@@ -1,0 +1,17 @@
+# Development and testing dependencies for axon_caliber_variation
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-xdist>=3.0.0  # For parallel test execution
+
+# Code quality
+black>=23.0.0
+ruff>=0.1.0
+mypy>=1.0.0
+
+# Hypothesis for property-based testing (optional but recommended)
+hypothesis>=6.0.0
+
+# Install main package requirements
+-r requirements.txt

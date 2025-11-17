@@ -1,0 +1,21 @@
+numpy>=1.24.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+scipy>=1.10.0
+h5py>=3.8.0
+scikit-learn>=1.2.0
+
+# Testing and debugging
+pytest
+pytest-cov
+black
+ruff
+mypy
+ipython
+ipdb
+debugpy
+
+# Interactive plotting and visualization
+ipykernel
+ipywidgets
+plotly

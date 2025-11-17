@@ -1,0 +1,4 @@
+# Matplotlib configuration for VS Code devcontainer
+# This ensures plots display in VS Code's plot viewer
+
+backend: Agg
