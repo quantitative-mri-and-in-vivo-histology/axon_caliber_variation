@@ -13,10 +13,10 @@ Each volume contains two white matter tract populations:
 - **Corpus Callosum (CC)**: Aligned primarily with a different volume axis
 
 The focus is on characterizing and visualizing:
-- Single-axon caliber fluctuations
-- Ensemble-effective radius behavior along white matter tracts
-- Comparisons between sham and TBI model groups
-- Summary statistics and spectral features derived from gamma-decomposed axon morphologies
+- Axon radius distributions in white matter tracts
+- Effective MRI-visible radius (r_eff = (⟨r⁶⟩/⟨r²⟩)^(1/4)) along tract length
+- Per-slice radius profiles and global pooled statistics
+- Comparisons between sham and TBI groups, and between CC and CG populations
 
 🗂 Repository Structure
 
@@ -30,25 +30,31 @@ The focus is on characterizing and visualizing:
 
 📈 Main Components
 
-**Preprocessing Pipeline**
+**Preprocessing Pipeline** ([filter_axons_simple.py](src/filter_axons_simple.py))
 - Extract and separate cingulum (CG) and corpus callosum (CC) populations from raw volumes
 - Filter axons based on:
   - Minimum length threshold (remove short fragments)
   - Slice persistence (axons must appear in sufficient fraction of slices)
   - Orientation filtering (remove axons with excessive bending that creates skewed 2D projections)
-- Generate per-slice radius histograms for both circular-equivalent and minor-axis radii
+- Identify top two populations by alignment axis (CC = most axons, CG = second most)
+- Create axis-aligned volumes (permute axes so axons run along z-axis)
+- Save separate HDF5 volumes for CC and CG populations
+- Memory-efficient: processes slice-by-slice to handle large volumes
 
-**Analysis Pipeline**
-- Gamma decomposition for position-based caliber analysis
-- FFT-based power spectral summaries
-- Effective radius (r_eff) calculations along tract length
-- Statistical comparisons between groups (TBI vs sham, ipsi vs contra)
+**Analysis Pipeline** ([analyze_effective_radius.py](src/analyze_effective_radius.py))
+- Extract circular-equivalent radii per slice using regionprops
+- Compute radius histograms (bin edges: 0-20 μm with 0.02 μm step)
+- Calculate effective MRI-visible radius: r_eff = (⟨r⁶⟩/⟨r²⟩)^(1/4)
+- Per-slice profiles showing radius variation along tract
+- Global pooled effective radius from all slices combined
+- Parallel processing support for faster computation
+- Memory-efficient histogram storage
 
 **Visualization**
-- Slice-wise and tract-level effective radius plots
-- Error bar summaries and distributions
-- 2D/3D comparison plots
-- Spectral feature visualizations
+- Effective radius profiles: per-slice values vs position along tract
+- Global effective radius as reference line (dashed)
+- Axon count per slice
+- Publication-ready plots with proper labeling and units
 
 ▶️ Workflow
 
@@ -69,10 +75,67 @@ The focus is on characterizing and visualizing:
    - LM_49_contra_myelinated_axons.mat (TBI)
 
 2. **Preprocess and extract tract populations**
-   Run preprocessing scripts to separate CG and CC populations, apply quality filters, and generate cleaned intermediate datasets
+   Run [filter_axons_simple.py](src/filter_axons_simple.py) to:
+   - Load raw .mat file (downsampled for filtering)
+   - Apply quality filters (alignment, straightness, extent)
+   - Identify CC and CG populations by alignment axis
+   - Create axis-aligned HDF5 volumes at full resolution
 
-3. **Analyze caliber variability**
-   Compute morphological features, effective radii, and statistical summaries
+   Example:
+   ```bash
+   python src/filter_axons_simple.py \
+       data/raw/LM/LM_25_ipsi_myelinated_axons.mat \
+       data/processed/LM_25_ipsi \
+       --downsample 4 \
+       --min-alignment 0.7 \
+       --min-extent 50 \
+       --min-straightness 0.8
+   ```
 
-4. **Generate figures**
-   Create publication-ready visualizations
+   Output: `data/processed/LM_25_ipsi/cc_aligned.h5` and `cg_aligned.h5`
+
+3. **Analyze axon radii**
+   Run [analyze_effective_radius.py](src/analyze_effective_radius.py) to:
+   - Extract circular-equivalent radii per slice
+   - Compute effective MRI-visible radius
+   - Generate profile plots
+
+   Example:
+   ```bash
+   python src/analyze_effective_radius.py \
+       data/processed/LM_25_ipsi/cc_aligned.h5 \
+       fig/LM_25_ipsi \
+       --voxel-size 0.05 \
+       --n-jobs -1
+   ```
+
+   Output: `fig/LM_25_ipsi/CC_effective_radius_profile.png`
+
+4. **Compare populations and groups**
+   Process all 10 volumes (both CC and CG for each) and compare:
+   - TBI vs Sham
+   - Ipsilateral vs Contralateral
+   - CC vs CG populations
+
+## Technical Details
+
+**Voxel Size**
+- Original data: 0.05 μm/voxel (isotropic)
+- Filtering uses 4× downsampling (0.2 μm/voxel) for speed
+- Output volumes are at full resolution (0.05 μm/voxel)
+
+**Memory Efficiency**
+- HDF5 streaming: slice-by-slice processing avoids loading full volumes
+- Chunked storage: (100, 512, 512) chunks optimized for z-axis access
+- Light compression: gzip level 1 for speed/size balance
+- Histogram aggregation: fixed memory footprint regardless of data size
+
+**Performance**
+- Parallel processing: uses all CPU cores by default (`--n-jobs -1`)
+- regionprops: efficient batch extraction of morphological properties
+- Progress tracking: tqdm progress bars for all long operations
+
+**Data Format**
+- Input: MATLAB .mat files with labeled volumes
+- Processing: HDF5 with chunked, compressed storage
+- Output: PNG figures with 200 DPI resolution

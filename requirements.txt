@@ -4,6 +4,8 @@ pandas>=2.0.0
 scipy>=1.10.0
 h5py>=3.8.0
 scikit-learn>=1.2.0
+scikit-image
+tqdm
 
 # Testing and debugging
 pytest
