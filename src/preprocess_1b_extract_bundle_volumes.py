@@ -68,7 +68,10 @@ def extract_bundle_volume_streaming(dataset: h5py.Dataset,
     logger.info(f"Extracting {len(axon_labels)} axons from volume (streaming)...")
 
     original_shape = dataset.shape
-    axon_labels_array = np.array(list(axon_labels), dtype=np.uint32)
+
+    # Convert to sorted array for faster np.isin() - this is the key optimization!
+    axon_labels_array = np.array(sorted(axon_labels), dtype=np.uint32)
+    logger.info(f"Bundle contains {len(axon_labels_array)} unique labels")
 
     # Determine output shape after permutation
     permuted_shape = tuple(original_shape[i] for i in permutation)
@@ -107,33 +110,41 @@ def extract_bundle_volume_streaming(dataset: h5py.Dataset,
 
         if read_axis == 0:
             # Reading z slices, they stay as z
-            for z in tqdm(range(original_shape[0]), desc="Processing slices"):
-                slice_2d = dataset[z, :, :]
+            # Process in batches for better I/O performance
+            batch_size = 50
+            for z_start in tqdm(range(0, original_shape[0], batch_size),
+                               desc="Processing slices", unit="batch"):
+                z_end = min(z_start + batch_size, original_shape[0])
+                batch_3d = dataset[z_start:z_end, :, :]
                 # Filter to bundle axons
-                mask = np.isin(slice_2d, axon_labels_array)
-                slice_2d = slice_2d.copy()
-                slice_2d[~mask] = 0
-                dset_out[z, :, :] = slice_2d
+                mask = np.isin(batch_3d, axon_labels_array)
+                batch_3d = batch_3d.copy()
+                batch_3d[~mask] = 0
+                dset_out[z_start:z_end, :, :] = batch_3d
 
         elif read_axis == 1:
-            # Reading y slices, they become z (permutation likely (1,0,2))
+            # Reading y slices, they become z (permutation (1,0,2))
+            # dataset[:, y, :] gives (z, x) -> need to write as (z, x) for permuted shape
             for y in tqdm(range(original_shape[1]), desc="Processing slices"):
-                slice_2d = dataset[:, y, :]
+                slice_2d = dataset[:, y, :]  # Shape: (z, x)
                 mask = np.isin(slice_2d, axon_labels_array)
                 slice_2d = slice_2d.copy()
                 slice_2d[~mask] = 0
-                # Write to output: y becomes new z
-                dset_out[y, :, :] = slice_2d
+                # Permutation (1,0,2): output is (y,z,x), so slice at y has shape (z,x)
+                dset_out[y, :, :] = slice_2d  # Matches: (z, x)
 
         else:  # read_axis == 2
-            # Reading x slices, they become z (permutation likely (2,1,0))
+            # Reading x slices, they become z (permutation (2,1,0))
+            # dataset[:, :, x] gives (z, y) -> need to transpose to (y, z) for permuted shape
+            # Process ONE slice at a time (can't batch easily due to transpose)
             for x in tqdm(range(original_shape[2]), desc="Processing slices"):
-                slice_2d = dataset[:, :, x]
+                slice_2d = dataset[:, :, x]  # Shape: (z, y)
+                # Optimized filtering using boolean indexing
                 mask = np.isin(slice_2d, axon_labels_array)
-                slice_2d = slice_2d.copy()
-                slice_2d[~mask] = 0
-                # Write to output: x becomes new z
-                dset_out[x, :, :] = slice_2d
+                filtered_slice = np.where(mask, slice_2d, 0)
+                # Permutation (2,1,0): output is (x,y,z), so slice at x has shape (y,z)
+                # Need to transpose (z,y) -> (y,z)
+                dset_out[x, :, :] = filtered_slice.T  # Transpose!
 
     logger.info(f"Saved bundle volume: {output_file}")
     logger.info(f"  Size: {output_file.stat().st_size / 1024**2:.1f} MB")
