@@ -8,8 +8,10 @@ HDF5 volumes for each bundle, ready for oblique slicing analysis.
 
 import json
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 from pathlib import Path
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import h5py
 import numpy as np
@@ -48,30 +50,111 @@ def determine_alignment_axis(orientation: np.ndarray) -> Tuple[int, np.ndarray]:
     return primary_axis, permutation
 
 
-def extract_bundle_volume_streaming(dataset: h5py.Dataset,
+def create_label_lut(axon_labels: Set[int], max_label: int = None) -> np.ndarray:
+    """
+    Create a lookup table for fast label filtering.
+
+    Much faster than np.isin() for repeated operations.
+
+    Args:
+        axon_labels: Set of axon labels to keep
+        max_label: Maximum label value (auto-detected if None)
+
+    Returns:
+        Boolean LUT where lut[label] = True if label is in axon_labels
+    """
+    if max_label is None:
+        max_label = max(axon_labels) if axon_labels else 0
+
+    lut = np.zeros(max_label + 1, dtype=bool)
+    for label in axon_labels:
+        if label <= max_label:
+            lut[label] = True
+    return lut
+
+
+def filter_volume_with_lut(volume: np.ndarray, lut: np.ndarray) -> np.ndarray:
+    """
+    Filter volume using lookup table (much faster than np.isin).
+
+    Args:
+        volume: Input labeled volume
+        lut: Boolean lookup table
+
+    Returns:
+        Filtered volume with non-matching labels set to 0
+    """
+    # Properly handle out-of-range labels (set them to 0, not false positives)
+    in_range = volume < len(lut)
+    mask = np.zeros(volume.shape, dtype=bool)
+    mask[in_range] = lut[volume[in_range]]
+    return np.where(mask, volume, 0).astype(volume.dtype)
+
+
+def process_batch(args):
+    """
+    Process a batch of slices along any axis (generic worker function).
+
+    Args:
+        args: Tuple of (mat_file, start_idx, end_idx, axon_labels_set, max_label, axis, transpose_order)
+            - axis: 0 for z, 1 for y, 2 for x
+            - transpose_order: None for z, (1,0,2) for y, (2,1,0) for x
+
+    Returns:
+        (start_idx, end_idx, filtered_data)
+    """
+    mat_file, start_idx, end_idx, axon_labels_set, max_label, axis, transpose_order = args
+
+    with h5py.File(mat_file, 'r') as f:
+        dataset = f['final_lbl']
+        # Build slice tuple dynamically based on axis
+        slices = [slice(None)] * 3
+        slices[axis] = slice(start_idx, end_idx)
+        batch = dataset[tuple(slices)]
+
+    lut = create_label_lut(axon_labels_set, max_label)
+    filtered = filter_volume_with_lut(batch, lut)
+
+    # Apply transpose if needed
+    if transpose_order is not None:
+        filtered = filtered.transpose(transpose_order)
+
+    return start_idx, end_idx, filtered
+
+
+def extract_bundle_volume_streaming(mat_file: Path,
+                                   dataset: h5py.Dataset,
                                    axon_labels: Set[int],
                                    permutation: Tuple[int, int, int],
                                    output_file: Path,
                                    bundle: Dict,
-                                   voxel_size_um: float = 0.05):
+                                   voxel_size_um: float = 0.05,
+                                   batch_size: int = 50,
+                                   n_workers: int = None):
     """
-    Extract and save bundle volume slice-by-slice (memory efficient).
+    Extract and save bundle volume with parallel batched processing.
 
     Args:
+        mat_file: Path to source .mat file (needed for parallel workers)
         dataset: HDF5 dataset reference (not loaded into memory)
         axon_labels: Set of axon labels in bundle
         permutation: Axis permutation tuple
         output_file: Output HDF5 file path
         bundle: Bundle metadata dictionary
         voxel_size_um: Physical voxel size
+        batch_size: Number of slices to process per batch
+        n_workers: Number of parallel workers (None = CPU count)
     """
-    logger.info(f"Extracting {len(axon_labels)} axons from volume (streaming)...")
+    import os
+    if n_workers is None:
+        n_workers = os.cpu_count() or 4
+
+    logger.info(f"Extracting {len(axon_labels)} axons from volume (optimized)...")
+    logger.info(f"Using {n_workers} workers, batch size {batch_size}")
 
     original_shape = dataset.shape
-
-    # Convert to sorted array for faster np.isin() - this is the key optimization!
-    axon_labels_array = np.array(sorted(axon_labels), dtype=np.uint32)
-    logger.info(f"Bundle contains {len(axon_labels_array)} unique labels")
+    # Use max of axon_labels to avoid loading entire dataset into memory
+    max_label = max(axon_labels) if axon_labels else 0
 
     # Determine output shape after permutation
     permuted_shape = tuple(original_shape[i] for i in permutation)
@@ -79,12 +162,45 @@ def extract_bundle_volume_streaming(dataset: h5py.Dataset,
     logger.info(f"Original shape: {original_shape}")
     logger.info(f"Permuted shape: {permuted_shape}")
 
-    # Create output file with chunking
+    # Create output file with optimized chunking based on write pattern
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    chunk_shape = (min(100, permuted_shape[0]),
-                  min(512, permuted_shape[1]),
-                  min(512, permuted_shape[2]))
+    # Determine which original axis becomes the new z-axis
+    # permutation[0] tells us which original axis goes to position 0 (new z)
+    read_axis = permutation[0]
+
+    # Optimize chunk layout for write pattern
+    if read_axis == 0:
+        # Z-aligned: standard chunks
+        chunk_shape = (min(100, permuted_shape[0]),
+                      min(512, permuted_shape[1]),
+                      min(512, permuted_shape[2]))
+    elif read_axis == 1:
+        # Y-aligned: optimize for y-major writes
+        chunk_shape = (min(batch_size, permuted_shape[0]),
+                      min(512, permuted_shape[1]),
+                      min(512, permuted_shape[2]))
+    else:
+        # X-aligned: optimize for x-major writes
+        chunk_shape = (min(batch_size, permuted_shape[0]),
+                      min(512, permuted_shape[1]),
+                      min(512, permuted_shape[2]))
+
+    # Axis-specific configuration for transpose
+    axis_config = {
+        0: None,        # Z-aligned: no transpose
+        1: (1, 0, 2),   # Y-aligned: (z, y, x) -> (y, z, x)
+        2: (2, 1, 0),   # X-aligned: (z, y, x) -> (x, y, z)
+    }
+
+    # Prepare batch tasks with generic function
+    n_slices = original_shape[read_axis]
+    transpose_order = axis_config[read_axis]
+    tasks = [(str(mat_file), i, min(i + batch_size, n_slices), axon_labels, max_label,
+              read_axis, transpose_order)
+             for i in range(0, n_slices, batch_size)]
+
+    logger.info(f"Processing {len(tasks)} batches of ~{batch_size} slices each")
 
     with h5py.File(output_file, 'w') as f_out:
         dset_out = f_out.create_dataset(
@@ -104,47 +220,22 @@ def extract_bundle_volume_streaming(dataset: h5py.Dataset,
         dset_out.attrs['voxel_size_um'] = voxel_size_um
         dset_out.attrs['alignment_axis'] = 'z'
 
-        # Process slice-by-slice based on permutation
-        # Read along axis that will become z after permutation
-        read_axis = permutation.index(0)
+        # Process in parallel
+        if n_workers > 1 and len(tasks) > 1:
+            # Use ProcessPoolExecutor for parallel processing
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                futures = {executor.submit(process_batch, task): task for task in tasks}
 
-        if read_axis == 0:
-            # Reading z slices, they stay as z
-            # Process in batches for better I/O performance
-            batch_size = 50
-            for z_start in tqdm(range(0, original_shape[0], batch_size),
-                               desc="Processing slices", unit="batch"):
-                z_end = min(z_start + batch_size, original_shape[0])
-                batch_3d = dataset[z_start:z_end, :, :]
-                # Filter to bundle axons
-                mask = np.isin(batch_3d, axon_labels_array)
-                batch_3d = batch_3d.copy()
-                batch_3d[~mask] = 0
-                dset_out[z_start:z_end, :, :] = batch_3d
-
-        elif read_axis == 1:
-            # Reading y slices, they become z (permutation (1,0,2))
-            # dataset[:, y, :] gives (z, x) -> need to write as (z, x) for permuted shape
-            for y in tqdm(range(original_shape[1]), desc="Processing slices"):
-                slice_2d = dataset[:, y, :]  # Shape: (z, x)
-                mask = np.isin(slice_2d, axon_labels_array)
-                slice_2d = slice_2d.copy()
-                slice_2d[~mask] = 0
-                # Permutation (1,0,2): output is (y,z,x), so slice at y has shape (z,x)
-                dset_out[y, :, :] = slice_2d  # Matches: (z, x)
-
-        else:  # read_axis == 2
-            # Reading x slices, they become z (permutation (2,1,0))
-            # dataset[:, :, x] gives (z, y) -> need to transpose to (y, z) for permuted shape
-            # Process ONE slice at a time (can't batch easily due to transpose)
-            for x in tqdm(range(original_shape[2]), desc="Processing slices"):
-                slice_2d = dataset[:, :, x]  # Shape: (z, y)
-                # Optimized filtering using boolean indexing
-                mask = np.isin(slice_2d, axon_labels_array)
-                filtered_slice = np.where(mask, slice_2d, 0)
-                # Permutation (2,1,0): output is (x,y,z), so slice at x has shape (y,z)
-                # Need to transpose (z,y) -> (y,z)
-                dset_out[x, :, :] = filtered_slice.T  # Transpose!
+                with tqdm(total=len(tasks), desc="Processing batches", unit="batch") as pbar:
+                    for future in as_completed(futures):
+                        start_idx, end_idx, filtered_data = future.result()
+                        dset_out[start_idx:end_idx, :, :] = filtered_data
+                        pbar.update(1)
+        else:
+            # Single-threaded fallback
+            for task in tqdm(tasks, desc="Processing batches", unit="batch"):
+                start_idx, end_idx, filtered_data = process_batch(task)
+                dset_out[start_idx:end_idx, :, :] = filtered_data
 
     logger.info(f"Saved bundle volume: {output_file}")
     logger.info(f"  Size: {output_file.stat().st_size / 1024**2:.1f} MB")
@@ -196,7 +287,9 @@ def save_bundle_hdf5(volume: np.ndarray,
 def extract_all_bundles(mat_file: Path,
                        bundle_metadata_file: Path,
                        output_dir: Path,
-                       voxel_size_um: float = 0.05):
+                       voxel_size_um: float = 0.05,
+                       batch_size: int = 50,
+                       n_workers: int = None):
     """
     Extract all bundles from volume and save as separate HDF5 files.
 
@@ -205,6 +298,8 @@ def extract_all_bundles(mat_file: Path,
         bundle_metadata_file: JSON file from preprocess_1
         output_dir: Directory for output HDF5 files
         voxel_size_um: Physical voxel size at full resolution
+        batch_size: Number of slices to process per batch
+        n_workers: Number of parallel workers (None = CPU count)
     """
     logger.info(f"\n{'='*80}")
     logger.info(f"Extracting bundle volumes from: {mat_file.name}")
@@ -239,12 +334,15 @@ def extract_all_bundles(mat_file: Path,
             axon_labels = set(bundle['axon_labels'])
             output_file = output_dir / f"bundle_{bundle['bundle_id']:02d}_aligned.h5"
             extract_bundle_volume_streaming(
+                mat_file,
                 dataset,
                 axon_labels,
                 permutation,
                 output_file,
                 bundle,
-                voxel_size_um
+                voxel_size_um,
+                batch_size=batch_size,
+                n_workers=n_workers
             )
 
     logger.info(f"\n{'='*80}")
@@ -266,6 +364,10 @@ if __name__ == '__main__':
                        help='Output directory for bundle HDF5 files')
     parser.add_argument('--voxel-size', type=float, default=0.05,
                        help='Voxel size in micrometers (default: 0.05)')
+    parser.add_argument('--batch-size', type=int, default=50,
+                       help='Number of slices per batch (default: 50)')
+    parser.add_argument('--n-workers', type=int, default=None,
+                       help='Number of parallel workers (default: CPU count)')
 
     args = parser.parse_args()
 
@@ -273,5 +375,7 @@ if __name__ == '__main__':
         args.mat_file,
         args.bundle_metadata,
         args.output_dir,
-        voxel_size_um=args.voxel_size
+        voxel_size_um=args.voxel_size,
+        batch_size=args.batch_size,
+        n_workers=args.n_workers
     )
