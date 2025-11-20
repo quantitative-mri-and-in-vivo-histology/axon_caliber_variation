@@ -572,6 +572,16 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
     displacement = (U[np.newaxis, :, :] * v1[:, np.newaxis, np.newaxis] +
                     V[np.newaxis, :, :] * v2[:, np.newaxis, np.newaxis])
 
+    # Create LUT to filter only bundle axons (zero out non-bundle labels)
+    bundle_labels = set(bundle['axon_labels'])
+    max_label = int(volume.max())
+    label_lut = np.zeros(max_label + 1, dtype=np.uint32)
+    for label in bundle_labels:
+        if label <= max_label:
+            label_lut[label] = label  # Keep bundle labels, others stay 0
+
+    logger.info(f"Filtering to {len(bundle_labels)} bundle axons")
+
     # Track segment IDs (thread-safe with lock)
     import threading
     segment_id_set = set()
@@ -611,6 +621,9 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
 
         # Reshape to 2D
         slice_2d = sampled.reshape(ny, nx)
+
+        # Filter to keep only bundle axons (apply LUT)
+        slice_2d = label_lut[slice_2d]
 
         # Write immediately to Zarr (Zarr handles concurrent writes to different chunks)
         level_0[:, :, slice_idx] = slice_2d.astype(np.uint32)
