@@ -19,6 +19,7 @@ from typing import Dict, List, Tuple
 
 import h5py
 import numpy as np
+from scipy.spatial import KDTree
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -145,15 +146,15 @@ def compute_axon_orientation_from_coords(coords: np.ndarray) -> Tuple[np.ndarray
     return principal_axis, float(length_voxels), n_voxels
 
 
-def compute_all_orientations(volume: np.ndarray,
-                            voxel_size_um: float = 0.2,
-                            min_voxels: int = 10,
-                            min_length_um: float = 0.0) -> Dict[int, Dict]:
+def compute_all_orientations_from_voxels(axon_voxels: Dict[int, np.ndarray],
+                                          voxel_size_um: float = 0.2,
+                                          min_voxels: int = 10,
+                                          min_length_um: float = 0.0) -> Dict[int, Dict]:
     """
-    Compute orientations for all axons in volume.
+    Compute orientations for all axons from pre-computed voxel coordinates.
 
     Args:
-        volume: Labeled 3D volume
+        axon_voxels: Dict mapping axon_id -> coordinates [N, 3]
         voxel_size_um: Physical voxel size in micrometers
         min_voxels: Minimum voxels per axon to analyze
         min_length_um: Minimum axon length in micrometers (filters before clustering)
@@ -162,10 +163,6 @@ def compute_all_orientations(volume: np.ndarray,
         Dictionary mapping label -> {orientation, length_um, n_voxels}
     """
     logger.info("Computing orientations for all axons...")
-
-    # Pre-compute all voxel coordinates (much faster!)
-    axon_voxels = precompute_axon_voxels(volume)
-
     logger.info(f"Processing {len(axon_voxels)} axons...")
 
     axon_data = {}
@@ -286,18 +283,69 @@ def cluster_by_orientation(axon_data: Dict[int, Dict],
     return label_to_bundle
 
 
+def filter_sparse_axons(axon_labels: List[int],
+                        axon_voxels: Dict[int, np.ndarray],
+                        voxel_size_um: float,
+                        k_neighbors: int = 10,
+                        max_distance_um: float = 30.0) -> Tuple[List[int], int]:
+    """
+    Remove spatially isolated axons using KNN distance threshold.
+
+    Axons whose k-th nearest neighbor is farther than max_distance_um are removed.
+
+    Args:
+        axon_labels: List of axon labels in this bundle
+        axon_voxels: Dict mapping axon_id -> coordinates [N, 3]
+        voxel_size_um: Physical voxel size
+        k_neighbors: Number of neighbors to check
+        max_distance_um: Maximum allowed distance to k-th neighbor
+
+    Returns:
+        (filtered_labels, n_removed) tuple
+    """
+    if len(axon_labels) <= k_neighbors:
+        # Not enough axons to apply filter
+        return axon_labels, 0
+
+    # Compute centroids for each axon
+    centroids = np.array([axon_voxels[label].mean(axis=0) for label in axon_labels])
+    centroids_um = centroids * voxel_size_um
+
+    # Build KDTree and query k+1 neighbors (includes self)
+    tree = KDTree(centroids_um)
+    distances, _ = tree.query(centroids_um, k=k_neighbors + 1)
+
+    # Distance to k-th neighbor (column k, since column 0 is self with distance 0)
+    kth_distances = distances[:, k_neighbors]
+
+    # Keep axons where k-th neighbor is within threshold
+    mask = kth_distances <= max_distance_um
+    filtered_labels = [axon_labels[i] for i in range(len(axon_labels)) if mask[i]]
+    n_removed = len(axon_labels) - len(filtered_labels)
+
+    return filtered_labels, n_removed
+
+
 def create_bundles(axon_data: Dict[int, Dict],
                   label_to_bundle: Dict[int, int],
+                  axon_voxels: Dict[int, np.ndarray],
+                  voxel_size_um: float,
                   min_axons: int = 500,
-                  min_length_um: float = 50.0) -> List[Dict]:
+                  min_length_um: float = 50.0,
+                  k_neighbors: int = 10,
+                  max_neighbor_distance_um: float = 30.0) -> List[Dict]:
     """
     Create bundle metadata with filtering.
 
     Args:
         axon_data: Dictionary mapping label -> {orientation, length_um, n_voxels}
         label_to_bundle: Dictionary mapping axon_label -> bundle_id
+        axon_voxels: Dict mapping axon_id -> coordinates [N, 3]
+        voxel_size_um: Physical voxel size
         min_axons: Minimum axons per bundle
         min_length_um: Minimum bundle length in micrometers
+        k_neighbors: Number of neighbors for sparse filtering
+        max_neighbor_distance_um: Max distance to k-th neighbor
 
     Returns:
         List of bundle dictionaries with metadata
@@ -314,9 +362,26 @@ def create_bundles(axon_data: Dict[int, Dict],
     # Process each bundle
     bundles = []
     rejected_bundles = []
+    total_sparse_removed = 0
 
     for bundle_id, axon_labels in bundles_raw.items():
+        n_axons_before = len(axon_labels)
+
+        # Filter sparse axons (per-bundle)
+        axon_labels, n_removed = filter_sparse_axons(
+            axon_labels,
+            axon_voxels,
+            voxel_size_um,
+            k_neighbors=k_neighbors,
+            max_distance_um=max_neighbor_distance_um
+        )
+        total_sparse_removed += n_removed
+
         n_axons = len(axon_labels)
+
+        # Skip if all axons were removed by sparse filtering
+        if n_axons == 0:
+            continue
 
         # Compute mean orientation
         orientations = np.array([axon_data[label]['orientation'] for label in axon_labels])
@@ -364,6 +429,7 @@ def create_bundles(axon_data: Dict[int, Dict],
 
     logger.info(f"Bundle filtering results:")
     logger.info(f"  Total clusters from hierarchical clustering: {len(bundles_raw)}")
+    logger.info(f"  Sparse axons removed (k={k_neighbors}, max_dist={max_neighbor_distance_um}μm): {total_sparse_removed}")
     logger.info(f"  Rejected bundles: {len(rejected_bundles)}")
     logger.info(f"  Final bundles meeting criteria: {len(bundles)}")
 
@@ -417,7 +483,9 @@ def identify_bundles(mat_file: Path,
                     min_axons: int = 500,
                     min_length_um: float = 10.0,
                     orientation_threshold: float = 0.7,
-                    min_voxels: int = 10) -> List[Dict]:
+                    min_voxels: int = 10,
+                    k_neighbors: int = 10,
+                    max_neighbor_distance_um: float = 30.0) -> List[Dict]:
     """
     Complete pipeline to identify fiber bundles.
 
@@ -433,6 +501,8 @@ def identify_bundles(mat_file: Path,
                               0.7 = moderate (~45° tolerance, recommended)
                               1.0 = permissive (~60° tolerance)
         min_voxels: Minimum voxels to analyze axon
+        k_neighbors: Number of neighbors for sparse axon filtering
+        max_neighbor_distance_um: Max distance to k-th neighbor for sparse filtering
 
     Returns:
         List of bundle dictionaries
@@ -450,14 +520,23 @@ def identify_bundles(mat_file: Path,
     # Adjust voxel size for downsampling
     voxel_size_downsampled = voxel_size_um * downsample
 
+    # Pre-compute voxel coordinates (needed for orientation and sparse filtering)
+    axon_voxels = precompute_axon_voxels(volume)
+
     # Compute orientations and filter short axons BEFORE clustering
-    axon_data = compute_all_orientations(volume, voxel_size_downsampled, min_voxels, min_length_um)
+    axon_data = compute_all_orientations_from_voxels(
+        axon_voxels, voxel_size_downsampled, min_voxels, min_length_um
+    )
 
     # Cluster by orientation (only long axons remain)
     label_to_bundle = cluster_by_orientation(axon_data, orientation_threshold)
 
-    # Create bundles (length filtering already done, only check axon count)
-    bundles = create_bundles(axon_data, label_to_bundle, min_axons, min_length_um=0.0)
+    # Create bundles with sparse axon filtering
+    bundles = create_bundles(
+        axon_data, label_to_bundle, axon_voxels, voxel_size_downsampled,
+        min_axons, min_length_um=0.0,
+        k_neighbors=k_neighbors, max_neighbor_distance_um=max_neighbor_distance_um
+    )
 
     # Save metadata
     save_bundle_metadata(bundles, metadata, output_file)
@@ -489,6 +568,10 @@ if __name__ == '__main__':
                        help='Minimum bundle length in μm (default: 50.0)')
     parser.add_argument('--orientation-threshold', type=float, default=0.7,
                        help='Orientation clustering threshold, 0-1.4 range (default: 0.7, ~45° tolerance)')
+    parser.add_argument('--k-neighbors', type=int, default=10,
+                       help='Number of neighbors for sparse axon filtering (default: 10)')
+    parser.add_argument('--max-neighbor-distance', type=float, default=30.0,
+                       help='Max distance to k-th neighbor in μm (default: 30.0)')
 
     args = parser.parse_args()
 
@@ -499,5 +582,7 @@ if __name__ == '__main__':
         voxel_size_um=args.voxel_size,
         min_axons=args.min_axons,
         min_length_um=args.min_length,
-        orientation_threshold=args.orientation_threshold
+        orientation_threshold=args.orientation_threshold,
+        k_neighbors=args.k_neighbors,
+        max_neighbor_distance_um=args.max_neighbor_distance
     )
