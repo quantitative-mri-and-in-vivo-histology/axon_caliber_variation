@@ -13,27 +13,49 @@ from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, Tuple
 
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 from skimage.measure import regionprops
 from tqdm import tqdm
 
+# Global variables for worker processes
+_volume_path = None
+_is_zarr = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def _process_single_slice(args: Tuple[int, np.ndarray, float, np.ndarray]) -> Tuple[int, np.ndarray, int]:
+def _init_worker(volume_path: Path, is_zarr: bool):
+    """Initialize worker process with volume path and format."""
+    global _volume_path, _is_zarr
+    _volume_path = volume_path
+    _is_zarr = is_zarr
+
+
+def _process_single_slice(args: Tuple[int, float, np.ndarray]) -> Tuple[int, np.ndarray, int]:
     """
     Process a single slice to extract radii histogram. Helper function for parallel processing.
 
+    Reads slice directly from file (memory efficient).
+
     Args:
-        args: Tuple of (slice_index, slice_2d, voxel_size_um, bin_edges)
+        args: Tuple of (slice_index, voxel_size_um, bin_edges)
 
     Returns:
         Tuple of (slice_index, histogram_counts, n_axons)
     """
-    z, slice_2d, voxel_size_um, bin_edges = args
+    z, voxel_size_um, bin_edges = args
+
+    # Read just this slice
+    if _is_zarr:
+        import zarr
+        root = zarr.open(str(_volume_path), mode='r')
+        slice_2d = root['0'][:, :, z]
+    else:
+        import h5py
+        with h5py.File(_volume_path, 'r') as f:
+            slice_2d = f['labels'][:, :, z]
 
     # Use regionprops to efficiently extract areas of all regions
     regions = regionprops(slice_2d)
@@ -57,15 +79,18 @@ def _process_single_slice(args: Tuple[int, np.ndarray, float, np.ndarray]) -> Tu
     return (z, counts.astype(np.int32), len(radii))
 
 
-def extract_radii_per_slice(volume: np.ndarray,
+def extract_radii_per_slice(volume_file: Path,
                             voxel_size_um: float = 0.2,
                             n_jobs: int = -1,
                             bin_edges: np.ndarray = None) -> Tuple[Dict[int, np.ndarray], Dict[int, int], np.ndarray, np.ndarray]:
     """
     Extract circular-equivalent radii histograms for all axons in each z-slice.
 
+    Memory efficient: reads slices directly from file (one chunk per slice).
+    Supports both Zarr and HDF5 formats.
+
     Args:
-        volume: 3D labeled volume (z, y, x) where axons are aligned with z
+        volume_file: Path to volume file (Zarr or HDF5), shape (y, x, z) where axons are aligned with z
         voxel_size_um: Voxel size in micrometers
         n_jobs: Number of parallel jobs (-1 = use all CPUs, 1 = no parallelization)
         bin_edges: Histogram bin edges in micrometers (default: 0 to 20 with 0.02 step)
@@ -73,9 +98,23 @@ def extract_radii_per_slice(volume: np.ndarray,
     Returns:
         Tuple of (histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers)
     """
-    logger.info(f"Extracting radii per slice from volume shape {volume.shape}")
+    # Detect format
+    is_zarr = volume_file.suffix == '.zarr' or (volume_file.is_dir() and (volume_file / '.zattrs').exists())
 
-    n_slices = volume.shape[0]
+    # Get volume shape from file without loading
+    if is_zarr:
+        import zarr
+        root = zarr.open(str(volume_file), mode='r')
+        volume_shape = root['0'].shape
+    else:
+        import h5py
+        with h5py.File(volume_file, 'r') as f:
+            volume_shape = f['labels'].shape
+
+    logger.info(f"Extracting radii per slice from volume shape {volume_shape}")
+
+    # Z-slices are along the last axis (axis 2)
+    n_slices = volume_shape[2]
 
     # Default bin edges: 0 to 20 μm with 0.02 μm step
     if bin_edges is None:
@@ -96,12 +135,14 @@ def extract_radii_per_slice(volume: np.ndarray,
 
     logger.info(f"Using {n_workers} parallel workers")
 
-    # Prepare arguments for parallel processing
-    args_list = [(z, volume[z, :, :], voxel_size_um, bin_edges) for z in range(n_slices)]
+    # Prepare arguments for parallel processing (no slice data, just indices)
+    args_list = [(z, voxel_size_um, bin_edges) for z in range(n_slices)]
 
     # Process in parallel
     if n_workers > 1:
-        with Pool(processes=n_workers) as pool:
+        with Pool(processes=n_workers,
+                  initializer=_init_worker,
+                  initargs=(volume_file, is_zarr)) as pool:
             results = list(tqdm(
                 pool.imap(_process_single_slice, args_list),
                 total=n_slices,
@@ -110,6 +151,10 @@ def extract_radii_per_slice(volume: np.ndarray,
             ))
     else:
         # Serial processing (useful for debugging)
+        # Set globals for serial mode
+        global _volume_path, _is_zarr
+        _volume_path = volume_file
+        _is_zarr = is_zarr
         results = [_process_single_slice(args) for args in tqdm(
             args_list,
             desc="Processing slices",
@@ -260,8 +305,11 @@ def analyze_population(volume_file: Path,
     """
     Analyze effective radius for a population volume.
 
+    Memory efficient: reads slices directly from file.
+    Supports both Zarr and HDF5 formats.
+
     Args:
-        volume_file: Path to aligned HDF5 volume file
+        volume_file: Path to aligned volume file (Zarr or HDF5)
         output_dir: Directory for output plots
         voxel_size_um: Voxel size in micrometers (0.05 * downsample_factor)
         n_jobs: Number of parallel jobs (-1 = use all CPUs)
@@ -273,17 +321,38 @@ def analyze_population(volume_file: Path,
     logger.info(f"Analyzing: {volume_file.name}")
     logger.info(f"{'='*80}\n")
 
-    # Load volume
-    with h5py.File(volume_file, 'r') as f:
-        volume = f['labels'][:]
-        population_name = f.attrs.get('population', 'Unknown')
+    # Detect format
+    is_zarr = volume_file.suffix == '.zarr' or (volume_file.is_dir() and (volume_file / '.zattrs').exists())
+
+    # Get metadata without loading volume
+    if is_zarr:
+        import zarr
+        root = zarr.open(str(volume_file), mode='r')
+        volume_shape = root['0'].shape
+        # Get population name from Zarr attrs
+        bundle_id = root.attrs.get('bundle_id', None)
+        if bundle_id is not None:
+            population_name = f"Bundle_{bundle_id:02d}"
+        else:
+            population_name = volume_file.stem
+    else:
+        import h5py
+        with h5py.File(volume_file, 'r') as f:
+            volume_shape = f['labels'].shape
+            # Try to get population name from dataset attrs first, then file attrs
+            dset = f['labels']
+            population_name = dset.attrs.get('bundle_id', None)
+            if population_name is not None:
+                population_name = f"Bundle_{population_name:02d}"
+            else:
+                population_name = f.attrs.get('population', 'Unknown')
 
     logger.info(f"Population: {population_name}")
-    logger.info(f"Volume shape: {volume.shape}")
+    logger.info(f"Volume shape: {volume_shape}")
 
-    # Extract radii histograms per slice
+    # Extract radii histograms per slice (memory efficient - reads from file)
     histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers = extract_radii_per_slice(
-        volume, voxel_size_um, n_jobs=n_jobs
+        volume_file, voxel_size_um, n_jobs=n_jobs
     )
 
     # Plot effective radius profile
@@ -311,7 +380,7 @@ if __name__ == '__main__':
         description='Analyze effective MRI-visible radius from aligned axon volumes'
     )
     parser.add_argument('volume_file', type=Path,
-                       help='Path to aligned HDF5 volume file (e.g., cc_aligned.h5)')
+                       help='Path to aligned volume file (Zarr or HDF5, e.g., bundle_07_orthogonal.zarr)')
     parser.add_argument('output_dir', type=Path,
                        help='Output directory for plots')
     parser.add_argument('--voxel-size', type=float, default=0.05,
