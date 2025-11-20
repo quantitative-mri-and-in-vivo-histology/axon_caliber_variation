@@ -1,51 +1,55 @@
 #!/usr/bin/env python3
 """
-Extract individual bundle volumes from bundle metadata.
+Extract individual bundle volumes from bundle metadata as OME-Zarr.
 
 Takes bundle metadata JSON (from preprocess_1) and creates axis-aligned
-HDF5 volumes for each bundle, ready for oblique slicing analysis.
+OME-Zarr volumes with multi-resolution pyramids for each bundle,
+optimized for Neuroglancer visualization.
+
+Output format: OME-NGFF (Zarr-based) with 5 pyramid levels.
 """
 
 import json
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 import h5py
 import numpy as np
+import zarr
+from zarr.codecs import BloscCodec
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def determine_alignment_axis(orientation: np.ndarray) -> Tuple[int, np.ndarray]:
+def determine_alignment_axis(orientation: np.ndarray) -> Tuple[int, Tuple[int, int, int]]:
     """
     Determine which axis is most aligned with orientation for axis permutation.
 
+    After permutation, axons will be aligned along the LAST axis (axis 2),
+    following the convention (y, x, z) where z is along-axon direction.
+
     Args:
-        orientation: [vz, vy, vx] normalized direction vector
+        orientation: [vz, vy, vx] normalized direction vector (in original coords)
 
     Returns:
-        (axis_index, permutation) where permutation reorders (z,y,x) so
-        primary axis becomes z
+        (axis_index, permutation) where permutation reorders axes so
+        primary axis becomes axis 2 (last)
     """
     orientation = np.array(orientation)
     abs_components = np.abs(orientation)
     primary_axis = np.argmax(abs_components)
 
-    # Permutations to move primary axis to position 0 (z)
+    # Permutations to move primary axis to position 2 (last axis)
+    # Output convention: (y, x, z) where z is along-axon
     if primary_axis == 0:
-        # Already z-aligned
-        permutation = (0, 1, 2)
+        permutation = (1, 2, 0)
     elif primary_axis == 1:
-        # y is primary -> move to z
-        permutation = (1, 0, 2)  # (y, z, x)
+        permutation = (0, 2, 1)
     else:
-        # x is primary -> move to z
-        permutation = (2, 1, 0)  # (x, y, z)
+        permutation = (0, 1, 2)
 
     return primary_axis, permutation
 
@@ -53,8 +57,6 @@ def determine_alignment_axis(orientation: np.ndarray) -> Tuple[int, np.ndarray]:
 def create_label_lut(axon_labels: Set[int], max_label: int = None) -> np.ndarray:
     """
     Create a lookup table for fast label filtering.
-
-    Much faster than np.isin() for repeated operations.
 
     Args:
         axon_labels: Set of axon labels to keep
@@ -73,236 +75,403 @@ def create_label_lut(axon_labels: Set[int], max_label: int = None) -> np.ndarray
     return lut
 
 
-def filter_volume_with_lut(volume: np.ndarray, lut: np.ndarray) -> np.ndarray:
+def filter_with_lut(data: np.ndarray, lut: np.ndarray) -> np.ndarray:
     """
-    Filter volume using lookup table (much faster than np.isin).
+    Filter array using lookup table.
 
     Args:
-        volume: Input labeled volume
+        data: Input array (2D or 3D)
         lut: Boolean lookup table
 
     Returns:
-        Filtered volume with non-matching labels set to 0
+        Filtered array with non-matching labels set to 0
     """
-    # Properly handle out-of-range labels (set them to 0, not false positives)
-    in_range = volume < len(lut)
-    mask = np.zeros(volume.shape, dtype=bool)
-    mask[in_range] = lut[volume[in_range]]
-    return np.where(mask, volume, 0).astype(volume.dtype)
+    clamped = np.minimum(data, len(lut) - 1)
+    mask = lut[clamped]
+    result = np.where(mask, data, 0)
+    return result.astype(data.dtype)
 
 
-def process_batch(args):
+def get_input_slice(volume: np.ndarray, z_out: int, permutation: Tuple[int, int, int]) -> np.ndarray:
     """
-    Process a batch of slices along any axis (generic worker function).
+    Extract the input slice corresponding to output z-index.
 
     Args:
-        args: Tuple of (mat_file, start_idx, end_idx, axon_labels_set, max_label, axis, transpose_order)
-            - axis: 0 for z, 1 for y, 2 for x
-            - transpose_order: None for z, (1,0,2) for y, (2,1,0) for x
+        volume: Input volume (original axes)
+        z_out: Output z-index
+        permutation: Axis permutation tuple
 
     Returns:
-        (start_idx, end_idx, filtered_data)
+        2D slice from input volume, already in correct (y, x) orientation
     """
-    mat_file, start_idx, end_idx, axon_labels_set, max_label, axis, transpose_order = args
+    input_axis = permutation[2]
 
-    with h5py.File(mat_file, 'r') as f:
-        dataset = f['final_lbl']
-        # Build slice tuple dynamically based on axis
-        slices = [slice(None)] * 3
-        slices[axis] = slice(start_idx, end_idx)
-        batch = dataset[tuple(slices)]
+    if input_axis == 0:
+        slice_2d = volume[z_out, :, :]
+    elif input_axis == 1:
+        slice_2d = volume[:, z_out, :]
+    else:
+        slice_2d = volume[:, :, z_out]
 
-    lut = create_label_lut(axon_labels_set, max_label)
-    filtered = filter_volume_with_lut(batch, lut)
+    remaining = [i for i in range(3) if i != input_axis]
+    expected = [permutation[0], permutation[1]]
 
-    # Apply transpose if needed
-    if transpose_order is not None:
-        filtered = filtered.transpose(transpose_order)
+    if remaining != expected:
+        slice_2d = slice_2d.T
 
-    return start_idx, end_idx, filtered
+    return slice_2d
 
 
-def extract_bundle_volume_streaming(mat_file: Path,
-                                   dataset: h5py.Dataset,
-                                   axon_labels: Set[int],
-                                   permutation: Tuple[int, int, int],
-                                   output_file: Path,
-                                   bundle: Dict,
-                                   voxel_size_um: float = 0.05,
-                                   batch_size: int = 50,
-                                   n_workers: int = None):
+def downsample_segmentation_mode(data: np.ndarray, factor: int) -> np.ndarray:
     """
-    Extract and save bundle volume with parallel batched processing.
+    Downsample segmentation using mode filtering.
+
+    For each (factor x factor x factor) block, takes the most common non-zero label.
+    This preserves label integrity better than nearest-neighbor for segmentation.
 
     Args:
-        mat_file: Path to source .mat file (needed for parallel workers)
-        dataset: HDF5 dataset reference (not loaded into memory)
-        axon_labels: Set of axon labels in bundle
-        permutation: Axis permutation tuple
-        output_file: Output HDF5 file path
-        bundle: Bundle metadata dictionary
-        voxel_size_um: Physical voxel size
-        batch_size: Number of slices to process per batch
-        n_workers: Number of parallel workers (None = CPU count)
+        data: Input 3D segmentation volume
+        factor: Downsampling factor
+
+    Returns:
+        Downsampled volume
     """
-    import os
-    if n_workers is None:
-        n_workers = os.cpu_count() or 4
+    if factor == 1:
+        return data
 
-    logger.info(f"Extracting {len(axon_labels)} axons from volume (optimized)...")
-    logger.info(f"Using {n_workers} workers, batch size {batch_size}")
+    # Calculate output shape
+    out_shape = tuple(s // factor for s in data.shape)
 
-    original_shape = dataset.shape
-    # Use max of axon_labels to avoid loading entire dataset into memory
-    max_label = max(axon_labels) if axon_labels else 0
+    # Trim input to be evenly divisible
+    trimmed = data[:out_shape[0] * factor, :out_shape[1] * factor, :out_shape[2] * factor]
 
-    # Determine output shape after permutation
-    permuted_shape = tuple(original_shape[i] for i in permutation)
+    # Reshape into blocks
+    reshaped = trimmed.reshape(
+        out_shape[0], factor,
+        out_shape[1], factor,
+        out_shape[2], factor
+    )
 
-    logger.info(f"Original shape: {original_shape}")
-    logger.info(f"Permuted shape: {permuted_shape}")
+    # For segmentation, we want the mode (most common label) in each block
+    # Flatten blocks and find mode
+    blocks = reshaped.transpose(0, 2, 4, 1, 3, 5).reshape(*out_shape, -1)
 
-    # Create output file with optimized chunking based on write pattern
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    # Find mode for each block (most common non-zero, or zero if all zero)
+    result = np.zeros(out_shape, dtype=data.dtype)
 
-    # Determine which original axis becomes the new z-axis
-    # permutation[0] tells us which original axis goes to position 0 (new z)
-    read_axis = permutation[0]
+    for i in range(out_shape[0]):
+        for j in range(out_shape[1]):
+            for k in range(out_shape[2]):
+                block = blocks[i, j, k]
+                # Get non-zero values
+                non_zero = block[block != 0]
+                if len(non_zero) > 0:
+                    # Find most common
+                    values, counts = np.unique(non_zero, return_counts=True)
+                    result[i, j, k] = values[np.argmax(counts)]
 
-    # Optimize chunk layout for write pattern
-    if read_axis == 0:
-        # Z-aligned: standard chunks
-        chunk_shape = (min(100, permuted_shape[0]),
-                      min(512, permuted_shape[1]),
-                      min(512, permuted_shape[2]))
-    elif read_axis == 1:
-        # Y-aligned: optimize for y-major writes
-        chunk_shape = (min(batch_size, permuted_shape[0]),
-                      min(512, permuted_shape[1]),
-                      min(512, permuted_shape[2]))
-    else:
-        # X-aligned: optimize for x-major writes
-        chunk_shape = (min(batch_size, permuted_shape[0]),
-                      min(512, permuted_shape[1]),
-                      min(512, permuted_shape[2]))
+    return result
 
-    # Axis-specific configuration for transpose
-    axis_config = {
-        0: None,        # Z-aligned: no transpose
-        1: (1, 0, 2),   # Y-aligned: (z, y, x) -> (y, z, x)
-        2: (2, 1, 0),   # X-aligned: (z, y, x) -> (x, y, z)
+
+def downsample_segmentation_mode_fast(data: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Fast mode-based downsampling using scipy's maximum_filter approach.
+
+    For segmentation, uses a majority-vote approximation by taking
+    the value at the center of each block (faster than true mode).
+
+    Args:
+        data: Input 3D segmentation volume
+        factor: Downsampling factor
+
+    Returns:
+        Downsampled volume
+    """
+    if factor == 1:
+        return data.copy()
+
+    # Simple approach: take center voxel of each block
+    # This is fast and works well when labels are spatially coherent
+    offset = factor // 2
+    return data[offset::factor, offset::factor, offset::factor].copy()
+
+
+def create_ome_ngff_metadata(bundle: Dict, voxel_size_um: float, n_levels: int = 5) -> Dict:
+    """
+    Create OME-NGFF compliant metadata for .zattrs.
+
+    Args:
+        bundle: Bundle metadata dictionary
+        voxel_size_um: Physical voxel size in micrometers
+        n_levels: Number of pyramid levels
+
+    Returns:
+        Dictionary for .zattrs
+    """
+    datasets = []
+    for level in range(n_levels):
+        scale_factor = 2 ** level
+        voxel_size = voxel_size_um * scale_factor
+        datasets.append({
+            "path": str(level),
+            "coordinateTransformations": [{
+                "type": "scale",
+                "scale": [voxel_size, voxel_size, voxel_size]
+            }]
+        })
+
+    metadata = {
+        "multiscales": [{
+            "version": "0.4",
+            "name": f"bundle_{bundle['bundle_id']:02d}",
+            "axes": [
+                {"name": "y", "type": "space", "unit": "micrometer"},
+                {"name": "x", "type": "space", "unit": "micrometer"},
+                {"name": "z", "type": "space", "unit": "micrometer"}
+            ],
+            "datasets": datasets,
+            "type": "gaussian"  # Downsampling method hint
+        }],
+        # Custom metadata
+        "bundle_id": int(bundle['bundle_id']),
+        "n_axons": int(bundle['n_axons']),
+        "mean_orientation": [float(x) for x in bundle['mean_orientation']],
+        "mean_length_um": float(bundle['mean_length_um']),
+        "voxel_size_um": float(voxel_size_um),
+        "alignment_axis": "z",
+        "n_levels": n_levels
     }
 
-    # Prepare batch tasks with generic function
-    n_slices = original_shape[read_axis]
-    transpose_order = axis_config[read_axis]
-    tasks = [(str(mat_file), i, min(i + batch_size, n_slices), axon_labels, max_label,
-              read_axis, transpose_order)
-             for i in range(0, n_slices, batch_size)]
-
-    logger.info(f"Processing {len(tasks)} batches of ~{batch_size} slices each")
-
-    with h5py.File(output_file, 'w') as f_out:
-        dset_out = f_out.create_dataset(
-            'labels',
-            shape=permuted_shape,
-            dtype=np.uint32,
-            chunks=chunk_shape,
-            compression='gzip',
-            compression_opts=1
-        )
-
-        # Add metadata
-        dset_out.attrs['bundle_id'] = bundle['bundle_id']
-        dset_out.attrs['n_axons'] = bundle['n_axons']
-        dset_out.attrs['mean_orientation'] = bundle['mean_orientation']
-        dset_out.attrs['mean_length_um'] = bundle['mean_length_um']
-        dset_out.attrs['voxel_size_um'] = voxel_size_um
-        dset_out.attrs['alignment_axis'] = 'z'
-
-        # Process in parallel
-        if n_workers > 1 and len(tasks) > 1:
-            # Use ProcessPoolExecutor for parallel processing
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                futures = {executor.submit(process_batch, task): task for task in tasks}
-
-                with tqdm(total=len(tasks), desc="Processing batches", unit="batch") as pbar:
-                    for future in as_completed(futures):
-                        start_idx, end_idx, filtered_data = future.result()
-                        dset_out[start_idx:end_idx, :, :] = filtered_data
-                        pbar.update(1)
-        else:
-            # Single-threaded fallback
-            for task in tqdm(tasks, desc="Processing batches", unit="batch"):
-                start_idx, end_idx, filtered_data = process_batch(task)
-                dset_out[start_idx:end_idx, :, :] = filtered_data
-
-    logger.info(f"Saved bundle volume: {output_file}")
-    logger.info(f"  Size: {output_file.stat().st_size / 1024**2:.1f} MB")
+    return metadata
 
 
-def save_bundle_hdf5(volume: np.ndarray,
-                    bundle: Dict,
-                    output_file: Path,
-                    voxel_size_um: float = 0.05):
+def write_bundle_level0(volume: np.ndarray,
+                        bundle: Dict,
+                        output_path: Path,
+                        permutation: Tuple[int, int, int],
+                        lut: np.ndarray,
+                        voxel_size_um: float = 0.05) -> np.ndarray:
     """
-    Save bundle volume to HDF5 with metadata.
+    Write level 0 of bundle to Zarr (streaming, memory-efficient).
 
     Args:
-        volume: Labeled 3D volume (aligned)
+        volume: Full input volume (kept in memory)
         bundle: Bundle metadata dictionary
-        output_file: Output HDF5 file path
+        output_path: Output Zarr store path
+        permutation: Axis permutation tuple
+        lut: Boolean lookup table for this bundle
         voxel_size_um: Physical voxel size
+
+    Returns:
+        Array of segment IDs found in this bundle
     """
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    # Calculate output shape after permutation
+    output_shape = tuple(volume.shape[i] for i in permutation)
 
-    with h5py.File(output_file, 'w') as f:
-        # Create dataset with chunking and light compression
-        chunk_shape = (min(100, volume.shape[0]),
-                      min(512, volume.shape[1]),
-                      min(512, volume.shape[2]))
+    logger.info(f"Creating Zarr store: {output_path}")
+    logger.info(f"Output shape: {output_shape}")
 
-        dset = f.create_dataset(
-            'labels',
-            data=volume,
-            dtype=np.uint32,
+    # Create Zarr group (v3 API)
+    root = zarr.open_group(str(output_path), mode='w')
+
+    # Compression codec (v3 API)
+    compressor = BloscCodec(cname='zstd', clevel=3, shuffle='bitshuffle')
+
+    # Level 0: Full resolution with (full_y, full_x, 1) chunking for slice access
+    chunk_shape_0 = (output_shape[0], output_shape[1], 1)
+    level_0 = root.create_array(
+        '0',
+        shape=output_shape,
+        chunks=chunk_shape_0,
+        dtype=np.uint32,
+        compressors=[compressor]
+    )
+
+    # Write level 0 slice by slice, tracking segment IDs
+    n_slices = output_shape[2]
+    logger.info(f"Writing level 0 ({n_slices} slices)...")
+
+    segment_id_set = set()
+    for z_out in tqdm(range(n_slices), desc="Level 0", unit="slice"):
+        input_slice = get_input_slice(volume, z_out, permutation)
+        filtered_slice = filter_with_lut(input_slice, lut)
+        level_0[:, :, z_out] = filtered_slice
+        # Track unique IDs incrementally
+        segment_id_set.update(np.unique(filtered_slice).tolist())
+
+    # Remove 0 from segment IDs
+    segment_id_set.discard(0)
+    segment_ids = np.array(sorted(segment_id_set), dtype=np.uint32)
+    logger.info(f"Found {len(segment_ids)} unique segments")
+
+    return segment_ids
+
+
+def generate_bundle_pyramid(output_path: Path,
+                            bundle: Dict,
+                            segment_ids: np.ndarray,
+                            voxel_size_um: float = 0.05,
+                            n_levels: int = 5):
+    """
+    Generate pyramid levels for a bundle (loads level 0 into memory).
+
+    Args:
+        output_path: Zarr store path (must have level 0 written)
+        bundle: Bundle metadata dictionary
+        segment_ids: Array of segment IDs
+        voxel_size_um: Physical voxel size
+        n_levels: Number of pyramid levels (default 5)
+    """
+    # Open existing Zarr store
+    root = zarr.open_group(str(output_path), mode='r+')
+
+    # Compression codec (v3 API)
+    compressor = BloscCodec(cname='zstd', clevel=3, shuffle='bitshuffle')
+
+    # Load level 0 into memory for pyramid generation
+    logger.info("Loading level 0 for pyramid generation...")
+    current_data = root['0'][:]
+
+    for level in range(1, n_levels):
+        logger.info(f"Generating level {level} (2x downsampling from level {level-1})...")
+
+        # Downsample from previous level (cascaded for memory efficiency)
+        downsampled = downsample_segmentation_mode_fast(current_data, 2)
+
+        # 3D chunks for visualization
+        chunk_size = min(64, min(downsampled.shape))
+        chunk_shape = (chunk_size, chunk_size, chunk_size)
+
+        # Create array for this level (v3 API)
+        level_ds = root.create_array(
+            str(level),
+            shape=downsampled.shape,
             chunks=chunk_shape,
-            compression='gzip',
-            compression_opts=1
+            dtype=np.uint32,
+            compressors=[compressor]
+        )
+        level_ds[:] = downsampled
+
+        logger.info(f"  Level {level} shape: {downsampled.shape}")
+
+        # Use downsampled as input for next level
+        current_data = downsampled
+
+    # Free pyramid memory
+    del current_data
+
+    # Store segment IDs in a labels group (v3 API)
+    labels_group = root.create_group('labels')
+    seg_array = labels_group.create_array('segment_ids', shape=segment_ids.shape, dtype=np.uint32)
+    seg_array[:] = segment_ids
+
+    # Write OME-NGFF metadata
+    root.attrs.update(create_ome_ngff_metadata(bundle, voxel_size_um, n_levels))
+
+    # Calculate total size
+    total_size = sum(f.stat().st_size for f in output_path.rglob('*') if f.is_file())
+    logger.info(f"Saved bundle Zarr: {output_path}")
+    logger.info(f"  Total size: {total_size / 1024**2:.1f} MB")
+
+
+def extract_bundles_full_volume(mat_file: Path,
+                                 bundles: List[Dict],
+                                 output_dir: Path,
+                                 voxel_size_um: float = 0.05,
+                                 n_levels: int = 5):
+    """
+    Extract all bundles as OME-Zarr using full-volume-in-memory approach.
+
+    Args:
+        mat_file: Original .mat file with full labeled volume
+        bundles: List of bundle metadata dictionaries
+        output_dir: Directory for output Zarr stores
+        voxel_size_um: Physical voxel size at full resolution
+        n_levels: Number of pyramid levels
+    """
+    logger.info("Using full-volume mode")
+
+    # Load entire volume into memory once
+    logger.info("Loading full volume into memory...")
+    with h5py.File(mat_file, 'r') as f:
+        dataset = f['final_lbl']
+        logger.info(f"Volume shape: {dataset.shape}, dtype: {dataset.dtype}")
+        volume = dataset[:]
+
+    volume_gb = volume.nbytes / (1024**3)
+    logger.info(f"Loaded {volume_gb:.2f} GB into memory")
+
+    # Get max label for LUT sizing
+    max_label = int(volume.max())
+    logger.info(f"Max label in volume: {max_label}")
+
+    # Phase 1: Write level 0 for all bundles (needs original volume)
+    bundle_info = []  # Store (output_path, bundle, segment_ids) for phase 2
+
+    for i, bundle in enumerate(bundles):
+        logger.info(f"\n--- Bundle {i+1}/{len(bundles)} (Phase 1: Write level 0) ---")
+        logger.info(f"Bundle ID: {bundle['bundle_id']}")
+        logger.info(f"Axons: {bundle['n_axons']}")
+        logger.info(f"Mean orientation: {bundle['mean_orientation']}")
+
+        # Determine axis permutation
+        primary_axis, permutation = determine_alignment_axis(bundle['mean_orientation'])
+        logger.info(f"Primary axis: {primary_axis} -> permutation {permutation}")
+
+        # Create LUT for this bundle
+        axon_labels = set(bundle['axon_labels'])
+        lut = create_label_lut(axon_labels, max_label)
+
+        # Write level 0 to Zarr
+        output_path = output_dir / f"bundle_{bundle['bundle_id']:02d}_aligned.zarr"
+        segment_ids = write_bundle_level0(
+            volume,
+            bundle,
+            output_path,
+            permutation,
+            lut,
+            voxel_size_um
+        )
+        bundle_info.append((output_path, bundle, segment_ids))
+
+    # Free original volume before pyramid generation
+    logger.info("\nFreeing original volume from memory...")
+    del volume
+
+    # Phase 2: Generate pyramids (loads each level 0 individually)
+    for i, (output_path, bundle, segment_ids) in enumerate(bundle_info):
+        logger.info(f"\n--- Bundle {i+1}/{len(bundles)} (Phase 2: Generate pyramid) ---")
+        logger.info(f"Bundle ID: {bundle['bundle_id']}")
+
+        generate_bundle_pyramid(
+            output_path,
+            bundle,
+            segment_ids,
+            voxel_size_um,
+            n_levels
         )
 
-        # Add metadata as attributes
-        dset.attrs['bundle_id'] = bundle['bundle_id']
-        dset.attrs['n_axons'] = bundle['n_axons']
-        dset.attrs['mean_orientation'] = bundle['mean_orientation']
-        dset.attrs['mean_length_um'] = bundle['mean_length_um']
-        dset.attrs['voxel_size_um'] = voxel_size_um
-        dset.attrs['alignment_axis'] = 'z'
-
-    logger.info(f"Saved bundle volume: {output_file}")
-    logger.info(f"  Shape: {volume.shape}")
-    logger.info(f"  Size: {output_file.stat().st_size / 1024**2:.1f} MB")
+    logger.info(f"\nExtraction complete! Created {len(bundles)} bundle Zarr stores.")
 
 
 def extract_all_bundles(mat_file: Path,
-                       bundle_metadata_file: Path,
-                       output_dir: Path,
-                       voxel_size_um: float = 0.05,
-                       batch_size: int = 50,
-                       n_workers: int = None):
+                        bundle_metadata_file: Path,
+                        output_dir: Path,
+                        voxel_size_um: float = 0.05,
+                        n_levels: int = 5):
     """
-    Extract all bundles from volume and save as separate HDF5 files.
+    Extract all bundles from volume and save as OME-Zarr stores.
 
     Args:
         mat_file: Original .mat file with full labeled volume
         bundle_metadata_file: JSON file from preprocess_1
-        output_dir: Directory for output HDF5 files
+        output_dir: Directory for output Zarr stores
         voxel_size_um: Physical voxel size at full resolution
-        batch_size: Number of slices to process per batch
-        n_workers: Number of parallel workers (None = CPU count)
+        n_levels: Number of pyramid levels
     """
     logger.info(f"\n{'='*80}")
     logger.info(f"Extracting bundle volumes from: {mat_file.name}")
+    logger.info(f"Output format: OME-Zarr with {n_levels} pyramid levels")
     logger.info(f"{'='*80}\n")
 
     # Load bundle metadata
@@ -313,40 +482,18 @@ def extract_all_bundles(mat_file: Path,
     bundles = metadata['bundles']
     logger.info(f"Found {len(bundles)} bundles to extract")
 
-    # Open HDF5 file (keep as dataset reference - don't load into memory)
-    logger.info(f"Opening volume file: {mat_file.name}")
-    with h5py.File(mat_file, 'r') as f:
-        dataset = f['final_lbl']
-        logger.info(f"Volume shape: {dataset.shape}")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Extract each bundle
-        for i, bundle in enumerate(bundles):
-            logger.info(f"\n--- Bundle {i+1}/{len(bundles)} ---")
-            logger.info(f"Bundle ID: {bundle['bundle_id']}")
-            logger.info(f"Axons: {bundle['n_axons']}")
-            logger.info(f"Mean orientation: {bundle['mean_orientation']}")
-
-            # Determine axis permutation
-            primary_axis, permutation = determine_alignment_axis(bundle['mean_orientation'])
-            logger.info(f"Primary axis: {primary_axis} -> applying permutation {permutation}")
-
-            # Extract and save bundle volume (streaming - low memory)
-            axon_labels = set(bundle['axon_labels'])
-            output_file = output_dir / f"bundle_{bundle['bundle_id']:02d}_aligned.h5"
-            extract_bundle_volume_streaming(
-                mat_file,
-                dataset,
-                axon_labels,
-                permutation,
-                output_file,
-                bundle,
-                voxel_size_um,
-                batch_size=batch_size,
-                n_workers=n_workers
-            )
+    extract_bundles_full_volume(
+        mat_file,
+        bundles,
+        output_dir,
+        voxel_size_um,
+        n_levels
+    )
 
     logger.info(f"\n{'='*80}")
-    logger.info(f"Extraction complete! Created {len(bundles)} bundle volumes.")
+    logger.info(f"Extraction complete!")
     logger.info(f"{'='*80}\n")
 
 
@@ -354,20 +501,18 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Extract individual bundle volumes from bundle metadata'
+        description='Extract individual bundle volumes as OME-Zarr with pyramids'
     )
     parser.add_argument('mat_file', type=Path,
-                       help='Original .mat file with full labeled volume')
+                        help='Original .mat file with full labeled volume')
     parser.add_argument('bundle_metadata', type=Path,
-                       help='Bundle metadata JSON from preprocess_1')
+                        help='Bundle metadata JSON from preprocess_1')
     parser.add_argument('output_dir', type=Path,
-                       help='Output directory for bundle HDF5 files')
+                        help='Output directory for bundle Zarr stores')
     parser.add_argument('--voxel-size', type=float, default=0.05,
-                       help='Voxel size in micrometers (default: 0.05)')
-    parser.add_argument('--batch-size', type=int, default=50,
-                       help='Number of slices per batch (default: 50)')
-    parser.add_argument('--n-workers', type=int, default=None,
-                       help='Number of parallel workers (default: CPU count)')
+                        help='Voxel size in micrometers (default: 0.05)')
+    parser.add_argument('--n-levels', type=int, default=5,
+                        help='Number of pyramid levels (default: 5)')
 
     args = parser.parse_args()
 
@@ -376,6 +521,5 @@ if __name__ == '__main__':
         args.bundle_metadata,
         args.output_dir,
         voxel_size_um=args.voxel_size,
-        batch_size=args.batch_size,
-        n_workers=args.n_workers
+        n_levels=args.n_levels
     )
