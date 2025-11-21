@@ -24,9 +24,9 @@ from typing import Dict, List, Set, Tuple
 import h5py
 import numpy as np
 import zarr
-from zarr.codecs import BloscCodec
 from scipy.ndimage import map_coordinates
 from tqdm import tqdm
+import numcodecs
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -341,7 +341,8 @@ def extract_slices_batched(volume: np.ndarray,
 def create_ome_ngff_metadata(bundle: Dict,
                               voxel_size_um: float,
                               n_levels: int,
-                              n_slices: int) -> Dict:
+                              n_slices: int,
+                              spatial_info: Dict = None) -> Dict:
     """
     Create OME-NGFF compliant metadata for orthogonal slice output.
 
@@ -350,20 +351,39 @@ def create_ome_ngff_metadata(bundle: Dict,
         voxel_size_um: Physical voxel size
         n_levels: Number of pyramid levels
         n_slices: Number of slices extracted
+        spatial_info: Dictionary with spatial positioning info (origin, bbox, basis vectors)
 
     Returns:
         Dictionary for .zattrs
     """
+    # Compute translation from spatial info
+    if spatial_info is not None:
+        # Origin of output volume in original [z, y, x] coordinates (voxels)
+        origin_voxels = spatial_info['origin_voxels']
+        # Convert to physical coordinates [z, y, x] in micrometers
+        origin_um_zyx = origin_voxels * voxel_size_um
+        # Translation in output axis order [y, x, z]
+        translation_um = [float(origin_um_zyx[1]), float(origin_um_zyx[2]), float(origin_um_zyx[0])]
+    else:
+        translation_um = [0.0, 0.0, 0.0]
+
     datasets = []
     for level in range(n_levels):
         scale_factor = 2 ** level
         voxel_size = voxel_size_um * scale_factor
+        # Translation is in physical units (micrometers), same for all levels
         datasets.append({
             "path": str(level),
-            "coordinateTransformations": [{
-                "type": "scale",
-                "scale": [voxel_size, voxel_size, voxel_size]
-            }]
+            "coordinateTransformations": [
+                {
+                    "type": "scale",
+                    "scale": [voxel_size, voxel_size, voxel_size]
+                },
+                {
+                    "type": "translation",
+                    "translation": translation_um
+                }
+            ]
         })
 
     metadata = {
@@ -387,6 +407,22 @@ def create_ome_ngff_metadata(bundle: Dict,
         "voxel_size_um": float(voxel_size_um),
         "n_levels": n_levels
     }
+
+    # Add spatial reconstruction metadata
+    if spatial_info is not None:
+        metadata["origin_voxels_zyx"] = [float(x) for x in spatial_info['origin_voxels']]
+        metadata["origin_um_zyx"] = [float(x) for x in origin_um_zyx]
+        metadata["v1_zyx"] = [float(x) for x in spatial_info['v1']]
+        metadata["v2_zyx"] = [float(x) for x in spatial_info['v2']]
+        metadata["volume_center_zyx"] = [float(x) for x in spatial_info['volume_center']]
+        metadata["bbox"] = {
+            "fiber_min": float(spatial_info['bbox']['fiber_min']),
+            "fiber_max": float(spatial_info['bbox']['fiber_max']),
+            "u_min": float(spatial_info['bbox']['u_min']),
+            "u_max": float(spatial_info['bbox']['u_max']),
+            "v_min": float(spatial_info['bbox']['v_min']),
+            "v_max": float(spatial_info['bbox']['v_max']),
+        }
 
     return metadata
 
@@ -412,11 +448,11 @@ def write_bundle_slices_zarr(output_path: Path,
     logger.info(f"Writing Zarr store: {output_path}")
     logger.info(f"Output shape: {output_shape}")
 
-    # Create Zarr group
-    root = zarr.open_group(str(output_path), mode='w')
+    # Create Zarr group (v2 format for Neuroglancer compatibility)
+    root = zarr.open_group(str(output_path), mode='w', zarr_format=2)
 
-    # Compression codec
-    compressor = BloscCodec(cname='zstd', clevel=3, shuffle='bitshuffle')
+    # Compression codec (numcodecs for Zarr v2)
+    compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
     # Level 0: Full resolution with (ny, nx, 1) chunking for slice access
     chunk_shape_0 = (output_shape[0], output_shape[1], 1)
@@ -424,8 +460,8 @@ def write_bundle_slices_zarr(output_path: Path,
         '0',
         shape=output_shape,
         chunks=chunk_shape_0,
-        dtype=np.uint32,
-        compressors=[compressor]
+        dtype=np.uint16,
+        compressor=compressor
     )
 
     # Write level 0 slice by slice
@@ -434,12 +470,12 @@ def write_bundle_slices_zarr(output_path: Path,
 
     for z in tqdm(range(n_slices), desc="Writing level 0", unit="slice"):
         slice_2d = slices[:, :, z]
-        level_0[:, :, z] = slice_2d.astype(np.uint32)
+        level_0[:, :, z] = slice_2d.astype(np.uint16)
         segment_id_set.update(np.unique(slice_2d).tolist())
 
     # Remove background from segment IDs
     segment_id_set.discard(0)
-    segment_ids = np.array(sorted(segment_id_set), dtype=np.uint32)
+    segment_ids = np.array(sorted(segment_id_set), dtype=np.uint16)
     logger.info(f"Found {len(segment_ids)} unique segments")
 
     # Generate pyramid levels
@@ -459,8 +495,8 @@ def write_bundle_slices_zarr(output_path: Path,
             str(level),
             shape=downsampled.shape,
             chunks=chunk_shape,
-            dtype=np.uint32,
-            compressors=[compressor]
+            dtype=np.uint16,
+            compressor=compressor
         )
         level_ds[:] = downsampled
 
@@ -472,7 +508,7 @@ def write_bundle_slices_zarr(output_path: Path,
 
     # Store segment IDs
     labels_group = root.create_group('labels')
-    seg_array = labels_group.create_array('segment_ids', shape=segment_ids.shape, dtype=np.uint32)
+    seg_array = labels_group.create_array('segment_ids', shape=segment_ids.shape, dtype=np.uint16)
     seg_array[:] = segment_ids
 
     # Write metadata
@@ -544,13 +580,13 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
     ny = int(np.ceil(v_max - v_min)) + 1
 
     logger.info(f"Output dimensions: {ny} x {nx} x {n_slices}")
-    output_size_gb = ny * nx * n_slices * 4 / (1024**3)
+    output_size_gb = ny * nx * n_slices * 2 / (1024**3)  # uint16 = 2 bytes
     logger.info(f"Output size: {output_size_gb:.2f} GB")
 
-    # Create Zarr store and level 0
+    # Create Zarr store and level 0 (v2 format for Neuroglancer compatibility)
     logger.info(f"Creating Zarr store: {output_path}")
-    root = zarr.open_group(str(output_path), mode='w')
-    compressor = BloscCodec(cname='zstd', clevel=3, shuffle='bitshuffle')
+    root = zarr.open_group(str(output_path), mode='w', zarr_format=2)
+    compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
     output_shape = (ny, nx, n_slices)
     chunk_shape_0 = (ny, nx, 1)
@@ -558,8 +594,8 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
         '0',
         shape=output_shape,
         chunks=chunk_shape_0,
-        dtype=np.uint32,
-        compressors=[compressor]
+        dtype=np.uint16,
+        compressor=compressor
     )
 
     # Pre-compute 2D grid (reused for all slices)
@@ -575,7 +611,7 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
     # Create LUT to filter only bundle axons (zero out non-bundle labels)
     bundle_labels = set(bundle['axon_labels'])
     max_label = int(volume.max())
-    label_lut = np.zeros(max_label + 1, dtype=np.uint32)
+    label_lut = np.zeros(max_label + 1, dtype=np.uint16)
     for label in bundle_labels:
         if label <= max_label:
             label_lut[label] = label  # Keep bundle labels, others stay 0
@@ -626,7 +662,7 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
         slice_2d = label_lut[slice_2d]
 
         # Write immediately to Zarr (Zarr handles concurrent writes to different chunks)
-        level_0[:, :, slice_idx] = slice_2d.astype(np.uint32)
+        level_0[:, :, slice_idx] = slice_2d.astype(np.uint16)
 
         # Update segment IDs (thread-safe)
         unique_ids = set(np.unique(slice_2d).tolist())
@@ -651,7 +687,7 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
 
     # Remove background
     segment_id_set.discard(0)
-    segment_ids = np.array(sorted(segment_id_set), dtype=np.uint32)
+    segment_ids = np.array(sorted(segment_id_set), dtype=np.uint16)
     logger.info(f"Found {len(segment_ids)} unique segments")
 
     # Clear references to volume data to allow garbage collection
@@ -660,14 +696,36 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
 
     # Store segment IDs
     labels_group = root.create_group('labels')
-    seg_array = labels_group.create_array('segment_ids', shape=segment_ids.shape, dtype=np.uint32)
+    seg_array = labels_group.create_array('segment_ids', shape=segment_ids.shape, dtype=np.uint16)
     seg_array[:] = segment_ids
 
-    # Write metadata (pyramids will be generated separately)
-    root.attrs.update(create_ome_ngff_metadata(bundle, voxel_size_um, n_levels, n_slices))
+    # Compute spatial info for metadata
+    # Origin of output volume (voxel 0,0,0) in original [z,y,x] coordinates
+    # y_out=0 -> v = v_min (padded), x_out=0 -> u = u_min (padded), z_out=0 -> fiber_min
+    volume_center = bbox['volume_center']
+    origin_voxels = (volume_center
+                     + bbox['fiber_min'] * fiber_direction
+                     + u_min * v1
+                     + v_min * v2)
 
+    spatial_info = {
+        'origin_voxels': origin_voxels,
+        'v1': v1,
+        'v2': v2,
+        'volume_center': volume_center,
+        'bbox': bbox
+    }
+
+    # Write metadata (pyramids will be generated separately)
+    root.attrs.update(create_ome_ngff_metadata(bundle, voxel_size_um, n_levels, n_slices, spatial_info))
+
+    # Log spatial positioning info
+    origin_um = origin_voxels * voxel_size_um
     logger.info(f"Level 0 written to: {output_path}")
     logger.info(f"  Shape: {output_shape}")
+    logger.info(f"  Origin (voxels, zyx): [{origin_voxels[0]:.1f}, {origin_voxels[1]:.1f}, {origin_voxels[2]:.1f}]")
+    logger.info(f"  Origin (μm, zyx): [{origin_um[0]:.2f}, {origin_um[1]:.2f}, {origin_um[2]:.2f}]")
+    logger.info(f"  Translation (μm, yxz): [{origin_um[1]:.2f}, {origin_um[2]:.2f}, {origin_um[0]:.2f}]")
 
     gc.collect()
 
@@ -686,7 +744,7 @@ def generate_pyramids_streamed(zarr_path: Path, n_levels: int = 5):
     logger.info(f"\nGenerating pyramids (streamed) for: {zarr_path}")
 
     root = zarr.open_group(str(zarr_path), mode='r+')
-    compressor = BloscCodec(cname='zstd', clevel=3, shuffle='bitshuffle')
+    compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
     prev_level_key = '0'
 
@@ -711,8 +769,8 @@ def generate_pyramids_streamed(zarr_path: Path, n_levels: int = 5):
             str(level),
             shape=new_shape,
             chunks=chunk_shape,
-            dtype=np.uint32,
-            compressors=[compressor]
+            dtype=np.uint16,
+            compressor=compressor
         )
 
         # Process slice pairs from previous level

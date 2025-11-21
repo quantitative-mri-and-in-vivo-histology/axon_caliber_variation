@@ -42,7 +42,7 @@ def load_volume_downsampled(mat_file: Path, downsample: int = 4) -> Tuple[np.nda
     # MATLAB v7.3 files are HDF5-based
     with h5py.File(mat_file, 'r') as f:
         # Load final_lbl dataset
-        volume_full = f['final_lbl'][()].astype(np.uint32)
+        volume_full = f['final_lbl'][()]
 
         logger.info(f"Original shape: {volume_full.shape}")
 

@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 import h5py
+import numcodecs
 import numpy as np
 import zarr
-from zarr.codecs import BloscCodec
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -214,10 +214,16 @@ def create_ome_ngff_metadata(bundle: Dict, voxel_size_um: float, n_levels: int =
         voxel_size = voxel_size_um * scale_factor
         datasets.append({
             "path": str(level),
-            "coordinateTransformations": [{
-                "type": "scale",
-                "scale": [voxel_size, voxel_size, voxel_size]
-            }]
+            "coordinateTransformations": [
+                {
+                    "type": "scale",
+                    "scale": [voxel_size, voxel_size, voxel_size]
+                },
+                {
+                    "type": "translation",
+                    "translation": [0.0, 0.0, 0.0]
+                }
+            ]
         })
 
     metadata = {
@@ -271,11 +277,11 @@ def write_bundle_level0(volume: np.ndarray,
     logger.info(f"Creating Zarr store: {output_path}")
     logger.info(f"Output shape: {output_shape}")
 
-    # Create Zarr group (v3 API)
-    root = zarr.open_group(str(output_path), mode='w')
+    # Create Zarr group (v2 format for Neuroglancer compatibility)
+    root = zarr.open_group(str(output_path), mode='w', zarr_format=2)
 
-    # Compression codec (v3 API)
-    compressor = BloscCodec(cname='zstd', clevel=3, shuffle='bitshuffle')
+    # Compression codec (numcodecs for Zarr v2)
+    compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
     # Level 0: Full resolution with (full_y, full_x, 1) chunking for slice access
     chunk_shape_0 = (output_shape[0], output_shape[1], 1)
@@ -283,8 +289,8 @@ def write_bundle_level0(volume: np.ndarray,
         '0',
         shape=output_shape,
         chunks=chunk_shape_0,
-        dtype=np.uint32,
-        compressors=[compressor]
+        dtype=np.uint16,
+        compressor=compressor
     )
 
     # Write level 0 slice by slice, tracking segment IDs
@@ -301,7 +307,7 @@ def write_bundle_level0(volume: np.ndarray,
 
     # Remove 0 from segment IDs
     segment_id_set.discard(0)
-    segment_ids = np.array(sorted(segment_id_set), dtype=np.uint32)
+    segment_ids = np.array(sorted(segment_id_set), dtype=np.uint16)
     logger.info(f"Found {len(segment_ids)} unique segments")
 
     return segment_ids
@@ -325,8 +331,8 @@ def generate_bundle_pyramid(output_path: Path,
     # Open existing Zarr store
     root = zarr.open_group(str(output_path), mode='r+')
 
-    # Compression codec (v3 API)
-    compressor = BloscCodec(cname='zstd', clevel=3, shuffle='bitshuffle')
+    # Compression codec (numcodecs for Zarr v2)
+    compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
     # Load level 0 into memory for pyramid generation
     logger.info("Loading level 0 for pyramid generation...")
@@ -342,13 +348,13 @@ def generate_bundle_pyramid(output_path: Path,
         chunk_size = min(64, min(downsampled.shape))
         chunk_shape = (chunk_size, chunk_size, chunk_size)
 
-        # Create array for this level (v3 API)
+        # Create array for this level
         level_ds = root.create_array(
             str(level),
             shape=downsampled.shape,
             chunks=chunk_shape,
-            dtype=np.uint32,
-            compressors=[compressor]
+            dtype=np.uint16,
+            compressor=compressor
         )
         level_ds[:] = downsampled
 
@@ -360,10 +366,9 @@ def generate_bundle_pyramid(output_path: Path,
     # Free pyramid memory
     del current_data
 
-    # Store segment IDs in a labels group (v3 API)
+    # Store segment IDs in a labels group
     labels_group = root.create_group('labels')
-    seg_array = labels_group.create_array('segment_ids', shape=segment_ids.shape, dtype=np.uint32)
-    seg_array[:] = segment_ids
+    labels_group.create_array('segment_ids', data=segment_ids.astype(np.uint16))
 
     # Write OME-NGFF metadata
     root.attrs.update(create_ome_ngff_metadata(bundle, voxel_size_um, n_levels))

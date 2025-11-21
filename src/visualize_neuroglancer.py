@@ -219,7 +219,8 @@ def load_hdf5_volume(volume_file: Path, downsample: int = 1) -> tuple:
 
 
 def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port: int = 9999,
-                      level: int = None, downsample: int = 1, multires: bool = True):
+                      level: int = None, downsample: int = 1, multires: bool = True,
+                      grayscale_file: Path = None):
     """
     Visualize one or more volumes in Neuroglancer.
 
@@ -230,6 +231,7 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
         level: Pyramid level for Zarr files (None = auto)
         downsample: Downsampling factor for HDF5 files
         multires: Use multi-resolution HTTP serving for Zarr (default True)
+        grayscale_file: Optional path to grayscale HDF5 file with 'raw' dataset
     """
     # Set up Neuroglancer
     neuroglancer.set_server_bind_address(bind_address, port)
@@ -239,8 +241,12 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
 
     # Load and add each volume
     for volume_path in volume_paths:
-        # Detect format
-        is_zarr = volume_path.suffix == '.zarr' or (volume_path.is_dir() and (volume_path / '.zattrs').exists())
+        # Detect format (Zarr v2 uses .zattrs/.zgroup, v3 uses zarr.json)
+        is_zarr = (volume_path.suffix == '.zarr' or
+                   (volume_path.is_dir() and
+                    ((volume_path / '.zattrs').exists() or
+                     (volume_path / '.zgroup').exists() or
+                     (volume_path / 'zarr.json').exists())))
 
         if is_zarr and multires:
             # Use HTTP serving for multi-resolution Zarr
@@ -264,23 +270,49 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
             zarr_url = f"zarr://http://localhost:{http_port}/{zarr_name}"
 
             logger.info(f"Serving Zarr at: {zarr_url}")
+            logger.info(f"Test HTTP access: curl http://localhost:{http_port}/{zarr_name}/.zattrs")
 
-            # Get voxel size in nanometers
-            voxel_size_nm = metadata['voxel_size_um'] * 1000
+            # Verify HTTP server is accessible
+            import urllib.request
+            try:
+                test_url = f"http://localhost:{http_port}/{zarr_name}/.zattrs"
+                with urllib.request.urlopen(test_url, timeout=2) as response:
+                    if response.status == 200:
+                        logger.info("HTTP server verified - .zattrs accessible")
+            except Exception as e:
+                logger.error(f"HTTP server test failed: {e}")
 
-            # Get segment IDs
-            segment_ids = metadata['segment_ids'] if metadata['segment_ids'] else []
+            # Get voxel size - Zarr metadata uses micrometers
+            voxel_size_um = metadata['voxel_size_um']
+
+            # Get segment IDs - only pass if we have them, otherwise let Neuroglancer show all
+            segment_ids = metadata.get('segment_ids')
+
+            if segment_ids:
+                logger.info(f"Using {len(segment_ids)} stored segment IDs")
+            else:
+                logger.info("No stored segment IDs - Neuroglancer will show all segments")
 
             with viewer.txn() as s:
                 # Add as segmentation layer with Zarr source
-                s.layers[layer_name] = neuroglancer.SegmentationLayer(
-                    source=zarr_url,
-                    segments=segment_ids,
-                )
+                layer_kwargs = {'source': zarr_url}
+                if segment_ids:
+                    layer_kwargs['segments'] = segment_ids
+                s.layers[layer_name] = neuroglancer.SegmentationLayer(**layer_kwargs)
+
+                # Set initial position to center of volume
+                # Position order matches OME-NGFF axes order: [y, x, z]
+                # Shape is also [y, x, z]
+                shape = metadata['shape']
+                center = [shape[0] // 2 * voxel_size_um,  # y
+                          shape[1] // 2 * voxel_size_um,  # x
+                          shape[2] // 2 * voxel_size_um]  # z
+                s.position = center
 
             logger.info(f"Added multi-resolution layer: {layer_name}")
             logger.info(f"  Shape: {metadata['shape']}")
             logger.info(f"  Levels: {metadata['n_levels']}")
+            logger.info(f"  Center position (nm): {center}")
             if metadata['n_axons']:
                 logger.info(f"  Expected axons: {metadata['n_axons']}")
 
@@ -317,6 +349,13 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                     ),
                     segments=segment_ids,
                 )
+
+                # Set initial position to center of volume
+                # Position order matches dimension names: [y, x, z]
+                center = [volume.shape[0] // 2 * voxel_size_nm,  # y
+                          volume.shape[1] // 2 * voxel_size_nm,  # x
+                          volume.shape[2] // 2 * voxel_size_nm]  # z
+                s.position = center
 
             logger.info(f"Added layer: {layer_name}")
             if metadata['n_axons']:
@@ -356,9 +395,66 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                     segments=segment_ids,
                 )
 
+                # Set initial position to center of volume
+                # Position order matches dimension names: [y, x, z]
+                center = [volume.shape[0] // 2 * voxel_size_nm,  # y
+                          volume.shape[1] // 2 * voxel_size_nm,  # x
+                          volume.shape[2] // 2 * voxel_size_nm]  # z
+                s.position = center
+
             logger.info(f"Added layer: {layer_name}")
             if metadata['n_axons']:
                 logger.info(f"  Expected axons: {metadata['n_axons']}")
+
+    # Add grayscale image layer if provided
+    if grayscale_file is not None:
+        import h5py
+
+        logger.info(f"Loading grayscale image: {grayscale_file}")
+
+        with h5py.File(grayscale_file, 'r') as f:
+            # Try common dataset names
+            if 'raw' in f:
+                dset_name = 'raw'
+            elif 'data' in f:
+                dset_name = 'data'
+            else:
+                dset_name = list(f.keys())[0]
+
+            dset = f[dset_name]
+            logger.info(f"Dataset '{dset_name}': shape {dset.shape}, dtype {dset.dtype}")
+
+            # Load with optional downsampling
+            if downsample > 1:
+                grayscale = dset[::downsample, ::downsample, ::downsample]
+                voxel_size_nm = 50 * downsample  # Assuming 0.05 μm base voxel size
+            else:
+                grayscale = dset[:]
+                voxel_size_nm = 50  # 0.05 μm = 50 nm
+
+        logger.info(f"Grayscale volume: {grayscale.shape}, {grayscale.nbytes / 1024**3:.2f} GB")
+
+        with viewer.txn() as s:
+            s.layers['grayscale'] = neuroglancer.ImageLayer(
+                source=neuroglancer.LocalVolume(
+                    data=grayscale,
+                    dimensions=neuroglancer.CoordinateSpace(
+                        names=['y', 'x', 'z'],
+                        units=['nm', 'nm', 'nm'],
+                        scales=[voxel_size_nm, voxel_size_nm, voxel_size_nm],
+                    ),
+                    voxel_offset=[0, 0, 0],
+                ),
+            )
+
+            # Set initial position to center if not already set
+            # Position order matches dimension names: [y, x, z]
+            center = [grayscale.shape[0] // 2 * voxel_size_nm,  # y
+                      grayscale.shape[1] // 2 * voxel_size_nm,  # x
+                      grayscale.shape[2] // 2 * voxel_size_nm]  # z
+            s.position = center
+
+        logger.info("Added grayscale image layer")
 
     # Print viewer URL
     print(f"\nNeuroglancer viewer URL: {viewer.get_viewer_url()}")
@@ -381,6 +477,8 @@ def main():
     )
     parser.add_argument('volume_files', type=Path, nargs='+',
                         help='One or more volume files to visualize (Zarr or HDF5)')
+    parser.add_argument('--grayscale', type=Path, default=None,
+                        help='Optional grayscale image (HDF5 with "raw" dataset)')
     parser.add_argument('--bind', type=str, default='localhost',
                         help='Address to bind to (default: localhost)')
     parser.add_argument('--port', type=int, default=9999,
@@ -400,8 +498,12 @@ def main():
             logger.error(f"File not found: {f}")
             return 1
 
+    if args.grayscale and not args.grayscale.exists():
+        logger.error(f"Grayscale file not found: {args.grayscale}")
+        return 1
+
     visualize_volumes(args.volume_files, args.bind, args.port, args.level, args.downsample,
-                      multires=not args.no_multires)
+                      multires=not args.no_multires, grayscale_file=args.grayscale)
     return 0
 
 

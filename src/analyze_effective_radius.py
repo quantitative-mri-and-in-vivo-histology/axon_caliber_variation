@@ -99,7 +99,7 @@ def extract_radii_per_slice(volume_file: Path,
         Tuple of (histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers)
     """
     # Detect format
-    is_zarr = volume_file.suffix == '.zarr' or (volume_file.is_dir() and (volume_file / '.zattrs').exists())
+    is_zarr = volume_file.suffix == '.zarr' or (volume_file.is_dir() and (volume_file / 'zarr.json').exists())
 
     # Get volume shape from file without loading
     if is_zarr:
@@ -226,7 +226,8 @@ def plot_effective_radius_profile(histogram_per_slice: Dict[int, np.ndarray],
                                   bin_centers: np.ndarray,
                                   output_file: Path,
                                   population_name: str = "Axons",
-                                  slice_thickness_um: float = 0.2):
+                                  slice_thickness_um: float = 0.2,
+                                  min_axon_fraction: float = 0.0):
     """
     Plot effective radius as a function of position along the tract.
 
@@ -237,6 +238,7 @@ def plot_effective_radius_profile(histogram_per_slice: Dict[int, np.ndarray],
         output_file: Path to save figure
         population_name: Name of the population (CC or CG)
         slice_thickness_um: Thickness of each slice in micrometers
+        min_axon_fraction: Minimum fraction of max axon count to include slice (0.0 = use all)
     """
     logger.info(f"Plotting effective radius profile for {population_name}")
 
@@ -252,7 +254,48 @@ def plot_effective_radius_profile(histogram_per_slice: Dict[int, np.ndarray],
     r_eff_per_slice = np.array(r_eff_per_slice)
     n_axons_array = np.array([n_axons_per_slice[z] for z in slice_indices])
 
-    # Compute global effective radius (pooled over all slices)
+    # Filter slices based on axon count threshold
+    if min_axon_fraction > 0.0:
+        # Find slice with maximum axon count
+        max_idx = np.argmax(n_axons_array)
+        max_count = n_axons_array[max_idx]
+        threshold_count = min_axon_fraction * max_count
+
+        # Expand symmetrically from max until we hit threshold
+        left_idx = max_idx
+        right_idx = max_idx
+
+        # Find extent on each side
+        left_extent = 0
+        for i in range(max_idx, -1, -1):
+            if n_axons_array[i] >= threshold_count:
+                left_extent = max_idx - i
+            else:
+                break
+
+        right_extent = 0
+        for i in range(max_idx, len(n_axons_array)):
+            if n_axons_array[i] >= threshold_count:
+                right_extent = i - max_idx
+            else:
+                break
+
+        # Use symmetric extent (smaller of the two)
+        extent = min(left_extent, right_extent)
+        start_idx = max_idx - extent
+        end_idx = max_idx + extent + 1  # +1 for inclusive
+
+        logger.info(f"Axon count filtering (threshold={min_axon_fraction:.2f}):")
+        logger.info(f"  Max axon count: {max_count} at slice {slice_indices[max_idx]}")
+        logger.info(f"  Using slices {slice_indices[start_idx]}-{slice_indices[end_idx-1]} "
+                   f"({end_idx - start_idx} of {len(slice_indices)} slices)")
+
+        # Filter arrays
+        slice_indices = slice_indices[start_idx:end_idx]
+        r_eff_per_slice = r_eff_per_slice[start_idx:end_idx]
+        n_axons_array = n_axons_array[start_idx:end_idx]
+
+    # Compute global effective radius (pooled over selected slices)
     total_histogram = np.sum([histogram_per_slice[z] for z in slice_indices], axis=0)
     r_eff_global = compute_effective_radius_from_histogram(total_histogram, bin_centers)
 
@@ -301,7 +344,8 @@ def plot_effective_radius_profile(histogram_per_slice: Dict[int, np.ndarray],
 def analyze_population(volume_file: Path,
                        output_dir: Path,
                        voxel_size_um: float = 0.2,
-                       n_jobs: int = -1) -> Tuple[float, np.ndarray]:
+                       n_jobs: int = -1,
+                       min_axon_fraction: float = 0.0) -> Tuple[float, np.ndarray]:
     """
     Analyze effective radius for a population volume.
 
@@ -313,6 +357,7 @@ def analyze_population(volume_file: Path,
         output_dir: Directory for output plots
         voxel_size_um: Voxel size in micrometers (0.05 * downsample_factor)
         n_jobs: Number of parallel jobs (-1 = use all CPUs)
+        min_axon_fraction: Minimum fraction of max axon count to include slice (0.0 = use all)
 
     Returns:
         Tuple of (global_r_eff, r_eff_per_slice)
@@ -322,7 +367,7 @@ def analyze_population(volume_file: Path,
     logger.info(f"{'='*80}\n")
 
     # Detect format
-    is_zarr = volume_file.suffix == '.zarr' or (volume_file.is_dir() and (volume_file / '.zattrs').exists())
+    is_zarr = volume_file.suffix == '.zarr' or (volume_file.is_dir() and (volume_file / 'zarr.json').exists())
 
     # Get metadata without loading volume
     if is_zarr:
@@ -363,7 +408,8 @@ def analyze_population(volume_file: Path,
         bin_centers,
         output_file,
         population_name,
-        slice_thickness_um=voxel_size_um
+        slice_thickness_um=voxel_size_um,
+        min_axon_fraction=min_axon_fraction
     )
 
     logger.info(f"\n{'='*80}")
@@ -387,6 +433,8 @@ if __name__ == '__main__':
                        help='Voxel size in micrometers (default: 0.05 for full resolution)')
     parser.add_argument('--n-jobs', type=int, default=-1,
                        help='Number of parallel jobs (default: -1 = use all CPUs, 1 = serial)')
+    parser.add_argument('--min-axon-fraction', type=float, default=0.75,
+                       help='Minimum fraction of max axon count to include slice (default: 0.0 = use all)')
 
     args = parser.parse_args()
 
@@ -394,5 +442,6 @@ if __name__ == '__main__':
         args.volume_file,
         args.output_dir,
         voxel_size_um=args.voxel_size,
-        n_jobs=args.n_jobs
+        n_jobs=args.n_jobs,
+        min_axon_fraction=args.min_axon_fraction
     )

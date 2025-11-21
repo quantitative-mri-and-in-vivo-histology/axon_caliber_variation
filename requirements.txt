@@ -21,3 +21,8 @@ debugpy
 ipykernel
 ipywidgets
 plotly
+neuroglancer
+
+# Zarr and OME-NGFF support
+zarr>=3.0.0
+ome-zarr>=0.8.0
