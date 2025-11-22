@@ -234,6 +234,88 @@ def compute_slice_positions(bbox: Dict, voxel_size_um: float) -> np.ndarray:
 
 
 # =============================================================================
+# Axon and slice filtering
+# =============================================================================
+
+def compute_valid_slice_range(axon_counts: List[int], min_axon_fraction: float) -> Tuple[int, int]:
+    """
+    Compute valid slice range using symmetric expansion from maximum.
+
+    Finds the slice with max axon count, then expands symmetrically until
+    hitting the threshold (fraction of max). Uses the smaller extent.
+
+    Args:
+        axon_counts: List of axon counts per slice
+        min_axon_fraction: Minimum fraction of max count (e.g., 0.75)
+
+    Returns:
+        (start_idx, end_idx) - valid slice range (inclusive start, exclusive end)
+    """
+    if not axon_counts:
+        return 0, 0
+
+    n_slices = len(axon_counts)
+    max_count = max(axon_counts)
+    if max_count == 0:
+        return 0, 0
+
+    threshold = max_count * min_axon_fraction
+    max_idx = axon_counts.index(max_count)
+
+    # Expand left
+    left_idx = max_idx
+    while left_idx > 0 and axon_counts[left_idx - 1] >= threshold:
+        left_idx -= 1
+
+    # Expand right
+    right_idx = max_idx
+    while right_idx < n_slices - 1 and axon_counts[right_idx + 1] >= threshold:
+        right_idx += 1
+
+    # Make symmetric (use smaller extent)
+    left_extent = max_idx - left_idx
+    right_extent = right_idx - max_idx
+    min_extent = min(left_extent, right_extent)
+
+    start_idx = max_idx - min_extent
+    end_idx = max_idx + min_extent + 1  # exclusive
+
+    return start_idx, end_idx
+
+
+def filter_axons_by_coverage(axon_slices: Dict[int, Set[int]],
+                              valid_slice_range: Tuple[int, int],
+                              min_coverage: float) -> Set[int]:
+    """
+    Filter axons by their coverage across valid slices.
+
+    Args:
+        axon_slices: Dict mapping axon_id -> set of slice indices where it appears
+        valid_slice_range: (start_idx, end_idx) of valid slices
+        min_coverage: Minimum fraction of valid slices axon must appear in (e.g., 0.5)
+
+    Returns:
+        Set of valid axon IDs
+    """
+    start_idx, end_idx = valid_slice_range
+    n_valid_slices = end_idx - start_idx
+
+    if n_valid_slices == 0:
+        return set()
+
+    valid_axons = set()
+    threshold = n_valid_slices * min_coverage
+
+    for axon_id, slice_indices in axon_slices.items():
+        # Count how many valid slices this axon appears in
+        count = sum(1 for idx in slice_indices if start_idx <= idx < end_idx)
+        if count >= threshold:
+            valid_axons.add(axon_id)
+
+    return valid_axons
+
+
+# =============================================================================
 # Batched slice extraction (performance-critical)
 # =============================================================================
 
@@ -530,12 +612,19 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
                                          voxel_size_um: float = 0.05,
                                          padding_um: float = 0.5,
                                          n_levels: int = 5,
-                                         n_workers: int = 32):
+                                         n_workers: int = 32,
+                                         min_axon_fraction: float = 0.75,
+                                         min_axon_coverage: float = 0.5):
     """
     Extract orthogonal slices and write directly to Zarr (streaming).
 
     This version extracts slices in parallel and streams them to Zarr.
     Pyramids are generated separately to allow freeing the original volume first.
+
+    Two-pass extraction with filtering:
+    1. First pass: track axon presence per slice
+    2. Filter: compute valid slice range and valid axons
+    3. Second pass: write filtered data
 
     Args:
         volume: Full 3D labeled volume
@@ -545,6 +634,8 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
         padding_um: Padding around bounding box in micrometers
         n_levels: Number of pyramid levels (stored in metadata, pyramids generated separately)
         n_workers: Number of parallel workers for extraction
+        min_axon_fraction: Minimum axon count fraction for valid slices (default 0.75)
+        min_axon_coverage: Minimum fraction of valid slices axon must appear in (default 0.5)
     """
     logger.info(f"\n{'='*60}")
     logger.info(f"Processing bundle {bundle['bundle_id']}")
@@ -618,16 +709,18 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
 
     logger.info(f"Filtering to {len(bundle_labels)} bundle axons")
 
-    # Track segment IDs (thread-safe with lock)
+    # =========================================================================
+    # FIRST PASS: Track axon presence per slice (no writing)
+    # =========================================================================
     import threading
-    segment_id_set = set()
-    segment_lock = threading.Lock()
-    progress_lock = threading.Lock()
-    completed_count = [0]  # Use list for mutable in closure
 
-    # Define function to extract and write a single slice
-    def extract_and_write_slice(slice_idx: int) -> None:
-        """Extract a single orthogonal slice and write immediately."""
+    # Track which axons appear in which slices
+    axon_slices: Dict[int, Set[int]] = {label: set() for label in bundle_labels}
+    axon_counts = [0] * n_slices
+    axon_lock = threading.Lock()
+
+    def extract_and_track_slice(slice_idx: int) -> None:
+        """Extract slice and track axon presence (no writing)."""
         pos = slice_positions[slice_idx]
         origin = volume_center + pos * fiber_direction
 
@@ -655,40 +748,137 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
                 cval=0
             )
 
-        # Reshape to 2D
+        # Reshape to 2D and filter to bundle
         slice_2d = sampled.reshape(ny, nx)
-
-        # Filter to keep only bundle axons (apply LUT)
         slice_2d = label_lut[slice_2d]
 
-        # Write immediately to Zarr (Zarr handles concurrent writes to different chunks)
-        level_0[:, :, slice_idx] = slice_2d.astype(np.uint16)
+        # Track unique axons in this slice
+        unique_ids = set(np.unique(slice_2d).tolist())
+        unique_ids.discard(0)
 
-        # Update segment IDs (thread-safe)
+        with axon_lock:
+            axon_counts[slice_idx] = len(unique_ids)
+            for axon_id in unique_ids:
+                if axon_id in axon_slices:
+                    axon_slices[axon_id].add(slice_idx)
+
+    # Run first pass
+    actual_workers = min(n_workers, n_slices)
+    logger.info(f"Pass 1: Tracking axon presence in {n_slices} slices...")
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = [executor.submit(extract_and_track_slice, i) for i in range(n_slices)]
+        for future in tqdm(as_completed(futures), total=n_slices, desc="Pass 1 (tracking)"):
+            future.result()
+
+    # =========================================================================
+    # FILTERING: Compute valid slice range and valid axons
+    # =========================================================================
+    logger.info(f"Computing filtering criteria...")
+
+    # Compute valid slice range
+    valid_start, valid_end = compute_valid_slice_range(axon_counts, min_axon_fraction)
+    n_valid_slices = valid_end - valid_start
+
+    max_count = max(axon_counts)
+    max_idx = axon_counts.index(max_count)
+    logger.info(f"  Max axon count: {max_count} at slice {max_idx}")
+    logger.info(f"  Valid slice range: {valid_start}-{valid_end-1} ({n_valid_slices} slices)")
+    logger.info(f"  Threshold: {min_axon_fraction * 100:.0f}% of max = {int(max_count * min_axon_fraction)} axons")
+
+    # Filter axons by coverage
+    valid_axons = filter_axons_by_coverage(axon_slices, (valid_start, valid_end), min_axon_coverage)
+    n_rejected_axons = len(bundle_labels) - len(valid_axons)
+    logger.info(f"  Valid axons: {len(valid_axons)} (rejected {n_rejected_axons})")
+    logger.info(f"  Coverage threshold: {min_axon_coverage * 100:.0f}% of {n_valid_slices} slices = {int(n_valid_slices * min_axon_coverage)} slices")
+
+    # Create filtered LUT
+    filtered_lut = np.zeros(max_label + 1, dtype=np.uint16)
+    for label in valid_axons:
+        if label <= max_label:
+            filtered_lut[label] = label
+
+    # Update output shape for valid slices only
+    output_shape = (ny, nx, n_valid_slices)
+
+    # Update slice positions for valid range
+    valid_slice_positions = slice_positions[valid_start:valid_end]
+
+    # =========================================================================
+    # SECOND PASS: Write filtered slices
+    # =========================================================================
+    logger.info(f"Creating Zarr store: {output_path}")
+    logger.info(f"Output shape: {output_shape}")
+
+    root = zarr.open_group(str(output_path), mode='w', zarr_format=2)
+    compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
+
+    chunk_shape_0 = (ny, nx, 1)
+    level_0 = root.create_array(
+        '0',
+        shape=output_shape,
+        chunks=chunk_shape_0,
+        dtype=np.uint16,
+        compressor=compressor
+    )
+
+    # Track segment IDs
+    segment_id_set = set()
+    segment_lock = threading.Lock()
+
+    def extract_and_write_slice(output_idx: int) -> None:
+        """Extract and write a single filtered slice."""
+        pos = valid_slice_positions[output_idx]
+        origin = volume_center + pos * fiber_direction
+
+        # Build coordinates for this slice
+        coords = origin[:, np.newaxis, np.newaxis] + displacement
+
+        # Flatten for map_coordinates
+        coords_flat = coords.reshape(3, -1)
+
+        # Check bounds
+        in_bounds = (
+            (coords_flat[0] >= 0) & (coords_flat[0] < volume.shape[0]) &
+            (coords_flat[1] >= 0) & (coords_flat[1] < volume.shape[1]) &
+            (coords_flat[2] >= 0) & (coords_flat[2] < volume.shape[2])
+        )
+
+        # Sample with nearest neighbor
+        sampled = np.zeros(coords_flat.shape[1], dtype=volume.dtype)
+        if in_bounds.any():
+            sampled[in_bounds] = map_coordinates(
+                volume,
+                coords_flat[:, in_bounds],
+                order=0,
+                mode='constant',
+                cval=0
+            )
+
+        # Reshape to 2D and apply filtered LUT
+        slice_2d = sampled.reshape(ny, nx)
+        slice_2d = filtered_lut[slice_2d]
+
+        # Write to Zarr
+        level_0[:, :, output_idx] = slice_2d.astype(np.uint16)
+
+        # Update segment IDs
         unique_ids = set(np.unique(slice_2d).tolist())
         with segment_lock:
             segment_id_set.update(unique_ids)
 
-        # Update progress
-        with progress_lock:
-            completed_count[0] += 1
-
-    # Extract and write slices in parallel
-    actual_workers = min(n_workers, n_slices)
-    logger.info(f"Extracting {n_slices} slices using {actual_workers} parallel workers...")
+    # Run second pass
+    logger.info(f"Pass 2: Writing {n_valid_slices} filtered slices...")
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        # Submit all tasks - they write immediately, no return values accumulate
-        futures = [executor.submit(extract_and_write_slice, i) for i in range(n_slices)]
-
-        # Wait for completion with progress bar
-        for future in tqdm(as_completed(futures), total=n_slices, desc="Extracting slices"):
-            future.result()  # Just check for exceptions, no data returned
+        futures = [executor.submit(extract_and_write_slice, i) for i in range(n_valid_slices)]
+        for future in tqdm(as_completed(futures), total=n_valid_slices, desc="Pass 2 (writing)"):
+            future.result()
 
     # Remove background
     segment_id_set.discard(0)
     segment_ids = np.array(sorted(segment_id_set), dtype=np.uint16)
-    logger.info(f"Found {len(segment_ids)} unique segments")
+    logger.info(f"Found {len(segment_ids)} unique segments in output")
 
     # Clear references to volume data to allow garbage collection
     del displacement, U, V, u_coords, v_coords
@@ -701,10 +891,12 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
 
     # Compute spatial info for metadata
     # Origin of output volume (voxel 0,0,0) in original [z,y,x] coordinates
-    # y_out=0 -> v = v_min (padded), x_out=0 -> u = u_min (padded), z_out=0 -> fiber_min
+    # y_out=0 -> v = v_min (padded), x_out=0 -> u = u_min (padded)
+    # z_out=0 -> first valid slice position (valid_slice_positions[0])
     volume_center = bbox['volume_center']
+    first_slice_pos = valid_slice_positions[0] if len(valid_slice_positions) > 0 else bbox['fiber_min']
     origin_voxels = (volume_center
-                     + bbox['fiber_min'] * fiber_direction
+                     + first_slice_pos * fiber_direction
                      + u_min * v1
                      + v_min * v2)
 
@@ -717,7 +909,7 @@ def extract_and_write_orthogonal_slices(volume: np.ndarray,
     }
 
     # Write metadata (pyramids will be generated separately)
-    root.attrs.update(create_ome_ngff_metadata(bundle, voxel_size_um, n_levels, n_slices, spatial_info))
+    root.attrs.update(create_ome_ngff_metadata(bundle, voxel_size_um, n_levels, n_valid_slices, spatial_info))
 
     # Log spatial positioning info
     origin_um = origin_voxels * voxel_size_um
@@ -816,7 +1008,9 @@ def extract_all_bundles(mat_file: Path,
                         voxel_size_um: float = 0.05,
                         padding_um: float = 0.5,
                         n_levels: int = 5,
-                        n_workers: int = 32):
+                        n_workers: int = 32,
+                        min_axon_fraction: float = 0.75,
+                        min_axon_coverage: float = 0.5):
     """
     Extract orthogonal slices for all bundles in a volume.
 
@@ -828,6 +1022,8 @@ def extract_all_bundles(mat_file: Path,
         padding_um: Padding around bounding box
         n_levels: Number of pyramid levels
         n_workers: Number of parallel workers
+        min_axon_fraction: Minimum axon count fraction for valid slices
+        min_axon_coverage: Minimum fraction of valid slices axon must appear in
     """
     logger.info(f"\n{'='*80}")
     logger.info(f"Extracting orthogonal slices")
@@ -872,7 +1068,9 @@ def extract_all_bundles(mat_file: Path,
             voxel_size_um=voxel_size_um,
             padding_um=padding_um,
             n_levels=n_levels,
-            n_workers=n_workers
+            n_workers=n_workers,
+            min_axon_fraction=min_axon_fraction,
+            min_axon_coverage=min_axon_coverage
         )
 
     # Free original volume before pyramid generation
@@ -915,6 +1113,10 @@ if __name__ == '__main__':
                         help='Number of pyramid levels (default: 5)')
     parser.add_argument('--n-workers', type=int, default=32,
                         help='Number of parallel workers for extraction (default: 32)')
+    parser.add_argument('--min-axon-fraction', type=float, default=0.75,
+                        help='Min axon count fraction for valid slices (default: 0.75)')
+    parser.add_argument('--min-axon-coverage', type=float, default=0.5,
+                        help='Min fraction of valid slices axon must appear in (default: 0.5)')
 
     args = parser.parse_args()
 
@@ -925,5 +1127,7 @@ if __name__ == '__main__':
         voxel_size_um=args.voxel_size,
         padding_um=args.padding,
         n_levels=args.n_levels,
-        n_workers=args.n_workers
+        n_workers=args.n_workers,
+        min_axon_fraction=args.min_axon_fraction,
+        min_axon_coverage=args.min_axon_coverage
     )

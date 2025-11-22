@@ -73,12 +73,44 @@ def start_http_server(directory: Path, port: int = 8000) -> tuple:
     return server, actual_port, thread
 
 
-def get_zarr_metadata(zarr_path: Path) -> dict:
+def detect_zarr_groups(zarr_path: Path) -> list:
+    """
+    Detect segmentation groups in a Zarr store.
+
+    A segmentation group is identified by having a '0' array (pyramid level 0).
+
+    Args:
+        zarr_path: Path to Zarr directory
+
+    Returns:
+        List of group names (empty list if single-level structure, or list like ['cc', 'cg'])
+    """
+    import zarr
+
+    root = zarr.open(str(zarr_path), mode='r')
+
+    # Check if root has direct pyramid levels (single bundle)
+    if '0' in root and isinstance(root['0'], zarr.Array):
+        return []  # Single bundle structure
+
+    # Look for groups that contain pyramid levels
+    groups = []
+    for name in root.keys():
+        if isinstance(root[name], zarr.Group):
+            # Check if this group has pyramid level 0
+            if '0' in root[name] and isinstance(root[name]['0'], zarr.Array):
+                groups.append(name)
+
+    return sorted(groups)
+
+
+def get_zarr_metadata(zarr_path: Path, group_name: str = None) -> dict:
     """
     Get metadata from Zarr store without loading volume data.
 
     Args:
         zarr_path: Path to Zarr directory
+        group_name: Optional group name for multi-group Zarr files
 
     Returns:
         Metadata dictionary
@@ -87,7 +119,22 @@ def get_zarr_metadata(zarr_path: Path) -> dict:
 
     root = zarr.open(str(zarr_path), mode='r')
 
-    attrs = dict(root.attrs)
+    # Navigate to group if specified
+    if group_name:
+        group = root[group_name]
+        # Get group-specific metadata from root attrs
+        root_attrs = dict(root.attrs)
+        group_attrs = root_attrs.get(group_name, {})
+        attrs = {
+            'n_axons': group_attrs.get('n_axons'),
+            'voxel_size_um': root_attrs.get('voxel_size_um', 0.05),
+            'mean_orientation': group_attrs.get('mean_orientation'),
+            'n_levels': root_attrs.get('n_levels', 1),
+        }
+    else:
+        group = root
+        attrs = dict(root.attrs)
+
     metadata = {
         'bundle_id': attrs.get('bundle_id'),
         'n_axons': attrs.get('n_axons'),
@@ -97,11 +144,11 @@ def get_zarr_metadata(zarr_path: Path) -> dict:
     }
 
     # Get shape from level 0
-    metadata['shape'] = root['0'].shape
+    metadata['shape'] = group['0'].shape
 
     # Get segment IDs if available
-    if 'labels' in root and 'segment_ids' in root['labels']:
-        segment_ids = root['labels']['segment_ids'][:]
+    if 'labels' in group and 'segment_ids' in group['labels']:
+        segment_ids = group['labels']['segment_ids'][:]
         metadata['segment_ids'] = segment_ids.tolist()
         logger.info(f"Found {len(segment_ids)} segment IDs")
     else:
@@ -250,27 +297,12 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
 
         if is_zarr and multires:
             # Use HTTP serving for multi-resolution Zarr
-            metadata = get_zarr_metadata(volume_path)
-
-            # Determine layer name
-            if metadata['bundle_id'] is not None:
-                layer_name = f"Bundle_{metadata['bundle_id']:02d}"
-            else:
-                layer_name = volume_path.stem
-
             # Start HTTP server for the parent directory
             parent_dir = volume_path.parent
             zarr_name = volume_path.name
 
-            # Find or start HTTP server for this directory
             server, http_port, thread = start_http_server(parent_dir, port=8000)
             http_servers.append(server)
-
-            # Build Zarr URL for Neuroglancer
-            zarr_url = f"zarr://http://localhost:{http_port}/{zarr_name}"
-
-            logger.info(f"Serving Zarr at: {zarr_url}")
-            logger.info(f"Test HTTP access: curl http://localhost:{http_port}/{zarr_name}/.zattrs")
 
             # Verify HTTP server is accessible
             import urllib.request
@@ -282,39 +314,85 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
             except Exception as e:
                 logger.error(f"HTTP server test failed: {e}")
 
-            # Get voxel size - Zarr metadata uses micrometers
-            voxel_size_um = metadata['voxel_size_um']
+            # Detect if this is a multi-group Zarr (e.g., /cc, /cg)
+            groups = detect_zarr_groups(volume_path)
 
-            # Get segment IDs - only pass if we have them, otherwise let Neuroglancer show all
-            segment_ids = metadata.get('segment_ids')
+            if groups:
+                # Multi-group Zarr - add each group as a separate layer
+                logger.info(f"Detected {len(groups)} segmentation groups: {groups}")
 
-            if segment_ids:
-                logger.info(f"Using {len(segment_ids)} stored segment IDs")
+                for group_name in groups:
+                    metadata = get_zarr_metadata(volume_path, group_name)
+                    layer_name = group_name  # Use group name as layer name
+
+                    # Build Zarr URL pointing to the group
+                    zarr_url = f"zarr://http://localhost:{http_port}/{zarr_name}/{group_name}"
+
+                    logger.info(f"Serving {group_name} at: {zarr_url}")
+
+                    voxel_size_um = metadata['voxel_size_um']
+                    segment_ids = metadata.get('segment_ids')
+
+                    if segment_ids:
+                        logger.info(f"  {group_name}: {len(segment_ids)} segment IDs")
+
+                    with viewer.txn() as s:
+                        layer_kwargs = {'source': zarr_url}
+                        if segment_ids:
+                            layer_kwargs['segments'] = segment_ids
+                        s.layers[layer_name] = neuroglancer.SegmentationLayer(**layer_kwargs)
+
+                        # Set position to center of first group
+                        if group_name == groups[0]:
+                            shape = metadata['shape']
+                            center = [shape[0] // 2 * voxel_size_um,
+                                      shape[1] // 2 * voxel_size_um,
+                                      shape[2] // 2 * voxel_size_um]
+                            s.position = center
+
+                    logger.info(f"Added layer: {layer_name}")
+                    logger.info(f"  Shape: {metadata['shape']}")
+                    if metadata['n_axons']:
+                        logger.info(f"  Axons: {metadata['n_axons']}")
+
             else:
-                logger.info("No stored segment IDs - Neuroglancer will show all segments")
+                # Single-bundle Zarr
+                metadata = get_zarr_metadata(volume_path)
 
-            with viewer.txn() as s:
-                # Add as segmentation layer with Zarr source
-                layer_kwargs = {'source': zarr_url}
+                if metadata['bundle_id'] is not None:
+                    layer_name = f"Bundle_{metadata['bundle_id']:02d}"
+                else:
+                    layer_name = volume_path.stem
+
+                zarr_url = f"zarr://http://localhost:{http_port}/{zarr_name}"
+
+                logger.info(f"Serving Zarr at: {zarr_url}")
+
+                voxel_size_um = metadata['voxel_size_um']
+                segment_ids = metadata.get('segment_ids')
+
                 if segment_ids:
-                    layer_kwargs['segments'] = segment_ids
-                s.layers[layer_name] = neuroglancer.SegmentationLayer(**layer_kwargs)
+                    logger.info(f"Using {len(segment_ids)} stored segment IDs")
+                else:
+                    logger.info("No stored segment IDs - Neuroglancer will show all segments")
 
-                # Set initial position to center of volume
-                # Position order matches OME-NGFF axes order: [y, x, z]
-                # Shape is also [y, x, z]
-                shape = metadata['shape']
-                center = [shape[0] // 2 * voxel_size_um,  # y
-                          shape[1] // 2 * voxel_size_um,  # x
-                          shape[2] // 2 * voxel_size_um]  # z
-                s.position = center
+                with viewer.txn() as s:
+                    layer_kwargs = {'source': zarr_url}
+                    if segment_ids:
+                        layer_kwargs['segments'] = segment_ids
+                    s.layers[layer_name] = neuroglancer.SegmentationLayer(**layer_kwargs)
 
-            logger.info(f"Added multi-resolution layer: {layer_name}")
-            logger.info(f"  Shape: {metadata['shape']}")
-            logger.info(f"  Levels: {metadata['n_levels']}")
-            logger.info(f"  Center position (nm): {center}")
-            if metadata['n_axons']:
-                logger.info(f"  Expected axons: {metadata['n_axons']}")
+                    shape = metadata['shape']
+                    center = [shape[0] // 2 * voxel_size_um,
+                              shape[1] // 2 * voxel_size_um,
+                              shape[2] // 2 * voxel_size_um]
+                    s.position = center
+
+                logger.info(f"Added multi-resolution layer: {layer_name}")
+                logger.info(f"  Shape: {metadata['shape']}")
+                logger.info(f"  Levels: {metadata['n_levels']}")
+                if metadata['n_axons']:
+                    logger.info(f"  Expected axons: {metadata['n_axons']}")
 
         elif is_zarr:
             # Fallback: load single level into memory
@@ -341,7 +419,7 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                     source=neuroglancer.LocalVolume(
                         data=volume,
                         dimensions=neuroglancer.CoordinateSpace(
-                            names=['y', 'x', 'z'],
+                            names=['z', 'y', 'x'],
                             units=['nm', 'nm', 'nm'],
                             scales=[voxel_size_nm, voxel_size_nm, voxel_size_nm],
                         ),
@@ -351,10 +429,10 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                 )
 
                 # Set initial position to center of volume
-                # Position order matches dimension names: [y, x, z]
-                center = [volume.shape[0] // 2 * voxel_size_nm,  # y
-                          volume.shape[1] // 2 * voxel_size_nm,  # x
-                          volume.shape[2] // 2 * voxel_size_nm]  # z
+                # Position order matches dimension names: [z, y, x]
+                center = [volume.shape[0] // 2 * voxel_size_nm,  # z
+                          volume.shape[1] // 2 * voxel_size_nm,  # y
+                          volume.shape[2] // 2 * voxel_size_nm]  # x
                 s.position = center
 
             logger.info(f"Added layer: {layer_name}")
@@ -386,7 +464,7 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                     source=neuroglancer.LocalVolume(
                         data=volume,
                         dimensions=neuroglancer.CoordinateSpace(
-                            names=['y', 'x', 'z'],
+                            names=['z', 'y', 'x'],
                             units=['nm', 'nm', 'nm'],
                             scales=[voxel_size_nm, voxel_size_nm, voxel_size_nm],
                         ),
@@ -396,10 +474,10 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                 )
 
                 # Set initial position to center of volume
-                # Position order matches dimension names: [y, x, z]
-                center = [volume.shape[0] // 2 * voxel_size_nm,  # y
-                          volume.shape[1] // 2 * voxel_size_nm,  # x
-                          volume.shape[2] // 2 * voxel_size_nm]  # z
+                # Position order matches dimension names: [z, y, x]
+                center = [volume.shape[0] // 2 * voxel_size_nm,  # z
+                          volume.shape[1] // 2 * voxel_size_nm,  # y
+                          volume.shape[2] // 2 * voxel_size_nm]  # x
                 s.position = center
 
             logger.info(f"Added layer: {layer_name}")
@@ -439,7 +517,7 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                 source=neuroglancer.LocalVolume(
                     data=grayscale,
                     dimensions=neuroglancer.CoordinateSpace(
-                        names=['y', 'x', 'z'],
+                        names=['z', 'y', 'x'],
                         units=['nm', 'nm', 'nm'],
                         scales=[voxel_size_nm, voxel_size_nm, voxel_size_nm],
                     ),
@@ -448,10 +526,10 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
             )
 
             # Set initial position to center if not already set
-            # Position order matches dimension names: [y, x, z]
-            center = [grayscale.shape[0] // 2 * voxel_size_nm,  # y
-                      grayscale.shape[1] // 2 * voxel_size_nm,  # x
-                      grayscale.shape[2] // 2 * voxel_size_nm]  # z
+            # Position order matches dimension names: [z, y, x]
+            center = [grayscale.shape[0] // 2 * voxel_size_nm,  # z
+                      grayscale.shape[1] // 2 * voxel_size_nm,  # y
+                      grayscale.shape[2] // 2 * voxel_size_nm]  # x
             s.position = center
 
         logger.info("Added grayscale image layer")

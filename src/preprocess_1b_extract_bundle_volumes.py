@@ -196,6 +196,80 @@ def downsample_segmentation_mode_fast(data: np.ndarray, factor: int) -> np.ndarr
     return data[offset::factor, offset::factor, offset::factor].copy()
 
 
+def compute_valid_slice_range(axon_counts: List[int], min_axon_fraction: float) -> Tuple[int, int]:
+    """
+    Compute valid slice range using symmetric expansion from maximum.
+
+    Args:
+        axon_counts: List of axon counts per slice
+        min_axon_fraction: Minimum fraction of max count (e.g., 0.75)
+
+    Returns:
+        (start_idx, end_idx) - valid slice range (inclusive start, exclusive end)
+    """
+    if not axon_counts:
+        return 0, 0
+
+    n_slices = len(axon_counts)
+    max_count = max(axon_counts)
+    if max_count == 0:
+        return 0, 0
+
+    threshold = max_count * min_axon_fraction
+    max_idx = axon_counts.index(max_count)
+
+    # Expand left
+    left_idx = max_idx
+    while left_idx > 0 and axon_counts[left_idx - 1] >= threshold:
+        left_idx -= 1
+
+    # Expand right
+    right_idx = max_idx
+    while right_idx < n_slices - 1 and axon_counts[right_idx + 1] >= threshold:
+        right_idx += 1
+
+    # Make symmetric (use smaller extent)
+    left_extent = max_idx - left_idx
+    right_extent = right_idx - max_idx
+    min_extent = min(left_extent, right_extent)
+
+    start_idx = max_idx - min_extent
+    end_idx = max_idx + min_extent + 1
+
+    return start_idx, end_idx
+
+
+def filter_axons_by_coverage(axon_slices: Dict[int, Set[int]],
+                              valid_slice_range: Tuple[int, int],
+                              min_coverage: float) -> Set[int]:
+    """
+    Filter axons by their coverage across valid slices.
+
+    Args:
+        axon_slices: Dict mapping axon_id -> set of slice indices where it appears
+        valid_slice_range: (start_idx, end_idx) of valid slices
+        min_coverage: Minimum fraction of valid slices axon must appear in
+
+    Returns:
+        Set of valid axon IDs
+    """
+    start_idx, end_idx = valid_slice_range
+    n_valid_slices = end_idx - start_idx
+
+    if n_valid_slices == 0:
+        return set()
+
+    valid_axons = set()
+    threshold = n_valid_slices * min_coverage
+
+    for axon_id, slice_indices in axon_slices.items():
+        count = sum(1 for idx in slice_indices if start_idx <= idx < end_idx)
+        if count >= threshold:
+            valid_axons.add(axon_id)
+
+    return valid_axons
+
+
 def create_ome_ngff_metadata(bundle: Dict, voxel_size_um: float, n_levels: int = 5) -> Dict:
     """
     Create OME-NGFF compliant metadata for .zattrs.
@@ -256,9 +330,11 @@ def write_bundle_level0(volume: np.ndarray,
                         output_path: Path,
                         permutation: Tuple[int, int, int],
                         lut: np.ndarray,
-                        voxel_size_um: float = 0.05) -> np.ndarray:
+                        voxel_size_um: float = 0.05,
+                        min_axon_fraction: float = 0.75,
+                        min_axon_coverage: float = 0.5) -> np.ndarray:
     """
-    Write level 0 of bundle to Zarr (streaming, memory-efficient).
+    Write level 0 of bundle to Zarr with two-pass filtering.
 
     Args:
         volume: Full input volume (kept in memory)
@@ -267,23 +343,76 @@ def write_bundle_level0(volume: np.ndarray,
         permutation: Axis permutation tuple
         lut: Boolean lookup table for this bundle
         voxel_size_um: Physical voxel size
+        min_axon_fraction: Minimum axon count fraction for valid slices
+        min_axon_coverage: Minimum fraction of valid slices axon must appear in
 
     Returns:
         Array of segment IDs found in this bundle
     """
-    # Calculate output shape after permutation
-    output_shape = tuple(volume.shape[i] for i in permutation)
+    # Calculate full output shape after permutation
+    full_output_shape = tuple(volume.shape[i] for i in permutation)
+    n_slices = full_output_shape[2]
+
+    # Get bundle axon labels
+    bundle_labels = set(bundle['axon_labels'])
+
+    # =========================================================================
+    # FIRST PASS: Track axon presence per slice
+    # =========================================================================
+    logger.info(f"Pass 1: Tracking axon presence in {n_slices} slices...")
+
+    axon_slices: Dict[int, Set[int]] = {label: set() for label in bundle_labels}
+    axon_counts = []
+
+    for z_out in tqdm(range(n_slices), desc="Pass 1 (tracking)", unit="slice"):
+        input_slice = get_input_slice(volume, z_out, permutation)
+        filtered_slice = filter_with_lut(input_slice, lut)
+
+        unique_ids = set(np.unique(filtered_slice).tolist())
+        unique_ids.discard(0)
+
+        axon_counts.append(len(unique_ids))
+        for axon_id in unique_ids:
+            if axon_id in axon_slices:
+                axon_slices[axon_id].add(z_out)
+
+    # =========================================================================
+    # FILTERING: Compute valid slice range and valid axons
+    # =========================================================================
+    logger.info(f"Computing filtering criteria...")
+
+    valid_start, valid_end = compute_valid_slice_range(axon_counts, min_axon_fraction)
+    n_valid_slices = valid_end - valid_start
+
+    max_count = max(axon_counts) if axon_counts else 0
+    max_idx = axon_counts.index(max_count) if max_count > 0 else 0
+    logger.info(f"  Max axon count: {max_count} at slice {max_idx}")
+    logger.info(f"  Valid slice range: {valid_start}-{valid_end-1} ({n_valid_slices} slices)")
+    logger.info(f"  Threshold: {min_axon_fraction * 100:.0f}% of max = {int(max_count * min_axon_fraction)} axons")
+
+    valid_axons = filter_axons_by_coverage(axon_slices, (valid_start, valid_end), min_axon_coverage)
+    n_rejected = len(bundle_labels) - len(valid_axons)
+    logger.info(f"  Valid axons: {len(valid_axons)} (rejected {n_rejected})")
+    logger.info(f"  Coverage threshold: {min_axon_coverage * 100:.0f}% of {n_valid_slices} slices")
+
+    # Create filtered LUT
+    max_label = len(lut) - 1
+    filtered_lut = np.zeros(max_label + 1, dtype=bool)
+    for label in valid_axons:
+        if label <= max_label:
+            filtered_lut[label] = True
+
+    # =========================================================================
+    # SECOND PASS: Write filtered slices
+    # =========================================================================
+    output_shape = (full_output_shape[0], full_output_shape[1], n_valid_slices)
 
     logger.info(f"Creating Zarr store: {output_path}")
     logger.info(f"Output shape: {output_shape}")
 
-    # Create Zarr group (v2 format for Neuroglancer compatibility)
     root = zarr.open_group(str(output_path), mode='w', zarr_format=2)
-
-    # Compression codec (numcodecs for Zarr v2)
     compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
-    # Level 0: Full resolution with (full_y, full_x, 1) chunking for slice access
     chunk_shape_0 = (output_shape[0], output_shape[1], 1)
     level_0 = root.create_array(
         '0',
@@ -293,22 +422,18 @@ def write_bundle_level0(volume: np.ndarray,
         compressor=compressor
     )
 
-    # Write level 0 slice by slice, tracking segment IDs
-    n_slices = output_shape[2]
-    logger.info(f"Writing level 0 ({n_slices} slices)...")
+    logger.info(f"Pass 2: Writing {n_valid_slices} filtered slices...")
 
     segment_id_set = set()
-    for z_out in tqdm(range(n_slices), desc="Level 0", unit="slice"):
-        input_slice = get_input_slice(volume, z_out, permutation)
-        filtered_slice = filter_with_lut(input_slice, lut)
-        level_0[:, :, z_out] = filtered_slice
-        # Track unique IDs incrementally
+    for out_idx, z_in in enumerate(tqdm(range(valid_start, valid_end), desc="Pass 2 (writing)", unit="slice")):
+        input_slice = get_input_slice(volume, z_in, permutation)
+        filtered_slice = filter_with_lut(input_slice, filtered_lut)
+        level_0[:, :, out_idx] = filtered_slice
         segment_id_set.update(np.unique(filtered_slice).tolist())
 
-    # Remove 0 from segment IDs
     segment_id_set.discard(0)
     segment_ids = np.array(sorted(segment_id_set), dtype=np.uint16)
-    logger.info(f"Found {len(segment_ids)} unique segments")
+    logger.info(f"Found {len(segment_ids)} unique segments in output")
 
     return segment_ids
 
@@ -383,7 +508,9 @@ def extract_bundles_full_volume(mat_file: Path,
                                  bundles: List[Dict],
                                  output_dir: Path,
                                  voxel_size_um: float = 0.05,
-                                 n_levels: int = 5):
+                                 n_levels: int = 5,
+                                 min_axon_fraction: float = 0.75,
+                                 min_axon_coverage: float = 0.5):
     """
     Extract all bundles as OME-Zarr using full-volume-in-memory approach.
 
@@ -393,6 +520,8 @@ def extract_bundles_full_volume(mat_file: Path,
         output_dir: Directory for output Zarr stores
         voxel_size_um: Physical voxel size at full resolution
         n_levels: Number of pyramid levels
+        min_axon_fraction: Minimum axon count fraction for valid slices
+        min_axon_coverage: Minimum fraction of valid slices axon must appear in
     """
     logger.info("Using full-volume mode")
 
@@ -435,7 +564,9 @@ def extract_bundles_full_volume(mat_file: Path,
             output_path,
             permutation,
             lut,
-            voxel_size_um
+            voxel_size_um,
+            min_axon_fraction,
+            min_axon_coverage
         )
         bundle_info.append((output_path, bundle, segment_ids))
 
@@ -463,7 +594,9 @@ def extract_all_bundles(mat_file: Path,
                         bundle_metadata_file: Path,
                         output_dir: Path,
                         voxel_size_um: float = 0.05,
-                        n_levels: int = 5):
+                        n_levels: int = 5,
+                        min_axon_fraction: float = 0.75,
+                        min_axon_coverage: float = 0.5):
     """
     Extract all bundles from volume and save as OME-Zarr stores.
 
@@ -473,6 +606,8 @@ def extract_all_bundles(mat_file: Path,
         output_dir: Directory for output Zarr stores
         voxel_size_um: Physical voxel size at full resolution
         n_levels: Number of pyramid levels
+        min_axon_fraction: Minimum axon count fraction for valid slices
+        min_axon_coverage: Minimum fraction of valid slices axon must appear in
     """
     logger.info(f"\n{'='*80}")
     logger.info(f"Extracting bundle volumes from: {mat_file.name}")
@@ -494,7 +629,9 @@ def extract_all_bundles(mat_file: Path,
         bundles,
         output_dir,
         voxel_size_um,
-        n_levels
+        n_levels,
+        min_axon_fraction,
+        min_axon_coverage
     )
 
     logger.info(f"\n{'='*80}")
@@ -518,6 +655,10 @@ if __name__ == '__main__':
                         help='Voxel size in micrometers (default: 0.05)')
     parser.add_argument('--n-levels', type=int, default=5,
                         help='Number of pyramid levels (default: 5)')
+    parser.add_argument('--min-axon-fraction', type=float, default=0.75,
+                        help='Minimum axon count fraction for valid slices (default: 0.75)')
+    parser.add_argument('--min-axon-coverage', type=float, default=0.5,
+                        help='Minimum fraction of valid slices axon must appear in (default: 0.5)')
 
     args = parser.parse_args()
 
@@ -526,5 +667,7 @@ if __name__ == '__main__':
         args.bundle_metadata,
         args.output_dir,
         voxel_size_um=args.voxel_size,
-        n_levels=args.n_levels
+        n_levels=args.n_levels,
+        min_axon_fraction=args.min_axon_fraction,
+        min_axon_coverage=args.min_axon_coverage
     )
