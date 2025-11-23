@@ -19,6 +19,7 @@ from pathlib import Path
 import multiprocessing as mp
 
 import numpy as np
+import h5py
 import scipy.io as sio
 from scipy.interpolate import RegularGridInterpolator as rgi
 from skimage.measure import label, regionprops
@@ -144,7 +145,7 @@ def sample_perpendicular_cross_section(binary_volume, point, tangent_vec,
     sz = binary_volume.shape
     interpolator = rgi(
         (range(sz[0]), range(sz[1]), range(sz[2])),
-        binary_volume.astype(float),
+        binary_volume.astype(np.float32),
         bounds_error=False,
         fill_value=0
     )
@@ -346,22 +347,42 @@ def compute_radius_profiles(mat_file: Path,
     if not mat_file.exists():
         raise FileNotFoundError(f"Input file not found: {mat_file}")
 
-    # Load labeled volume
+    # Load labeled volume - try HDF5 first, then scipy.io for older formats
     logger.info(f"Loading {mat_file}")
-    mat = sio.loadmat(str(mat_file))
+    volume = None
 
-    # Find the labeled volume key
-    volume_key = None
-    for key in mat.keys():
-        if not key.startswith('_'):
-            volume_key = key
-            break
+    # Try HDF5 format first (MATLAB v7.3)
+    try:
+        with h5py.File(str(mat_file), 'r') as f:
+            # Find the labeled volume key
+            volume_key = None
+            for key in f.keys():
+                if not key.startswith('#') and not key.startswith('_'):
+                    volume_key = key
+                    break
 
-    if volume_key is None:
-        raise ValueError(f"No data found in {mat_file}")
+            if volume_key is None:
+                raise ValueError(f"No data found in {mat_file}")
 
-    volume = mat[volume_key]
-    logger.info(f"Volume shape: {volume.shape}, dtype: {volume.dtype}")
+            volume = f[volume_key][:]
+            logger.info(f"Loaded HDF5 format, volume shape: {volume.shape}, dtype: {volume.dtype}")
+    except OSError as e:
+        # Try scipy.io for older MATLAB formats (v5/v6/v7)
+        logger.info(f"HDF5 failed ({e}), trying scipy.io for older MATLAB format...")
+        mat_data = sio.loadmat(str(mat_file))
+
+        # Find the labeled volume key (skip MATLAB metadata keys)
+        volume_key = None
+        for key in mat_data.keys():
+            if not key.startswith('__'):
+                volume_key = key
+                break
+
+        if volume_key is None:
+            raise ValueError(f"No data found in {mat_file}")
+
+        volume = mat_data[volume_key]
+        logger.info(f"Loaded scipy.io format, volume shape: {volume.shape}, dtype: {volume.dtype}")
 
     # Get unique axon labels
     axon_labels = np.unique(volume)
