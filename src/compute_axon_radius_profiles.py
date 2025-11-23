@@ -197,27 +197,28 @@ def process_single_axon(args):
     axon_label, voxel_size_um, plane_radius, plane_resolution, step_size = args
 
     try:
-        # Extract binary volume from shared memory
-        axon_binary = (_shared_volume == axon_label).astype(np.uint8)
-
-        # Get axon coordinates and bounding box
-        coords = np.argwhere(axon_binary)
+        # Get axon coordinates directly (avoids 20GB boolean array per worker)
+        # The temporary boolean from comparison is garbage collected after argwhere
+        coords = np.argwhere(_shared_volume == axon_label)
         if len(coords) < 100:  # Skip very small axons
             return None
 
-        # Crop to bounding box with padding
+        # Compute bounding box with padding
         min_coords = coords.min(axis=0)
         max_coords = coords.max(axis=0)
 
         padding = int(plane_radius) + 5
         min_padded = np.maximum(min_coords - padding, 0)
-        max_padded = np.minimum(max_coords + padding, np.array(axon_binary.shape))
+        max_padded = np.minimum(max_coords + padding, np.array(_shared_volume.shape))
 
-        cropped = axon_binary[
+        # Create binary mask only for the cropped region (much smaller)
+        cropped_region = _shared_volume[
             min_padded[0]:max_padded[0],
             min_padded[1]:max_padded[1],
             min_padded[2]:max_padded[2]
-        ].copy()
+        ]
+        # Must be C-contiguous for skeleton() to work correctly
+        cropped = np.ascontiguousarray((cropped_region == axon_label).astype(np.uint8))
 
         # Run skeletonization
         skel_segments = skeleton(cropped)
