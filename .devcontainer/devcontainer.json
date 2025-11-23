@@ -11,7 +11,7 @@
     }
   },
   "features": {},
-  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
+  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW", "--shm-size=4g"],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -71,7 +71,7 @@
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",
-  "postCreateCommand": "mkdir -p /home/node/.ssh && cp -r /home/node/.ssh-host/* /home/node/.ssh/ 2>/dev/null || true && chmod 700 /home/node/.ssh && chmod 600 /home/node/.ssh/id_* 2>/dev/null || true && chmod 644 /home/node/.ssh/*.pub 2>/dev/null || true && git remote set-url origin git@github.com:quantitative-mri-and-in-vivo-histology/axon_caliber_variation.git",
+  "postCreateCommand": "mkdir -p /home/node/.ssh && cp -r /home/node/.ssh-host/* /home/node/.ssh/ 2>/dev/null || true && chmod 700 /home/node/.ssh && chmod 600 /home/node/.ssh/id_* 2>/dev/null || true && chmod 644 /home/node/.ssh/*.pub 2>/dev/null || true && git remote set-url origin git@github.com:quantitative-mri-and-in-vivo-histology/axon_caliber_variation.git && for req in /workspace/external/*/requirements.txt; do [ -f \"$req\" ] && sudo uv pip install --system -r \"$req\" || true; done",
   "postStartCommand": "npm update -g @anthropic-ai/claude-code  ",
   "waitFor": "postStartCommand"
 }

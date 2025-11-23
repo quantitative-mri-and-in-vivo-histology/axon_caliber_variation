@@ -11,7 +11,7 @@ This metric is relevant for diffusion MRI sensitivity to axon caliber.
 import logging
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,41 +21,72 @@ from tqdm import tqdm
 # Global variables for worker processes
 _volume_path = None
 _is_zarr = None
+_slice_axis = None
+_subgroup = None
+_volume_data = None  # For in-memory mode
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def _init_worker(volume_path: Path, is_zarr: bool):
-    """Initialize worker process with volume path and format."""
-    global _volume_path, _is_zarr
+def _init_worker(volume_path: Path, is_zarr: bool, slice_axis: int, subgroup: str = None, volume_data: np.ndarray = None):
+    """Initialize worker process with volume path, format, slice axis, and optional subgroup."""
+    global _volume_path, _is_zarr, _slice_axis, _subgroup, _volume_data
     _volume_path = volume_path
     _is_zarr = is_zarr
+    _slice_axis = slice_axis
+    _subgroup = subgroup
+    _volume_data = volume_data
 
 
-def _process_single_slice(args: Tuple[int, float, np.ndarray]) -> Tuple[int, np.ndarray, int]:
+def _process_single_slice(args: Tuple[int, float, np.ndarray, bool, float]) -> Tuple[int, np.ndarray, int]:
     """
     Process a single slice to extract radii histogram. Helper function for parallel processing.
 
     Reads slice directly from file (memory efficient).
 
     Args:
-        args: Tuple of (slice_index, voxel_size_um, bin_edges)
+        args: Tuple of (slice_index, voxel_size_um, bin_edges, use_minor_axis, max_ellipse_ratio)
 
     Returns:
         Tuple of (slice_index, histogram_counts, n_axons)
     """
-    z, voxel_size_um, bin_edges = args
+    z, voxel_size_um, bin_edges, use_minor_axis, max_ellipse_ratio = args
 
-    # Read just this slice
-    if _is_zarr:
+    # Use in-memory data if available, otherwise read from file
+    if _volume_data is not None:
+        # In-memory mode - slice from pre-loaded array
+        if _slice_axis == 0:
+            slice_2d = _volume_data[z, :, :]
+        elif _slice_axis == 1:
+            slice_2d = _volume_data[:, z, :]
+        else:  # axis == 2
+            slice_2d = _volume_data[:, :, z]
+    elif _is_zarr:
         import zarr
         root = zarr.open(str(_volume_path), mode='r')
-        slice_2d = root['0'][:, :, z]
+        # Navigate to subgroup if specified (e.g., 'cc' or 'cg')
+        if _subgroup:
+            data = root[_subgroup]['0']
+        else:
+            data = root['0']
+        # Slice along the appropriate axis
+        if _slice_axis == 0:
+            slice_2d = data[z, :, :]
+        elif _slice_axis == 1:
+            slice_2d = data[:, z, :]
+        else:  # axis == 2
+            slice_2d = data[:, :, z]
     else:
         import h5py
         with h5py.File(_volume_path, 'r') as f:
-            slice_2d = f['labels'][:, :, z]
+            data = f['labels']
+            if _slice_axis == 0:
+                slice_2d = data[z, :, :]
+            elif _slice_axis == 1:
+                slice_2d = data[:, z, :]
+            else:  # axis == 2
+                slice_2d = data[:, :, z]
 
     # Use regionprops to efficiently extract areas of all regions
     regions = regionprops(slice_2d)
@@ -63,13 +94,27 @@ def _process_single_slice(args: Tuple[int, float, np.ndarray]) -> Tuple[int, np.
     if len(regions) == 0:
         return (z, np.zeros(len(bin_edges) - 1, dtype=np.int32), 0)
 
-    # Compute circular-equivalent radius for each region
+    # Compute radius for each region
     radii = []
     for region in regions:
         area_voxels = region.area
-        # Convert to physical area and compute radius
-        area_um2 = area_voxels * (voxel_size_um ** 2)
-        radius_um = np.sqrt(area_um2 / np.pi)
+
+        # Filter by ellipse area ratio if specified
+        if max_ellipse_ratio > 0:
+            # Compute ellipse area from fitted axes (in pixels)
+            ellipse_area = np.pi * (region.axis_major_length / 2) * (region.axis_minor_length / 2)
+            if ellipse_area > max_ellipse_ratio * area_voxels:
+                continue  # Skip sparse/fragmented regions
+
+        if use_minor_axis:
+            # Use minor axis of fitted ellipse (diameter -> radius)
+            # minor_axis_length is in pixels
+            radius_um = (region.axis_minor_length / 2) * voxel_size_um
+        else:
+            # Compute circular-equivalent radius from area
+            # Convert to physical area and compute radius
+            area_um2 = area_voxels * (voxel_size_um ** 2)
+            radius_um = np.sqrt(area_um2 / np.pi)
         radii.append(radius_um)
 
     # Compute histogram
@@ -82,18 +127,27 @@ def _process_single_slice(args: Tuple[int, float, np.ndarray]) -> Tuple[int, np.
 def extract_radii_per_slice(volume_file: Path,
                             voxel_size_um: float = 0.2,
                             n_jobs: int = -1,
-                            bin_edges: np.ndarray = None) -> Tuple[Dict[int, np.ndarray], Dict[int, int], np.ndarray, np.ndarray]:
+                            bin_edges: np.ndarray = None,
+                            slice_axis: int = 2,
+                            subgroup: str = None,
+                            load_in_memory: bool = False,
+                            use_minor_axis: bool = False,
+                            max_ellipse_ratio: float = 0.0) -> Tuple[Dict[int, np.ndarray], Dict[int, int], np.ndarray, np.ndarray]:
     """
-    Extract circular-equivalent radii histograms for all axons in each z-slice.
+    Extract radii histograms for all axons in each slice.
 
-    Memory efficient: reads slices directly from file (one chunk per slice).
     Supports both Zarr and HDF5 formats.
 
     Args:
-        volume_file: Path to volume file (Zarr or HDF5), shape (y, x, z) where axons are aligned with z
+        volume_file: Path to volume file (Zarr or HDF5)
         voxel_size_um: Voxel size in micrometers
         n_jobs: Number of parallel jobs (-1 = use all CPUs, 1 = no parallelization)
         bin_edges: Histogram bin edges in micrometers (default: 0 to 20 with 0.02 step)
+        slice_axis: Axis to slice along (0=Z, 1=Y, 2=X), determined by dominant fiber direction
+        subgroup: Optional subgroup name (e.g., 'cc' or 'cg')
+        load_in_memory: If True, load entire volume into memory first (faster but uses more RAM)
+        use_minor_axis: If True, use ellipse minor axis; otherwise use circular-equivalent radius
+        max_ellipse_ratio: Max ratio of ellipse area to voxel area (0 = no filter, 2.0 recommended)
 
     Returns:
         Tuple of (histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers)
@@ -105,16 +159,21 @@ def extract_radii_per_slice(volume_file: Path,
     if is_zarr:
         import zarr
         root = zarr.open(str(volume_file), mode='r')
-        volume_shape = root['0'].shape
+        if subgroup:
+            volume_shape = root[subgroup]['0'].shape
+        else:
+            volume_shape = root['0'].shape
     else:
         import h5py
         with h5py.File(volume_file, 'r') as f:
             volume_shape = f['labels'].shape
 
     logger.info(f"Extracting radii per slice from volume shape {volume_shape}")
+    axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
+    logger.info(f"Slicing along axis {slice_axis} ({axis_names[slice_axis]})")
 
-    # Z-slices are along the last axis (axis 2)
-    n_slices = volume_shape[2]
+    # Number of slices along the specified axis
+    n_slices = volume_shape[slice_axis]
 
     # Default bin edges: 0 to 20 μm with 0.02 μm step
     if bin_edges is None:
@@ -124,6 +183,9 @@ def extract_radii_per_slice(volume_file: Path,
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     logger.info(f"Using {len(bin_edges)-1} histogram bins from {bin_edges[0]:.2f} to {bin_edges[-1]:.2f} μm")
+    logger.info(f"Radius estimation: {'minor axis' if use_minor_axis else 'circular-equivalent'}")
+    if max_ellipse_ratio > 0:
+        logger.info(f"Filtering regions with ellipse/voxel area ratio > {max_ellipse_ratio}")
 
     # Determine number of workers
     if n_jobs == -1:
@@ -135,14 +197,33 @@ def extract_radii_per_slice(volume_file: Path,
 
     logger.info(f"Using {n_workers} parallel workers")
 
+    # Load volume into memory if requested
+    volume_data = None
+    if load_in_memory:
+        logger.info("Loading volume into memory...")
+        if is_zarr:
+            import zarr
+            root = zarr.open(str(volume_file), mode='r')
+            if subgroup:
+                volume_data = root[subgroup]['0'][:]
+            else:
+                volume_data = root['0'][:]
+        else:
+            import h5py
+            with h5py.File(volume_file, 'r') as f:
+                volume_data = f['labels'][:]
+
+        mem_gb = volume_data.nbytes / (1024**3)
+        logger.info(f"Loaded volume: {volume_data.shape}, {mem_gb:.2f} GB")
+
     # Prepare arguments for parallel processing (no slice data, just indices)
-    args_list = [(z, voxel_size_um, bin_edges) for z in range(n_slices)]
+    args_list = [(z, voxel_size_um, bin_edges, use_minor_axis, max_ellipse_ratio) for z in range(n_slices)]
 
     # Process in parallel
     if n_workers > 1:
         with Pool(processes=n_workers,
                   initializer=_init_worker,
-                  initargs=(volume_file, is_zarr)) as pool:
+                  initargs=(volume_file, is_zarr, slice_axis, subgroup, volume_data)) as pool:
             results = list(tqdm(
                 pool.imap(_process_single_slice, args_list),
                 total=n_slices,
@@ -152,9 +233,12 @@ def extract_radii_per_slice(volume_file: Path,
     else:
         # Serial processing (useful for debugging)
         # Set globals for serial mode
-        global _volume_path, _is_zarr
+        global _volume_path, _is_zarr, _slice_axis, _subgroup, _volume_data
         _volume_path = volume_file
         _is_zarr = is_zarr
+        _slice_axis = slice_axis
+        _subgroup = subgroup
+        _volume_data = volume_data
         results = [_process_single_slice(args) for args in tqdm(
             args_list,
             desc="Processing slices",
@@ -345,12 +429,17 @@ def analyze_population(volume_file: Path,
                        output_dir: Path,
                        voxel_size_um: float = 0.2,
                        n_jobs: int = -1,
-                       min_axon_fraction: float = 0.0) -> Tuple[float, np.ndarray]:
+                       min_axon_fraction: float = 0.0,
+                       load_in_memory: bool = False,
+                       use_minor_axis: bool = False,
+                       max_ellipse_ratio: float = 0.0) -> Dict[str, Tuple[float, np.ndarray]]:
     """
     Analyze effective radius for a population volume.
 
-    Memory efficient: reads slices directly from file.
     Supports both Zarr and HDF5 formats.
+
+    For Zarr files with cc/cg subgroups (from segment_spatial_subvolumes.py),
+    analyzes both populations using their respective dominant axes.
 
     Args:
         volume_file: Path to aligned volume file (Zarr or HDF5)
@@ -358,9 +447,12 @@ def analyze_population(volume_file: Path,
         voxel_size_um: Voxel size in micrometers (0.05 * downsample_factor)
         n_jobs: Number of parallel jobs (-1 = use all CPUs)
         min_axon_fraction: Minimum fraction of max axon count to include slice (0.0 = use all)
+        load_in_memory: If True, load entire volume into memory first (faster but uses more RAM)
+        use_minor_axis: If True, use ellipse minor axis; otherwise use circular-equivalent radius
+        max_ellipse_ratio: Max ratio of ellipse area to voxel area (0 = no filter, 2.0 recommended)
 
     Returns:
-        Tuple of (global_r_eff, r_eff_per_slice)
+        Dict mapping population name -> (global_r_eff, r_eff_per_slice)
     """
     logger.info(f"\n{'='*80}")
     logger.info(f"Analyzing: {volume_file.name}")
@@ -369,22 +461,102 @@ def analyze_population(volume_file: Path,
     # Detect format
     is_zarr = volume_file.suffix == '.zarr' or (volume_file.is_dir() and (volume_file / 'zarr.json').exists())
 
-    # Get metadata without loading volume
+    results = {}
+
     if is_zarr:
         import zarr
         root = zarr.open(str(volume_file), mode='r')
-        volume_shape = root['0'].shape
-        # Get population name from Zarr attrs
-        bundle_id = root.attrs.get('bundle_id', None)
-        if bundle_id is not None:
-            population_name = f"Bundle_{bundle_id:02d}"
+
+        # Check if this is a CC/CG subvolume structure
+        has_cc = 'cc' in root
+        has_cg = 'cg' in root
+
+        if has_cc or has_cg:
+            # Process CC and CG subgroups with their dominant axes
+            populations = []
+            if has_cc:
+                populations.append(('cc', 'CC'))
+            if has_cg:
+                populations.append(('cg', 'CG'))
+
+            for subgroup, pop_name in populations:
+                logger.info(f"\n{'-'*40}")
+                logger.info(f"Processing {pop_name} population")
+                logger.info(f"{'-'*40}")
+
+                # Get metadata for this population
+                pop_meta = root.attrs.get(subgroup, {})
+                dominant_axis = pop_meta.get('dominant_axis', 2)  # Default to X-axis
+                dominant_axis_name = pop_meta.get('dominant_axis_name', 'X')
+                n_axons = pop_meta.get('n_axons', 0)
+
+                volume_shape = root[subgroup]['0'].shape
+                logger.info(f"Population: {pop_name}")
+                logger.info(f"Volume shape: {volume_shape}")
+                logger.info(f"Dominant axis: {dominant_axis} ({dominant_axis_name})")
+                logger.info(f"Number of axons: {n_axons}")
+
+                # Extract radii histograms per slice using dominant axis
+                histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers = extract_radii_per_slice(
+                    volume_file, voxel_size_um, n_jobs=n_jobs,
+                    slice_axis=dominant_axis, subgroup=subgroup,
+                    load_in_memory=load_in_memory,
+                    use_minor_axis=use_minor_axis,
+                    max_ellipse_ratio=max_ellipse_ratio
+                )
+
+                # Plot effective radius profile
+                output_file = output_dir / f'{pop_name}_effective_radius_profile.png'
+                r_eff_global, r_eff_per_slice = plot_effective_radius_profile(
+                    histogram_per_slice,
+                    n_axons_per_slice,
+                    bin_centers,
+                    output_file,
+                    pop_name,
+                    slice_thickness_um=voxel_size_um,
+                    min_axon_fraction=min_axon_fraction
+                )
+
+                results[pop_name] = (r_eff_global, r_eff_per_slice)
         else:
-            population_name = volume_file.stem
+            # Single population (legacy format)
+            volume_shape = root['0'].shape
+            bundle_id = root.attrs.get('bundle_id', None)
+            if bundle_id is not None:
+                population_name = f"Bundle_{bundle_id:02d}"
+            else:
+                population_name = volume_file.stem
+
+            # Default to axis 2 for legacy format
+            slice_axis = 2
+
+            logger.info(f"Population: {population_name}")
+            logger.info(f"Volume shape: {volume_shape}")
+
+            histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers = extract_radii_per_slice(
+                volume_file, voxel_size_um, n_jobs=n_jobs, slice_axis=slice_axis,
+                load_in_memory=load_in_memory,
+                use_minor_axis=use_minor_axis,
+                max_ellipse_ratio=max_ellipse_ratio
+            )
+
+            output_file = output_dir / f'{population_name}_effective_radius_profile.png'
+            r_eff_global, r_eff_per_slice = plot_effective_radius_profile(
+                histogram_per_slice,
+                n_axons_per_slice,
+                bin_centers,
+                output_file,
+                population_name,
+                slice_thickness_um=voxel_size_um,
+                min_axon_fraction=min_axon_fraction
+            )
+
+            results[population_name] = (r_eff_global, r_eff_per_slice)
     else:
+        # HDF5 format
         import h5py
         with h5py.File(volume_file, 'r') as f:
             volume_shape = f['labels'].shape
-            # Try to get population name from dataset attrs first, then file attrs
             dset = f['labels']
             population_name = dset.attrs.get('bundle_id', None)
             if population_name is not None:
@@ -392,31 +564,34 @@ def analyze_population(volume_file: Path,
             else:
                 population_name = f.attrs.get('population', 'Unknown')
 
-    logger.info(f"Population: {population_name}")
-    logger.info(f"Volume shape: {volume_shape}")
+        logger.info(f"Population: {population_name}")
+        logger.info(f"Volume shape: {volume_shape}")
 
-    # Extract radii histograms per slice (memory efficient - reads from file)
-    histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers = extract_radii_per_slice(
-        volume_file, voxel_size_um, n_jobs=n_jobs
-    )
+        histogram_per_slice, n_axons_per_slice, bin_edges, bin_centers = extract_radii_per_slice(
+            volume_file, voxel_size_um, n_jobs=n_jobs, slice_axis=2,
+            load_in_memory=load_in_memory,
+            use_minor_axis=use_minor_axis,
+            max_ellipse_ratio=max_ellipse_ratio
+        )
 
-    # Plot effective radius profile
-    output_file = output_dir / f'{population_name}_effective_radius_profile.png'
-    r_eff_global, r_eff_per_slice = plot_effective_radius_profile(
-        histogram_per_slice,
-        n_axons_per_slice,
-        bin_centers,
-        output_file,
-        population_name,
-        slice_thickness_um=voxel_size_um,
-        min_axon_fraction=min_axon_fraction
-    )
+        output_file = output_dir / f'{population_name}_effective_radius_profile.png'
+        r_eff_global, r_eff_per_slice = plot_effective_radius_profile(
+            histogram_per_slice,
+            n_axons_per_slice,
+            bin_centers,
+            output_file,
+            population_name,
+            slice_thickness_um=voxel_size_um,
+            min_axon_fraction=min_axon_fraction
+        )
+
+        results[population_name] = (r_eff_global, r_eff_per_slice)
 
     logger.info(f"\n{'='*80}")
     logger.info(f"Completed: {volume_file.name}")
     logger.info(f"{'='*80}\n")
 
-    return r_eff_global, r_eff_per_slice
+    return results
 
 
 if __name__ == '__main__':
@@ -434,7 +609,13 @@ if __name__ == '__main__':
     parser.add_argument('--n-jobs', type=int, default=-1,
                        help='Number of parallel jobs (default: -1 = use all CPUs, 1 = serial)')
     parser.add_argument('--min-axon-fraction', type=float, default=0.75,
-                       help='Minimum fraction of max axon count to include slice (default: 0.0 = use all)')
+                       help='Minimum fraction of max axon count to include slice (default: 0.75)')
+    parser.add_argument('--load-in-memory', action='store_true',
+                       help='Load entire volume into memory first (faster but uses more RAM)')
+    parser.add_argument('--use-minor-axis', action='store_true',
+                       help='Use ellipse minor axis instead of circular-equivalent radius')
+    parser.add_argument('--max-ellipse-ratio', type=float, default=0.0,
+                       help='Max ratio of ellipse area to voxel area to filter sparse regions (0 = no filter, 2.0 recommended)')
 
     args = parser.parse_args()
 
@@ -443,5 +624,8 @@ if __name__ == '__main__':
         args.output_dir,
         voxel_size_um=args.voxel_size,
         n_jobs=args.n_jobs,
-        min_axon_fraction=args.min_axon_fraction
+        min_axon_fraction=args.min_axon_fraction,
+        load_in_memory=args.load_in_memory,
+        use_minor_axis=args.use_minor_axis,
+        max_ellipse_ratio=args.max_ellipse_ratio
     )

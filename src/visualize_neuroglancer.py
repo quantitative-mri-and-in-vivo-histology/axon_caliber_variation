@@ -2,7 +2,7 @@
 """
 Visualize bundle volumes in Neuroglancer.
 
-Supports both HDF5 and OME-Zarr formats with multi-resolution pyramids.
+Supports HDF5, OME-Zarr, and MATLAB .mat formats with multi-resolution pyramids.
 For Zarr, serves via HTTP for proper multi-resolution support.
 """
 
@@ -265,6 +265,47 @@ def load_hdf5_volume(volume_file: Path, downsample: int = 1) -> tuple:
     return volume, metadata, voxel_size_um
 
 
+def load_mat_volume(mat_file: Path, downsample: int = 1) -> tuple:
+    """
+    Load volume from MATLAB .mat file (original axon segmentation format).
+
+    Args:
+        mat_file: Path to .mat file
+        downsample: Downsampling factor
+
+    Returns:
+        Tuple of (volume, metadata_dict, voxel_size_um)
+    """
+    import h5py
+
+    logger.info(f"Loading MAT: {mat_file}")
+
+    with h5py.File(mat_file, 'r') as f:
+        dset = f['final_lbl']
+
+        # .mat files don't have metadata attributes, use defaults
+        voxel_size_um = 0.05  # Standard voxel size for this dataset
+        metadata = {
+            'bundle_id': None,
+            'n_axons': None,
+            'voxel_size_um': voxel_size_um,
+            'mean_orientation': None,
+            'segment_ids': None,
+        }
+
+        if downsample > 1:
+            logger.info(f"Downsampling by {downsample}x")
+            volume = dset[::downsample, ::downsample, ::downsample]
+            voxel_size_um = voxel_size_um * downsample
+        else:
+            volume = dset[:]
+
+    logger.info(f"Volume shape: {volume.shape}")
+    logger.info(f"Memory: {volume.nbytes / 1024**3:.2f} GB")
+
+    return volume, metadata, voxel_size_um
+
+
 def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port: int = 9999,
                       level: int = None, downsample: int = 1, multires: bool = True,
                       grayscale_file: Path = None):
@@ -272,11 +313,11 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
     Visualize one or more volumes in Neuroglancer.
 
     Args:
-        volume_paths: List of paths to volume files (Zarr or HDF5)
+        volume_paths: List of paths to volume files (Zarr, HDF5, or .mat)
         bind_address: Address to bind the viewer to
         port: Port number (0 = auto-select)
         level: Pyramid level for Zarr files (None = auto)
-        downsample: Downsampling factor for HDF5 files
+        downsample: Downsampling factor for HDF5/.mat files
         multires: Use multi-resolution HTTP serving for Zarr (default True)
         grayscale_file: Optional path to grayscale HDF5 file with 'raw' dataset
     """
@@ -433,6 +474,50 @@ def visualize_volumes(volume_paths: list, bind_address: str = 'localhost', port:
                 center = [volume.shape[0] // 2 * voxel_size_nm,  # z
                           volume.shape[1] // 2 * voxel_size_nm,  # y
                           volume.shape[2] // 2 * voxel_size_nm]  # x
+                s.position = center
+
+            logger.info(f"Added layer: {layer_name}")
+            if metadata['n_axons']:
+                logger.info(f"  Expected axons: {metadata['n_axons']}")
+
+        elif volume_path.suffix == '.mat':
+            # MATLAB .mat file (original segmentation data)
+            volume, metadata, voxel_size_um = load_mat_volume(volume_path, downsample)
+
+            # Determine layer name
+            if metadata['bundle_id'] is not None:
+                layer_name = f"Bundle_{metadata['bundle_id']:02d}"
+            else:
+                layer_name = volume_path.stem
+
+            voxel_size_nm = voxel_size_um * 1000
+
+            segment_ids = metadata['segment_ids'] if metadata['segment_ids'] else []
+            if not segment_ids:
+                logger.info("Finding unique segment IDs...")
+                unique_ids = np.unique(volume)
+                segment_ids = unique_ids[unique_ids != 0].tolist()
+
+            logger.info(f"Found {len(segment_ids)} unique segments")
+
+            with viewer.txn() as s:
+                s.layers[layer_name] = neuroglancer.SegmentationLayer(
+                    source=neuroglancer.LocalVolume(
+                        data=volume,
+                        dimensions=neuroglancer.CoordinateSpace(
+                            names=['z', 'y', 'x'],
+                            units=['nm', 'nm', 'nm'],
+                            scales=[voxel_size_nm, voxel_size_nm, voxel_size_nm],
+                        ),
+                        voxel_offset=[0, 0, 0],
+                    ),
+                    segments=segment_ids,
+                )
+
+                # Set initial position to center of volume
+                center = [volume.shape[0] // 2 * voxel_size_nm,
+                          volume.shape[1] // 2 * voxel_size_nm,
+                          volume.shape[2] // 2 * voxel_size_nm]
                 s.position = center
 
             logger.info(f"Added layer: {layer_name}")

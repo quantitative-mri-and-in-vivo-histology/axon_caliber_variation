@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Extract CC and CG fiber bundles to a single OME-Zarr file.
+Segment volume into CC and CG spatial subvolumes using a learned boundary.
 
-Uses dominant-axis classification: axons are grouped by which coordinate axis
-(Z, Y, X) they align with most strongly. CC is assigned to the axis with most
-axons, CG to the second-most. Axons aligned with the third axis or exceeding
-the angular threshold are excluded.
+Uses orientation-classified axons as seeds to learn a curved spatial boundary
+(SVM with RBF kernel), then assigns ALL axons based on their spatial location.
+This captures the complete tissue including noise and imperfectly aligned axons.
 
 Output structure:
     output.zarr/
-    ├── cc/0, cc/1, ...  (pyramid levels for corpus callosum)
-    ├── cg/0, cg/1, ...  (pyramid levels for cingulum)
-    └── .zattrs          (combined metadata)
+    ├── cc/0, cc/1, ...  (pyramid levels for corpus callosum region)
+    ├── cg/0, cg/1, ...  (pyramid levels for cingulum region)
+    └── .zattrs          (combined metadata with boundary info)
 """
 
 import json
@@ -24,6 +23,7 @@ import numcodecs
 import numpy as np
 import zarr
 from scipy.spatial import KDTree
+from sklearn.svm import SVC
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Bundle Identification Functions (from identify_cc_cg_bundles.py)
+# Volume Loading and Axon Analysis (reused from extract_cc_cg_bundles.py)
 # =============================================================================
 
 def load_volume_downsampled(mat_file: Path, downsample: int = 4) -> Tuple[np.ndarray, Dict]:
@@ -100,12 +100,12 @@ def compute_axon_orientation_from_coords(coords: np.ndarray) -> Tuple[np.ndarray
     return principal_axis, float(length_voxels), n_voxels
 
 
-def compute_all_orientations(axon_voxels: Dict[int, np.ndarray],
-                             voxel_size_um: float,
-                             min_voxels: int = 10,
-                             min_length_um: float = 50.0) -> Dict[int, Dict]:
-    """Compute orientations for all axons with length filtering."""
-    logger.info(f"Computing orientations for {len(axon_voxels)} axons...")
+def compute_all_axon_data(axon_voxels: Dict[int, np.ndarray],
+                          voxel_size_um: float,
+                          min_voxels: int = 10,
+                          min_length_um: float = 10.0) -> Dict[int, Dict]:
+    """Compute orientations and centroids for all axons."""
+    logger.info(f"Computing axon data for {len(axon_voxels)} axons...")
 
     axon_data = {}
     n_too_short = 0
@@ -136,31 +136,26 @@ def compute_all_orientations(axon_voxels: Dict[int, np.ndarray],
     return axon_data
 
 
-def classify_by_dominant_axis(axon_data: Dict[int, Dict],
-                               max_angle_deg: float = 30.0) -> Tuple[Dict[int, int], Dict[int, int]]:
+# =============================================================================
+# Seed Classification by Dominant Axis
+# =============================================================================
+
+def classify_seeds_by_dominant_axis(axon_data: Dict[int, Dict],
+                                     max_angle_deg: float = 30.0) -> Tuple[List[int], List[int], Dict[int, int]]:
     """
-    Classify axons by dominant axis alignment.
-
-    Each axon is assigned to the axis (0=Z, 1=Y, 2=X) with which it aligns best.
-    CC is assigned to the axis with most axons, CG to the second-most.
-
-    Args:
-        axon_data: Dict mapping axon labels to orientation data
-        max_angle_deg: Maximum deviation from axis to be included (default 45°)
+    Classify well-aligned axons as seeds for boundary learning.
 
     Returns:
-        Tuple of (label_to_bundle, axis_to_bundle) where:
-        - label_to_bundle maps axon label -> bundle ID (1=CC, 2=CG)
-        - axis_to_bundle maps axis index -> bundle ID
+        Tuple of (cc_seeds, cg_seeds, bundle_to_axis) where bundle_to_axis maps
+        bundle_id (1=CC, 2=CG) to dominant axis index (0=Z, 1=Y, 2=X)
     """
-    logger.info(f"Classifying axons by dominant axis (max angle: {max_angle_deg}°)...")
+    logger.info(f"Classifying seed axons by dominant axis (max angle: {max_angle_deg}°)...")
 
     cos_threshold = np.cos(np.deg2rad(max_angle_deg))
 
     # Classify each axon by dominant axis
     axis_counts = {0: 0, 1: 0, 2: 0}  # Z, Y, X
     axon_to_axis = {}
-    n_rejected = 0
 
     for label, data in axon_data.items():
         orient = np.array(data['orientation'])
@@ -174,12 +169,10 @@ def classify_by_dominant_axis(axon_data: Dict[int, Dict],
         dominant_axis = int(np.argmax(abs_orient))
         alignment = abs_orient[dominant_axis]
 
-        # Check if alignment exceeds threshold
+        # Only include well-aligned axons as seeds
         if alignment >= cos_threshold:
             axon_to_axis[label] = dominant_axis
             axis_counts[dominant_axis] += 1
-        else:
-            n_rejected += 1
 
     # Sort axes by count (descending)
     sorted_axes = sorted(axis_counts.keys(), key=lambda a: axis_counts[a], reverse=True)
@@ -188,29 +181,111 @@ def classify_by_dominant_axis(axon_data: Dict[int, Dict],
     axis_to_bundle = {
         sorted_axes[0]: 1,  # CC
         sorted_axes[1]: 2,  # CG
-        sorted_axes[2]: 0   # Unclassified (third axis)
+        sorted_axes[2]: 0   # Third axis (not used as seeds)
     }
 
-    # Log axis statistics
+    # Inverse mapping: bundle_id -> axis
+    bundle_to_axis = {
+        1: sorted_axes[0],  # CC
+        2: sorted_axes[1]   # CG
+    }
+
+    # Collect seeds
+    cc_seeds = [label for label, axis in axon_to_axis.items() if axis_to_bundle[axis] == 1]
+    cg_seeds = [label for label, axis in axon_to_axis.items() if axis_to_bundle[axis] == 2]
+
+    # Log statistics
     axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
-    logger.info(f"  Axis counts:")
+    logger.info(f"  Seed classification:")
     for axis in sorted_axes:
-        bundle_name = {1: 'CC', 2: 'CG', 0: 'unclassified'}[axis_to_bundle[axis]]
-        logger.info(f"    {axis_names[axis]}-axis: {axis_counts[axis]} axons -> {bundle_name}")
-    if n_rejected > 0:
-        logger.info(f"  Rejected {n_rejected} axons (angle > {max_angle_deg}°)")
+        bundle_name = {1: 'CC', 2: 'CG', 0: 'third'}[axis_to_bundle[axis]]
+        logger.info(f"    {axis_names[axis]}-axis: {axis_counts[axis]} seeds -> {bundle_name}")
 
-    # Build label_to_bundle mapping (only CC and CG, not third axis)
-    label_to_bundle = {}
-    for label, axis in axon_to_axis.items():
-        bundle_id = axis_to_bundle[axis]
-        if bundle_id > 0:  # Only include CC (1) and CG (2)
-            label_to_bundle[label] = bundle_id
+    logger.info(f"  Total seeds: {len(cc_seeds)} CC, {len(cg_seeds)} CG")
 
-    logger.info(f"  Total classified: {len(label_to_bundle)} axons")
+    return cc_seeds, cg_seeds, bundle_to_axis
 
-    return label_to_bundle, axis_to_bundle
 
+# =============================================================================
+# Spatial Boundary Learning
+# =============================================================================
+
+def learn_spatial_boundary(axon_data: Dict[int, Dict],
+                            cc_seeds: List[int],
+                            cg_seeds: List[int],
+                            svm_gamma: float = None) -> SVC:
+    """
+    Learn a curved spatial boundary using SVM with RBF kernel.
+
+    Args:
+        axon_data: Dict with centroid_um for each axon
+        cc_seeds: Labels of CC seed axons
+        cg_seeds: Labels of CG seed axons
+        svm_gamma: RBF kernel width. Lower = stiffer/smoother boundary.
+                   None uses 'scale' (1 / (n_features * X.var()))
+
+    Returns:
+        Trained SVM classifier
+    """
+    logger.info("Learning spatial boundary with SVM (RBF kernel)...")
+
+    # Prepare training data
+    X_cc = np.array([axon_data[label]['centroid_um'] for label in cc_seeds])
+    X_cg = np.array([axon_data[label]['centroid_um'] for label in cg_seeds])
+
+    X = np.vstack([X_cc, X_cg])
+    y = np.array([1] * len(cc_seeds) + [2] * len(cg_seeds))
+
+    # Train SVM with RBF kernel
+    # C controls regularization, gamma controls RBF kernel width
+    # Lower gamma = stiffer/smoother boundary
+    gamma_value = svm_gamma if svm_gamma is not None else 'scale'
+    svm = SVC(kernel='rbf', C=1.0, gamma=gamma_value, random_state=42)
+    svm.fit(X, y)
+
+    logger.info(f"  Gamma: {gamma_value}")
+
+    # Log training accuracy
+    train_acc = svm.score(X, y)
+    logger.info(f"  Training accuracy: {train_acc:.1%}")
+    logger.info(f"  Support vectors: {svm.n_support_[0]} CC, {svm.n_support_[1]} CG")
+
+    return svm
+
+
+def assign_all_axons_spatially(axon_data: Dict[int, Dict],
+                                svm: SVC) -> Dict[int, int]:
+    """
+    Assign ALL axons to CC or CG based on spatial location.
+
+    Args:
+        axon_data: Dict with centroid_um for each axon
+        svm: Trained SVM classifier
+
+    Returns:
+        Dict mapping axon label -> bundle ID (1=CC, 2=CG)
+    """
+    logger.info(f"Assigning {len(axon_data)} axons spatially...")
+
+    labels = list(axon_data.keys())
+    centroids = np.array([axon_data[label]['centroid_um'] for label in labels])
+
+    # Predict using learned boundary
+    predictions = svm.predict(centroids)
+
+    label_to_bundle = {labels[i]: int(predictions[i]) for i in range(len(labels))}
+
+    # Count assignments
+    n_cc = sum(1 for v in label_to_bundle.values() if v == 1)
+    n_cg = sum(1 for v in label_to_bundle.values() if v == 2)
+    logger.info(f"  Assigned: {n_cc} CC, {n_cg} CG")
+
+    return label_to_bundle
+
+
+# =============================================================================
+# Sparse Axon Filtering (optional post-processing)
+# =============================================================================
 
 def filter_sparse_axons(axon_labels: List[int],
                         axon_voxels: Dict[int, np.ndarray],
@@ -233,14 +308,27 @@ def filter_sparse_axons(axon_labels: List[int],
     return filtered_labels, len(axon_labels) - len(filtered_labels)
 
 
-def create_bundles(axon_data: Dict[int, Dict],
-                   label_to_bundle: Dict[int, int],
-                   axon_voxels: Dict[int, np.ndarray],
-                   voxel_size_um: float,
-                   k_neighbors: int = 10,
-                   max_neighbor_distance_um: float = 30.0) -> List[Dict]:
-    """Create bundle metadata with per-bundle KNN filtering."""
+# =============================================================================
+# Bundle Metadata Creation
+# =============================================================================
+
+def create_bundle_metadata(axon_data: Dict[int, Dict],
+                            label_to_bundle: Dict[int, int],
+                            axon_voxels: Dict[int, np.ndarray],
+                            voxel_size_um: float,
+                            bundle_to_axis: Dict[int, int],
+                            k_neighbors: int = 10,
+                            max_neighbor_distance_um: float = 30.0) -> List[Dict]:
+    """Create bundle metadata with optional KNN filtering."""
     logger.info("Creating bundle metadata...")
+
+    # Axis names and canonical directions
+    axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
+    axis_directions = {
+        0: [1.0, 0.0, 0.0],  # Z-axis (first dimension)
+        1: [0.0, 1.0, 0.0],  # Y-axis (second dimension)
+        2: [0.0, 0.0, 1.0]   # X-axis (third dimension)
+    }
 
     bundles_raw = {1: [], 2: []}
     for label, bundle_id in label_to_bundle.items():
@@ -252,6 +340,7 @@ def create_bundles(axon_data: Dict[int, Dict],
         if not axon_labels:
             continue
 
+        # Optional: filter sparse axons
         axon_labels, n_removed = filter_sparse_axons(
             axon_labels, axon_voxels, voxel_size_um,
             k_neighbors=k_neighbors, max_distance_um=max_neighbor_distance_um
@@ -260,8 +349,13 @@ def create_bundles(axon_data: Dict[int, Dict],
         if not axon_labels:
             continue
 
+        # Compute mean orientation for reference
         orientations = np.array([axon_data[label]['orientation'] for label in axon_labels])
-        orientations = orientations / np.linalg.norm(orientations, axis=1, keepdims=True)
+        norms = np.linalg.norm(orientations, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        orientations = orientations / norms
+
+        # Handle sign ambiguity
         sign_flip = orientations[:, 0] < 0
         orientations[sign_flip] = -orientations[sign_flip]
 
@@ -271,9 +365,15 @@ def create_bundles(axon_data: Dict[int, Dict],
 
         lengths = [axon_data[label]['length_um'] for label in axon_labels]
 
+        # Get dominant axis for this bundle
+        dominant_axis = bundle_to_axis.get(bundle_id, 0)
+
         bundle_info = {
             'bundle_id': int(bundle_id),
             'n_axons': len(axon_labels),
+            'dominant_axis': int(dominant_axis),
+            'dominant_axis_name': axis_names[dominant_axis],
+            'fiber_direction': axis_directions[dominant_axis],
             'mean_orientation': mean_orientation.tolist(),
             'mean_length_um': float(np.mean(lengths)),
             'median_length_um': float(np.median(lengths)),
@@ -282,40 +382,17 @@ def create_bundles(axon_data: Dict[int, Dict],
         }
         bundles.append(bundle_info)
 
-        logger.info(f"  Bundle {bundle_id}: {len(axon_labels)} axons (removed {n_removed} sparse)")
+        bundle_name = 'CC' if bundle_id == 1 else 'CG'
+        logger.info(f"  {bundle_name}: {len(axon_labels)} axons (removed {n_removed} sparse)")
 
-    # Sort by axon count descending
-    bundles.sort(key=lambda b: b['n_axons'], reverse=True)
+    # Sort by bundle_id
+    bundles.sort(key=lambda b: b['bundle_id'])
     return bundles
 
 
 # =============================================================================
-# Volume Extraction Functions (from extract_bundle_volumes_simple.py)
+# Volume Extraction (reused from extract_cc_cg_bundles.py)
 # =============================================================================
-
-def create_label_lut(axon_labels: Set[int], max_label: int) -> np.ndarray:
-    """Create lookup table for fast label filtering."""
-    lut = np.zeros(max_label + 1, dtype=bool)
-    for label in axon_labels:
-        if label <= max_label:
-            lut[label] = True
-    return lut
-
-
-def filter_with_lut(data: np.ndarray, lut: np.ndarray) -> np.ndarray:
-    """Filter array using lookup table."""
-    clamped = np.minimum(data, len(lut) - 1)
-    mask = lut[clamped]
-    return np.where(mask, data, 0).astype(data.dtype)
-
-
-def downsample_segmentation(data: np.ndarray, factor: int) -> np.ndarray:
-    """Fast downsampling using center voxel."""
-    if factor == 1:
-        return data.copy()
-    offset = factor // 2
-    return data[offset::factor, offset::factor, offset::factor].copy()
-
 
 def create_group_ome_metadata(group_name: str, voxel_size_um: float, n_levels: int) -> Dict:
     """Create OME-NGFF metadata for a single group."""
@@ -343,23 +420,43 @@ def create_group_ome_metadata(group_name: str, voxel_size_um: float, n_levels: i
     }
 
 
+def create_label_lut(axon_labels: Set[int], max_label: int) -> np.ndarray:
+    """Create lookup table for fast label filtering."""
+    lut = np.zeros(max_label + 1, dtype=bool)
+    for label in axon_labels:
+        if label <= max_label:
+            lut[label] = True
+    return lut
+
+
+def filter_with_lut(data: np.ndarray, lut: np.ndarray) -> np.ndarray:
+    """Filter array using lookup table."""
+    clamped = np.minimum(data, len(lut) - 1)
+    mask = lut[clamped]
+    return np.where(mask, data, 0).astype(data.dtype)
+
+
+def downsample_segmentation(data: np.ndarray, factor: int) -> np.ndarray:
+    """Fast downsampling using center voxel."""
+    if factor == 1:
+        return data.copy()
+    offset = factor // 2
+    return data[offset::factor, offset::factor, offset::factor].copy()
+
+
 def write_bundle_to_group(volume: np.ndarray,
                           bundle: Dict,
                           group: zarr.Group,
                           lut: np.ndarray,
                           voxel_size_um: float,
                           n_levels: int = 5) -> np.ndarray:
-    """Write bundle to Zarr group with pyramid levels and OME-NGFF metadata.
-
-    Keeps original volume orientation [Z, Y, X] for spatial alignment of all bundles.
-    """
-    # Use original volume shape - no permutation for spatial alignment
-    output_shape = volume.shape  # [Z, Y, X]
+    """Write bundle to Zarr group with pyramid levels."""
+    output_shape = volume.shape
     n_slices = output_shape[0]
 
     compressor = numcodecs.Blosc(cname='zstd', clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
-    # Write level 0 with (1, Y, X) chunking for efficient slice access
+    # Write level 0
     chunk_shape_0 = (1, output_shape[1], output_shape[2])
     level_0 = group.create_array(
         '0', shape=output_shape, chunks=chunk_shape_0,
@@ -368,7 +465,6 @@ def write_bundle_to_group(volume: np.ndarray,
 
     segment_id_set = set()
     for z_out in tqdm(range(n_slices), desc=f"Writing {group.name}", unit="slice", leave=False):
-        # Direct slice extraction - no permutation
         input_slice = volume[z_out, :, :]
         filtered_slice = filter_with_lut(input_slice, lut)
         level_0[z_out, :, :] = filtered_slice
@@ -421,9 +517,8 @@ def create_ome_metadata(bundles: List[Dict], voxel_size_um: float, n_levels: int
         {"name": "x", "type": "space", "unit": "micrometer"}
     ]
 
-    # CC is largest (index 0), CG is second (index 1)
-    cc_bundle = bundles[0] if len(bundles) > 0 else None
-    cg_bundle = bundles[1] if len(bundles) > 1 else None
+    cc_bundle = next((b for b in bundles if b['bundle_id'] == 1), None)
+    cg_bundle = next((b for b in bundles if b['bundle_id'] == 2), None)
 
     metadata = {
         "multiscales": [
@@ -442,16 +537,23 @@ def create_ome_metadata(bundles: List[Dict], voxel_size_um: float, n_levels: int
         ],
         "cc": {
             "n_axons": cc_bundle['n_axons'] if cc_bundle else 0,
+            "dominant_axis": cc_bundle['dominant_axis'] if cc_bundle else 0,
+            "dominant_axis_name": cc_bundle['dominant_axis_name'] if cc_bundle else 'Z',
+            "fiber_direction": cc_bundle['fiber_direction'] if cc_bundle else [1, 0, 0],
             "mean_orientation": cc_bundle['mean_orientation'] if cc_bundle else [0, 0, 0],
             "mean_length_um": cc_bundle['mean_length_um'] if cc_bundle else 0
         },
         "cg": {
             "n_axons": cg_bundle['n_axons'] if cg_bundle else 0,
+            "dominant_axis": cg_bundle['dominant_axis'] if cg_bundle else 1,
+            "dominant_axis_name": cg_bundle['dominant_axis_name'] if cg_bundle else 'Y',
+            "fiber_direction": cg_bundle['fiber_direction'] if cg_bundle else [0, 1, 0],
             "mean_orientation": cg_bundle['mean_orientation'] if cg_bundle else [0, 0, 0],
             "mean_length_um": cg_bundle['mean_length_um'] if cg_bundle else 0
         },
         "voxel_size_um": voxel_size_um,
-        "n_levels": n_levels
+        "n_levels": n_levels,
+        "segmentation_method": "spatial_boundary_svm"
     }
 
     return metadata
@@ -461,60 +563,56 @@ def create_ome_metadata(bundles: List[Dict], voxel_size_um: float, n_levels: int
 # Main Pipeline
 # =============================================================================
 
-def extract_cc_cg_bundles(mat_file: Path,
-                          output_zarr: Path,
-                          metadata_file: Path,
-                          downsample: int = 4,
-                          voxel_size_um: float = 0.05,
-                          max_angle_deg: float = 30.0,
-                          min_length_um: float = 50.0,
-                          min_voxels: int = 10,
-                          k_neighbors: int = 10,
-                          max_neighbor_distance_um: float = 30.0,
-                          n_levels: int = 5):
+def segment_spatial_subvolumes(mat_file: Path,
+                                output_zarr: Path,
+                                metadata_file: Path,
+                                downsample: int = 4,
+                                voxel_size_um: float = 0.05,
+                                max_angle_deg: float = 30.0,
+                                min_length_um: float = 10.0,
+                                min_voxels: int = 10,
+                                k_neighbors: int = 10,
+                                max_neighbor_distance_um: float = 30.0,
+                                n_levels: int = 5,
+                                svm_gamma: float = None):
     """
-    Complete pipeline to identify and extract CC/CG bundles to single Zarr.
+    Segment volume into CC and CG spatial subvolumes.
 
-    Uses dominant-axis classification: axons are grouped by which coordinate axis
-    they align with most strongly. CC is assigned to the axis with most axons,
-    CG to the second-most.
-
-    Args:
-        mat_file: Input .mat file
-        output_zarr: Output Zarr store path
-        metadata_file: Output JSON metadata path
-        downsample: Downsampling factor for identification
-        voxel_size_um: Physical voxel size
-        max_angle_deg: Maximum deviation from dominant axis (default 45°)
-        min_length_um: Minimum axon length
-        min_voxels: Minimum voxels per axon
-        k_neighbors: K for KNN filtering
-        max_neighbor_distance_um: Max distance for KNN
-        n_levels: Pyramid levels
+    Uses orientation-classified axons as seeds to learn a curved spatial
+    boundary, then assigns ALL axons based on their spatial location.
     """
     logger.info(f"\n{'='*80}")
-    logger.info(f"Extracting CC and CG bundles: {mat_file.name}")
+    logger.info(f"Segmenting spatial subvolumes: {mat_file.name}")
     logger.info(f"{'='*80}\n")
 
-    # Phase 1: Identify bundles (on downsampled volume)
-    logger.info("Phase 1: Identifying bundles...")
+    # Phase 1: Load and analyze axons
+    logger.info("Phase 1: Loading and analyzing axons...")
     volume_ds, vol_metadata = load_volume_downsampled(mat_file, downsample)
     voxel_size_ds = voxel_size_um * downsample
 
     axon_voxels_ds = precompute_axon_voxels(volume_ds)
-    axon_data = compute_all_orientations(axon_voxels_ds, voxel_size_ds, min_voxels, min_length_um)
+    axon_data = compute_all_axon_data(axon_voxels_ds, voxel_size_ds, min_voxels, min_length_um)
 
     if not axon_data:
         raise ValueError("No valid axons found after filtering")
 
-    label_to_bundle, axis_to_bundle = classify_by_dominant_axis(axon_data, max_angle_deg)
+    # Phase 2: Classify seeds and learn boundary
+    logger.info("\nPhase 2: Learning spatial boundary...")
+    cc_seeds, cg_seeds, bundle_to_axis = classify_seeds_by_dominant_axis(axon_data, max_angle_deg)
 
-    if not label_to_bundle:
-        raise ValueError("No axons remain after classification")
+    if len(cc_seeds) < 10 or len(cg_seeds) < 10:
+        raise ValueError(f"Not enough seeds: {len(cc_seeds)} CC, {len(cg_seeds)} CG (need ≥10 each)")
 
-    bundles = create_bundles(
+    svm = learn_spatial_boundary(axon_data, cc_seeds, cg_seeds, svm_gamma)
+
+    # Phase 3: Assign ALL axons spatially
+    logger.info("\nPhase 3: Assigning all axons spatially...")
+    label_to_bundle = assign_all_axons_spatially(axon_data, svm)
+
+    # Create bundle metadata
+    bundles = create_bundle_metadata(
         axon_data, label_to_bundle, axon_voxels_ds, voxel_size_ds,
-        k_neighbors, max_neighbor_distance_um
+        bundle_to_axis, k_neighbors, max_neighbor_distance_um
     )
 
     if len(bundles) < 2:
@@ -523,8 +621,8 @@ def extract_cc_cg_bundles(mat_file: Path,
     # Free downsampled data
     del volume_ds, axon_voxels_ds
 
-    # Phase 2: Load full volume for extraction
-    logger.info("\nPhase 2: Extracting bundles...")
+    # Phase 4: Extract to Zarr
+    logger.info("\nPhase 4: Extracting subvolumes...")
     logger.info("Loading full volume...")
     with h5py.File(mat_file, 'r') as f:
         volume_full = f['final_lbl'][:]
@@ -534,18 +632,18 @@ def extract_cc_cg_bundles(mat_file: Path,
     # Create output Zarr
     root = zarr.open_group(str(output_zarr), mode='w', zarr_format=2)
 
-    # Extract CC (largest bundle) - keep original orientation for spatial alignment
-    if len(bundles) >= 1:
-        cc_bundle = bundles[0]
-        logger.info(f"\nExtracting CC (largest): {cc_bundle['n_axons']} axons")
+    # Extract CC
+    cc_bundle = next((b for b in bundles if b['bundle_id'] == 1), None)
+    if cc_bundle:
+        logger.info(f"\nExtracting CC region: {cc_bundle['n_axons']} axons")
         cc_group = root.create_group('cc')
         lut = create_label_lut(set(cc_bundle['axon_labels']), max_label)
         write_bundle_to_group(volume_full, cc_bundle, cc_group, lut, voxel_size_um, n_levels)
 
-    # Extract CG (second largest) - keep original orientation for spatial alignment
-    if len(bundles) >= 2:
-        cg_bundle = bundles[1]
-        logger.info(f"\nExtracting CG (second): {cg_bundle['n_axons']} axons")
+    # Extract CG
+    cg_bundle = next((b for b in bundles if b['bundle_id'] == 2), None)
+    if cg_bundle:
+        logger.info(f"\nExtracting CG region: {cg_bundle['n_axons']} axons")
         cg_group = root.create_group('cg')
         lut = create_label_lut(set(cg_bundle['axon_labels']), max_label)
         write_bundle_to_group(volume_full, cg_bundle, cg_group, lut, voxel_size_um, n_levels)
@@ -556,10 +654,12 @@ def extract_cc_cg_bundles(mat_file: Path,
     # Save JSON metadata
     output_metadata = {
         'volume_metadata': vol_metadata,
+        'segmentation_method': 'spatial_boundary_svm',
+        'n_seeds': {'cc': len(cc_seeds), 'cg': len(cg_seeds)},
         'n_bundles': len(bundles),
         'bundles': [
-            {**bundles[0], 'name': 'cc'} if len(bundles) > 0 else {},
-            {**bundles[1], 'name': 'cg'} if len(bundles) > 1 else {}
+            {**b, 'name': 'cc'} if b['bundle_id'] == 1 else {**b, 'name': 'cg'}
+            for b in bundles
         ]
     }
     metadata_file.parent.mkdir(parents=True, exist_ok=True)
@@ -572,7 +672,7 @@ def extract_cc_cg_bundles(mat_file: Path,
     logger.info(f"Saved Zarr: {output_zarr} ({total_size / 1024**2:.1f} MB)")
 
     logger.info(f"\n{'='*80}")
-    logger.info("Extraction complete!")
+    logger.info("Spatial segmentation complete!")
     logger.info(f"{'='*80}\n")
 
 
@@ -580,34 +680,36 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Extract CC and CG bundles to single OME-Zarr file'
+        description='Segment volume into CC and CG spatial subvolumes'
     )
     parser.add_argument('mat_file', type=Path,
-                       help='Input .mat file with labeled volume')
+                        help='Input .mat file with labeled volume')
     parser.add_argument('output_zarr', type=Path,
-                       help='Output Zarr store path')
+                        help='Output Zarr store path')
     parser.add_argument('--metadata', type=Path, required=True,
-                       help='Output JSON metadata file')
+                        help='Output JSON metadata file')
     parser.add_argument('--downsample', type=int, default=4,
-                       help='Downsampling factor for identification (default: 4)')
+                        help='Downsampling factor for analysis (default: 4)')
     parser.add_argument('--voxel-size', type=float, default=0.05,
-                       help='Voxel size in μm (default: 0.05)')
+                        help='Voxel size in μm (default: 0.05)')
     parser.add_argument('--max-angle', type=float, default=30.0,
-                       help='Max deviation from dominant axis in degrees (default: 30.0)')
-    parser.add_argument('--min-length', type=float, default=50.0,
-                       help='Minimum axon length in μm (default: 50.0)')
+                        help='Max angle for seed classification in degrees (default: 30.0)')
+    parser.add_argument('--min-length', type=float, default=10.0,
+                        help='Minimum axon length in μm (default: 10.0)')
     parser.add_argument('--min-voxels', type=int, default=10,
-                       help='Minimum voxels per axon (default: 10)')
+                        help='Minimum voxels per axon (default: 10)')
     parser.add_argument('--k-neighbors', type=int, default=10,
-                       help='K for sparse axon filtering (default: 10)')
+                        help='K for sparse axon filtering (default: 10)')
     parser.add_argument('--max-neighbor-distance', type=float, default=30.0,
-                       help='Max distance to k-th neighbor in μm (default: 30.0)')
+                        help='Max distance to k-th neighbor in μm (default: 30.0)')
     parser.add_argument('--n-levels', type=int, default=5,
-                       help='Pyramid levels (default: 5)')
+                        help='Pyramid levels (default: 5)')
+    parser.add_argument('--svm-gamma', type=float, default=0.1,
+                        help='SVM gamma (RBF width). Lower = stiffer boundary. Default: auto-scale')
 
     args = parser.parse_args()
 
-    extract_cc_cg_bundles(
+    segment_spatial_subvolumes(
         args.mat_file,
         args.output_zarr,
         args.metadata,
@@ -618,5 +720,6 @@ if __name__ == '__main__':
         min_voxels=args.min_voxels,
         k_neighbors=args.k_neighbors,
         max_neighbor_distance_um=args.max_neighbor_distance,
-        n_levels=args.n_levels
+        n_levels=args.n_levels,
+        svm_gamma=args.svm_gamma
     )
