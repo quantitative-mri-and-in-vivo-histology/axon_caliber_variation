@@ -93,17 +93,19 @@ def angle_between(vec1, vec2):
     return np.arccos(cos_angle)
 
 
-def sample_perpendicular_cross_section(binary_volume, point, tangent_vec,
-                                       plane_radius=5.0, plane_resolution=0.5):
+def sample_perpendicular_cross_section(interpolator, point, tangent_vec,
+                                       plane_radius=5.0, plane_resolution=0.5,
+                                       grid_shape=None):
     """
     Sample a perpendicular cross-section at a skeleton point.
 
     Args:
-        binary_volume: 3D binary array of the axon
+        interpolator: RegularGridInterpolator for the binary volume
         point: (3,) skeleton point coordinates
         tangent_vec: (3,) unit tangent vector at the point
         plane_radius: Radius of sampling plane in voxels
         plane_resolution: Resolution of sampling plane
+        grid_shape: Shape of the sampling grid (for reshaping results)
 
     Returns:
         area: Cross-section area in voxels^2, or None if sampling failed
@@ -138,17 +140,6 @@ def sample_perpendicular_cross_section(binary_volume, point, tangent_vec,
 
     # Translate to skeleton point
     sample_coords = rotated_plane + point
-
-    # Set up interpolator
-    # Note: skeleton points from DeepACSON are in array index order (i, j, k)
-    # which matches RegularGridInterpolator's expected coordinate order
-    sz = binary_volume.shape
-    interpolator = rgi(
-        (range(sz[0]), range(sz[1]), range(sz[2])),
-        binary_volume.astype(np.float32),
-        bounds_error=False,
-        fill_value=0
-    )
 
     # Sample cross-section
     # sample_coords are in (i, j, k) order after rotation and translation
@@ -271,6 +262,15 @@ def process_single_axon(args):
         # Compute tangent vectors
         tangent_vecs = unit_tangent_vector(sampled_skel)
 
+        # Create interpolator once for this axon (major speedup)
+        sz = cropped.shape
+        interpolator = rgi(
+            (range(sz[0]), range(sz[1]), range(sz[2])),
+            cropped.astype(np.float32),
+            bounds_error=False,
+            fill_value=0
+        )
+
         # Sample cross-sections and compute radii
         radii = []
         valid_skel_points = []
@@ -281,7 +281,7 @@ def process_single_axon(args):
                 continue
 
             area = sample_perpendicular_cross_section(
-                cropped, point, tangent,
+                interpolator, point, tangent,
                 plane_radius=plane_radius,
                 plane_resolution=plane_resolution
             )
