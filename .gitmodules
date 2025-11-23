@@ -1,0 +1,3 @@
+[submodule "external/DeepACSON"]
+	path = external/DeepACSON
+	url = https://github.com/aAbdz/DeepACSON.git
