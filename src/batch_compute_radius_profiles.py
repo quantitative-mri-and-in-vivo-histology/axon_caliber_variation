@@ -10,10 +10,11 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Tuple, Union
 
 import numpy as np
 
-from compute_axon_radius_profiles import compute_radius_profiles
+from compute_axon_radius_profiles import compute_radius_profiles, parse_voxel_size_arg
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -35,24 +36,30 @@ def extract_sample_name(mat_file: Path) -> str:
 
 def batch_compute_profiles(input_dir: Path,
                            output_dir: Path,
-                           voxel_size_um: float = 0.05,
+                           voxel_size_um: Union[float, Tuple[float, float, float]] = 0.05,
                            plane_radius: float = 10.0,
                            plane_resolution: float = 0.5,
                            step_size: float = 2.0,
                            n_jobs: int = -1,
-                           max_axons: int = 0):
+                           max_axons: int = 0,
+                           anisotropy_mode: str = 'simple'):
     """
     Compute radius profiles for all *_myelinated_axons.mat files in input directory.
 
     Args:
         input_dir: Directory containing *_myelinated_axons.mat files
         output_dir: Directory for output .npz files
-        voxel_size_um: Voxel size in micrometers
+        voxel_size_um: Voxel size in micrometers. Can be:
+                      - float: isotropic voxel size (e.g., 0.05)
+                      - tuple: anisotropic (vz, vy, vx) matching array axes (Z, Y, X)
         plane_radius: Radius of sampling plane in voxels
         plane_resolution: Resolution of sampling plane
-        step_size: Step size along skeleton in voxels
+        step_size: Step size along skeleton in physical units (μm)
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
+        anisotropy_mode: How to handle anisotropic voxels:
+                        - 'simple': Resample to isotropic (coarsest dimension)
+                        - 'none': Use geometric mean (legacy, less accurate)
 
     Returns:
         Dict mapping sample_name -> summary statistics
@@ -92,7 +99,8 @@ def batch_compute_profiles(input_dir: Path,
                 plane_resolution=plane_resolution,
                 step_size=step_size,
                 n_jobs=n_jobs,
-                max_axons=max_axons
+                max_axons=max_axons,
+                anisotropy_mode=anisotropy_mode
             )
 
             # Load results to get summary stats
@@ -171,8 +179,10 @@ if __name__ == '__main__':
                         help='Directory containing *_myelinated_axons.mat files')
     parser.add_argument('output_dir', type=Path,
                         help='Output directory for .npz files and summary')
-    parser.add_argument('--voxel-size', type=float, default=0.05,
-                        help='Voxel size in micrometers (default: 0.05)')
+    parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=0.05,
+                        help='Voxel size in micrometers: single value for isotropic (e.g., 0.05) '
+                             'or vz,vy,vx for anisotropic matching array axes Z,Y,X '
+                             '(e.g., 0.015,0.015,0.05). Default: 0.05')
     parser.add_argument('--plane-radius', type=float, default=10.0,
                         help='Radius of sampling plane in voxels (default: 10.0)')
     parser.add_argument('--plane-resolution', type=float, default=0.5,
@@ -183,6 +193,11 @@ if __name__ == '__main__':
                         help='Number of parallel jobs (default: -1 = all CPUs)')
     parser.add_argument('--max-axons', type=int, default=0,
                         help='Maximum axons to process per volume (0 = all, default: 0)')
+    parser.add_argument('--anisotropy-mode', type=str, default='simple',
+                        choices=['simple', 'none'],
+                        help="How to handle anisotropic voxels: 'simple' resamples to isotropic "
+                             "(using coarsest dimension), 'none' uses geometric mean (legacy). "
+                             "Default: 'simple'")
 
     args = parser.parse_args()
 
@@ -194,5 +209,6 @@ if __name__ == '__main__':
         plane_resolution=args.plane_resolution,
         step_size=args.step_size,
         n_jobs=args.n_jobs,
-        max_axons=args.max_axons
+        max_axons=args.max_axons,
+        anisotropy_mode=args.anisotropy_mode
     )

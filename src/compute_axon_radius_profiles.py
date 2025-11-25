@@ -2,6 +2,9 @@
 """
 Compute axon radius profiles by sampling perpendicular cross-sections along skeletons.
 
+REFERENCE IMPLEMENTATION using DeepACSON skeletonization.
+This is the slow but correct implementation for validation purposes.
+
 For each axon:
 1. Extract skeleton using DeepACSON
 2. Walk along skeleton points
@@ -20,13 +23,18 @@ import multiprocessing as mp
 from typing import Tuple, Union
 
 import numpy as np
-import numba
-from numba import njit, prange
 import h5py
 import scipy.io as sio
-from scipy.ndimage import map_coordinates
+from scipy.interpolate import RegularGridInterpolator as rgi
+from scipy.ndimage import zoom
+from skimage.measure import label, regionprops
 from tqdm import tqdm
-import kimimaro
+
+# Add external DeepACSON to path
+DEEPACSON_PATH = Path(__file__).parent.parent / 'external' / 'DeepACSON' / 'CSD'
+sys.path.insert(0, str(DEEPACSON_PATH))
+
+from skeleton3D import skeleton
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -34,13 +42,13 @@ logger = logging.getLogger(__name__)
 
 def parse_voxel_size(voxel_size_um: Union[float, Tuple[float, float, float]]) -> Tuple[float, float, float]:
     """
-    Parse voxel size to a (vx, vy, vz) tuple.
+    Parse voxel size to a (vz, vy, vx) tuple matching array axis order (Z, Y, X).
 
     Args:
-        voxel_size_um: Scalar (isotropic) or (vx, vy, vz) tuple (anisotropic)
+        voxel_size_um: Scalar (isotropic) or (vz, vy, vx) tuple (anisotropic)
 
     Returns:
-        Tuple of (vx, vy, vz) in micrometers
+        Tuple of (vz, vy, vx) in micrometers, matching array axes (Z, Y, X)
     """
     if isinstance(voxel_size_um, (tuple, list)):
         if len(voxel_size_um) == 3:
@@ -65,6 +73,51 @@ def parse_voxel_size_arg(value: str) -> Union[float, Tuple[float, float, float]]
             )
         return tuple(float(p.strip()) for p in parts)
     return float(value)
+
+
+def resample_to_isotropic(volume: np.ndarray,
+                          voxel_size: Tuple[float, float, float]
+                          ) -> Tuple[np.ndarray, float]:
+    """
+    Resample anisotropic volume to isotropic voxels.
+
+    Downsamples to the coarsest voxel dimension to avoid upsampling artifacts.
+    Uses nearest-neighbor interpolation (order=0) to preserve label integrity.
+
+    Args:
+        volume: 3D labeled volume with shape (Z, Y, X)
+        voxel_size: Tuple of (vz, vy, vx) voxel sizes in micrometers, matching array axes
+
+    Returns:
+        Tuple of (resampled_volume, isotropic_voxel_size)
+    """
+    vz, vy, vx = voxel_size
+
+    # Check if already isotropic
+    if np.allclose([vz, vy, vx], vz):
+        logger.info("Volume is already isotropic, no resampling needed")
+        return volume, vz
+
+    # Target voxel size is the coarsest dimension
+    target_size = max(vz, vy, vx)
+
+    # Compute zoom factors (< 1 means downsampling)
+    # Volume axes are (Z, Y, X), voxel_size is (vz, vy, vx)
+    zoom_factors = (vz / target_size, vy / target_size, vx / target_size)
+
+    logger.info(f"Resampling anisotropic volume to isotropic:")
+    logger.info(f"  Original voxel size (Z, Y, X): vz={vz:.4f}, vy={vy:.4f}, vx={vx:.4f} μm")
+    logger.info(f"  Target voxel size: {target_size:.4f} μm (isotropic)")
+    logger.info(f"  Zoom factors (Z, Y, X): {zoom_factors}")
+    logger.info(f"  Original shape: {volume.shape}")
+
+    # Use order=0 (nearest-neighbor) to preserve label integrity
+    resampled = zoom(volume, zoom_factors, order=0, mode='nearest')
+
+    logger.info(f"  Resampled shape: {resampled.shape}")
+
+    return resampled, target_size
+
 
 # Global variable for volume access in worker processes
 _shared_volume = None
@@ -92,202 +145,122 @@ def unit_tangent_vector(curve):
     return d_curve / ds
 
 
-@njit(cache=True)
 def rotation_matrix_3D(vector, theta):
     """
     Create rotation matrix for counterclockwise rotation about a unit vector.
     Uses Euler-Rodrigues formula.
     """
     a = np.cos(theta / 2.0)
-    sin_half = np.sin(theta / 2.0)
-    b = -vector[0] * sin_half
-    c = -vector[1] * sin_half
-    d = -vector[2] * sin_half
-    aa, bb, cc, dd = a*a, b*b, c*c, d*d
+    b, c, d = -vector * np.sin(theta / 2.0)
+    aa, bb, cc, dd = a**2, b**2, c**2, d**2
     bc, ad, ac, ab, bd, cd = b*c, a*d, a*c, a*b, b*d, c*d
 
-    result = np.empty((3, 3), dtype=np.float64)
-    result[0, 0] = aa+bb-cc-dd
-    result[0, 1] = 2*(bc+ad)
-    result[0, 2] = 2*(bd-ac)
-    result[1, 0] = 2*(bc-ad)
-    result[1, 1] = aa+cc-bb-dd
-    result[1, 2] = 2*(cd+ab)
-    result[2, 0] = 2*(bd+ac)
-    result[2, 1] = 2*(cd-ab)
-    result[2, 2] = aa+dd-bb-cc
-    return result
+    return np.array([
+        [aa+bb-cc-dd, 2*(bc+ad), 2*(bd-ac)],
+        [2*(bc-ad), aa+cc-bb-dd, 2*(cd+ab)],
+        [2*(bd+ac), 2*(cd-ab), aa+dd-bb-cc]
+    ])
 
 
-@njit(cache=True)
 def unit_normal_vector(vec1, vec2):
     """Compute unit normal vector from cross product."""
     n = np.cross(vec1, vec2)
-    norm_sq = n[0]*n[0] + n[1]*n[1] + n[2]*n[2]
-    if norm_sq < 1e-10:
+    if np.allclose(n, 0):
         n = vec1.copy()
-        norm_sq = n[0]*n[0] + n[1]*n[1] + n[2]*n[2]
-    s = max(np.sqrt(norm_sq), 1e-5)
+    s = max(np.linalg.norm(n), 1e-5)
     return n / s
 
 
-@njit(cache=True)
 def angle_between(vec1, vec2):
     """Compute angle between two vectors."""
-    norm1 = np.sqrt(vec1[0]*vec1[0] + vec1[1]*vec1[1] + vec1[2]*vec1[2])
-    norm2 = np.sqrt(vec2[0]*vec2[0] + vec2[1]*vec2[1] + vec2[2]*vec2[2])
-    dot = vec1[0]*vec2[0] + vec1[1]*vec2[1] + vec1[2]*vec2[2]
-    cos_angle = dot / (norm1 * norm2 + 1e-10)
-    if cos_angle > 1.0:
-        cos_angle = 1.0
-    elif cos_angle < -1.0:
-        cos_angle = -1.0
+    cos_angle = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-10)
+    cos_angle = np.clip(cos_angle, -1, 1)
     return np.arccos(cos_angle)
 
 
-@njit(cache=True, parallel=True)
-def prepare_sample_coordinates(points, tangent_vecs, base_xyz, n_grid):
+def sample_perpendicular_cross_section(binary_volume, point, tangent_vec,
+                                       plane_radius=5.0, plane_resolution=0.5,
+                                       interpolator=None):
     """
-    Prepare all sampling coordinates for all skeleton points.
-    JIT-compiled for speed.
-    """
-    n_points = len(points)
-    all_sample_coords = np.zeros((n_points * n_grid, 3), dtype=np.float32)
-    z_axis = np.array([0.0, 0.0, 1.0])
-
-    for i in prange(n_points):
-        point = points[i]
-        tangent = tangent_vecs[i]
-
-        # Check if tangent is zero
-        tangent_norm = np.sqrt(tangent[0]**2 + tangent[1]**2 + tangent[2]**2)
-        if tangent_norm < 1e-10:
-            # Fill with out-of-bounds coords
-            for j in range(n_grid):
-                all_sample_coords[i * n_grid + j, 0] = -1.0
-                all_sample_coords[i * n_grid + j, 1] = -1.0
-                all_sample_coords[i * n_grid + j, 2] = -1.0
-            continue
-
-        # Compute rotation
-        dot_z = tangent[2]  # dot product with z_axis
-
-        # Check if aligned with z-axis
-        if abs(dot_z) > 0.9999:
-            # Already aligned or opposite
-            if dot_z < 0:
-                # Flip z
-                for j in range(n_grid):
-                    all_sample_coords[i * n_grid + j, 0] = base_xyz[j, 0] + point[0]
-                    all_sample_coords[i * n_grid + j, 1] = base_xyz[j, 1] + point[1]
-                    all_sample_coords[i * n_grid + j, 2] = -base_xyz[j, 2] + point[2]
-            else:
-                for j in range(n_grid):
-                    all_sample_coords[i * n_grid + j, 0] = base_xyz[j, 0] + point[0]
-                    all_sample_coords[i * n_grid + j, 1] = base_xyz[j, 1] + point[1]
-                    all_sample_coords[i * n_grid + j, 2] = base_xyz[j, 2] + point[2]
-        else:
-            # Compute rotation matrix
-            rot_axis = unit_normal_vector(z_axis, tangent)
-            theta = angle_between(z_axis, tangent)
-            rot_mat = rotation_matrix_3D(rot_axis, theta)
-
-            # Rotate and translate each grid point
-            for j in range(n_grid):
-                x = base_xyz[j, 0]
-                y = base_xyz[j, 1]
-                z = base_xyz[j, 2]
-                # Matrix multiply: rot_mat.T @ [x, y, z]
-                rx = rot_mat[0, 0] * x + rot_mat[1, 0] * y + rot_mat[2, 0] * z
-                ry = rot_mat[0, 1] * x + rot_mat[1, 1] * y + rot_mat[2, 1] * z
-                rz = rot_mat[0, 2] * x + rot_mat[1, 2] * y + rot_mat[2, 2] * z
-                all_sample_coords[i * n_grid + j, 0] = rx + point[0]
-                all_sample_coords[i * n_grid + j, 1] = ry + point[1]
-                all_sample_coords[i * n_grid + j, 2] = rz + point[2]
-
-    return all_sample_coords
-
-
-@njit(cache=True, parallel=True)
-def compute_areas_from_samples(all_values, n_points, n_grid, plane_resolution):
-    """
-    Count voxels and compute areas for all cross-sections.
-
-    Assumes clean data where the interpolated values represent only the target axon.
-    Simply counts voxels above threshold and converts to area.
+    Sample a perpendicular cross-section at a skeleton point.
 
     Args:
-        all_values: Flattened array of all interpolated values (n_points * n_grid,)
-        n_points: Number of skeleton points
-        n_grid: Number of grid points per cross-section
-        plane_resolution: Resolution of sampling plane
-
-    Returns:
-        areas: Array of cross-section areas (n_points,)
-    """
-    areas = np.zeros(n_points, dtype=np.float32)
-    res_squared = plane_resolution * plane_resolution
-
-    for i in prange(n_points):
-        count = 0
-        start_idx = i * n_grid
-        for j in range(n_grid):
-            if all_values[start_idx + j] >= 0.5:
-                count += 1
-        areas[i] = count * res_squared
-
-    return areas
-
-
-def sample_cross_sections_batched(volume, points, tangent_vecs,
-                                   plane_radius=5.0, plane_resolution=0.5):
-    """
-    Sample perpendicular cross-sections for multiple skeleton points at once.
-
-    Args:
-        volume: 3D binary array of the axon (float32)
-        points: (N, 3) array of skeleton point coordinates
-        tangent_vecs: (N, 3) array of unit tangent vectors
+        binary_volume: 3D binary array of the axon
+        point: (3,) skeleton point coordinates
+        tangent_vec: (3,) unit tangent vector at the point
         plane_radius: Radius of sampling plane in voxels
         plane_resolution: Resolution of sampling plane
+        interpolator: Optional pre-built RegularGridInterpolator
 
     Returns:
-        areas: Array of cross-section areas in voxels^2
+        area: Cross-section area in voxels^2, or None if sampling failed
     """
-    n_points = len(points)
-    if n_points == 0:
-        return []
-
-    # Create base sampling grid in XY plane (reused for all points)
+    # Create sampling grid in XY plane
     coords = np.arange(-plane_radius, plane_radius + plane_resolution, plane_resolution)
     x, y = np.meshgrid(coords, coords)
-    grid_shape = x.shape
-    n_grid = x.size
     z = np.zeros_like(x)
-    base_xyz = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1).astype(np.float32)  # (n_grid, 3)
 
-    # Prepare all sampling coordinates using JIT-compiled function
-    points_f32 = np.ascontiguousarray(points.astype(np.float64))
-    tangent_f64 = np.ascontiguousarray(tangent_vecs.astype(np.float64))
-    base_xyz_f64 = base_xyz.astype(np.float64)
+    # Flatten for rotation
+    xyz = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1)
 
-    all_sample_coords = prepare_sample_coordinates(points_f32, tangent_f64, base_xyz_f64, n_grid)
+    # Compute rotation to align Z-axis with tangent vector
+    z_axis = np.array([0, 0, 1])
 
-    # Single interpolation call for all points using map_coordinates
-    # map_coordinates expects (ndim, npoints), so transpose
-    # order=1 for linear interpolation, mode='constant' with cval=0 for out-of-bounds
-    all_values = map_coordinates(
-        volume,
-        all_sample_coords.T,
-        order=1,
-        mode='constant',
-        cval=0.0
-    )
+    if np.allclose(tangent_vec, z_axis) or np.allclose(tangent_vec, -z_axis):
+        # Already aligned or opposite
+        if np.dot(tangent_vec, z_axis) < 0:
+            rotated_plane = xyz * np.array([1, 1, -1])
+        else:
+            rotated_plane = xyz
+    else:
+        rot_axis = unit_normal_vector(z_axis, tangent_vec)
+        theta = angle_between(z_axis, tangent_vec)
+        rot_mat = rotation_matrix_3D(rot_axis, theta)
+        rotated_plane = xyz @ rot_mat.T
 
-    # Compute areas using JIT-compiled function (parallel over cross-sections)
-    areas = compute_areas_from_samples(all_values, n_points, n_grid, plane_resolution)
+    # Translate to skeleton point
+    sample_coords = rotated_plane + point
 
-    return areas
+    # Set up interpolator if not provided
+    if interpolator is None:
+        sz = binary_volume.shape
+        interpolator = rgi(
+            (range(sz[0]), range(sz[1]), range(sz[2])),
+            binary_volume.astype(float),
+            bounds_error=False,
+            fill_value=0
+        )
+
+    # Sample cross-section
+    cross_section = interpolator(sample_coords)
+    bw_cross_section = (cross_section >= 0.5).reshape(x.shape)
+
+    # Label connected components
+    labeled, n_components = label(bw_cross_section, connectivity=1, return_num=True)
+
+    if n_components == 0:
+        return None
+
+    # Find the component at the center (should be the axon)
+    center_idx = bw_cross_section.shape[0] // 2
+    center_label = labeled[center_idx, center_idx]
+
+    if center_label == 0:
+        # No component at center - find largest
+        props = regionprops(labeled)
+        if not props:
+            return None
+        areas = [p.area for p in props]
+        center_label = props[np.argmax(areas)].label
+
+    # Get area of the main component
+    main_component = (labeled == center_label)
+    area = np.sum(main_component)
+
+    # Convert from grid squares to actual area
+    area_voxels = area * (plane_resolution ** 2)
+
+    return area_voxels
 
 
 def process_single_axon(args):
@@ -303,99 +276,52 @@ def process_single_axon(args):
     """
     axon_label, voxel_size_um, plane_radius, plane_resolution, step_size = args
 
-    # Parse voxel size to ensure we have (vx, vy, vz)
-    vx, vy, vz = parse_voxel_size(voxel_size_um)
+    # Parse voxel size to ensure we have (vz, vy, vx) matching array axes (Z, Y, X)
+    vz, vy, vx = parse_voxel_size(voxel_size_um)
     # Geometric mean for approximate isotropic conversions
-    voxel_geom_mean = (vx * vy * vz) ** (1/3)
+    voxel_geom_mean = (vz * vy * vx) ** (1/3)
 
     try:
-        # Get axon coordinates directly (avoids 20GB boolean array per worker)
-        # The temporary boolean from comparison is garbage collected after argwhere
-        coords = np.argwhere(_shared_volume == axon_label)
+        # Extract binary volume from shared memory
+        axon_binary = (_shared_volume == axon_label).astype(np.uint8)
+
+        # Get axon coordinates and bounding box
+        coords = np.argwhere(axon_binary)
         if len(coords) < 100:  # Skip very small axons
             return None
 
-        # Compute bounding box with padding
+        # Crop to bounding box with padding
         min_coords = coords.min(axis=0)
         max_coords = coords.max(axis=0)
 
         padding = int(plane_radius) + 5
         min_padded = np.maximum(min_coords - padding, 0)
-        max_padded = np.minimum(max_coords + padding, np.array(_shared_volume.shape))
+        max_padded = np.minimum(max_coords + padding, np.array(axon_binary.shape))
 
-        # Create binary mask only for the cropped region (much smaller)
-        cropped_region = _shared_volume[
+        cropped = axon_binary[
             min_padded[0]:max_padded[0],
             min_padded[1]:max_padded[1],
             min_padded[2]:max_padded[2]
-        ]
-        # Kimimaro expects a labeled volume (uint8 with label 1 for the axon)
-        cropped = np.ascontiguousarray((cropped_region == axon_label).astype(np.uint8))
+        ].copy()
 
-        # Run skeletonization with Kimimaro
-        # Use conservative parameters for axon skeletonization
-        # Note: We keep anisotropy=(1,1,1) so vertices are returned in voxel coordinates.
-        # We handle anisotropy ourselves when computing physical lengths and radii.
-        skels = kimimaro.skeletonize(
-            cropped,
-            teasar_params={
-                "scale": 1.5,
-                "const": 10,  # Small const for thin structures like axons
-            },
-            anisotropy=(1, 1, 1),  # Keep voxel coordinates; scale ourselves later
-            dust_threshold=50,  # Remove very small components
-            progress=False,
-            parallel=1,  # Single thread (already parallelizing at axon level)
-        )
+        # Run DeepACSON skeletonization
+        skel_segments = skeleton(cropped)
 
-        if len(skels) == 0 or 1 not in skels:
+        if len(skel_segments) == 0:
             return None
 
-        skel = skels[1]  # Get skeleton for label 1
-        vertices = skel.vertices  # (N, 3) array
-        edges = skel.edges  # (M, 2) array
-
-        if len(vertices) < 3:
-            return None
-
-        # Convert skeleton graph to ordered path by tracing from an endpoint
-        # Build adjacency list
-        from collections import defaultdict
-        adj = defaultdict(list)
-        for e in edges:
-            adj[e[0]].append(e[1])
-            adj[e[1]].append(e[0])
-
-        # Find endpoints (degree 1) or use first vertex
-        endpoints = [v for v in adj if len(adj[v]) == 1]
-        if len(endpoints) == 0:
-            start = 0
+        # Use the longest skeleton segment
+        if len(skel_segments) == 1:
+            main_skel = skel_segments[0]
         else:
-            start = endpoints[0]
-
-        # Trace path using DFS
-        visited = set()
-        path = []
-        stack = [start]
-        while stack:
-            v = stack.pop()
-            if v in visited:
-                continue
-            visited.add(v)
-            path.append(vertices[v])
-            # Add unvisited neighbors
-            for neighbor in adj[v]:
-                if neighbor not in visited:
-                    stack.append(neighbor)
-
-        main_skel = np.array(path)
+            lengths = [len(seg) for seg in skel_segments]
+            main_skel = skel_segments[np.argmax(lengths)]
 
         if len(main_skel) < 3:
             return None
 
         # Subsample skeleton to step_size intervals
         # Compute cumulative arc length in physical units (accounting for anisotropy)
-        # Skeleton coords are (z, y, x) in voxel indices
         diffs = np.diff(main_skel, axis=0)
         # Scale by voxel sizes: axis 0 = z, axis 1 = y, axis 2 = x
         diffs_physical = diffs * np.array([vz, vy, vx])
@@ -429,32 +355,48 @@ def process_single_axon(args):
         # Compute tangent vectors
         tangent_vecs = unit_tangent_vector(sampled_skel)
 
-        # Convert to float32 for interpolation
-        cropped_float = cropped.astype(np.float32)
-
-        # Sample all cross-sections in one batch (major speedup)
-        areas = sample_cross_sections_batched(
-            cropped_float, sampled_skel, tangent_vecs,
-            plane_radius=plane_radius,
-            plane_resolution=plane_resolution
+        # Create interpolator once for all cross-sections
+        sz = cropped.shape
+        interpolator = rgi(
+            (range(sz[0]), range(sz[1]), range(sz[2])),
+            cropped.astype(float),
+            bounds_error=False,
+            fill_value=0
         )
 
-        # Convert areas to radii and filter valid points (area > 0)
-        valid_mask = areas > 0
-        if np.sum(valid_mask) < 2:
+        # Sample cross-sections and compute radii
+        radii = []
+        valid_skel_points = []
+
+        for i, (point, tangent) in enumerate(zip(sampled_skel, tangent_vecs)):
+            # Skip if tangent is zero
+            if np.allclose(tangent, 0):
+                continue
+
+            area = sample_perpendicular_cross_section(
+                cropped, point, tangent,
+                plane_radius=plane_radius,
+                plane_resolution=plane_resolution,
+                interpolator=interpolator
+            )
+
+            if area is not None and area > 0:
+                # Convert area to equivalent circular radius
+                # A = π * r², so r = sqrt(A / π)
+                # For anisotropic voxels, use geometric mean
+                radius_voxels = np.sqrt(area / np.pi)
+                radius_um = radius_voxels * voxel_geom_mean
+
+                radii.append(radius_um)
+                # Convert skeleton point back to original coordinates
+                original_point = point + min_padded
+                valid_skel_points.append(original_point * np.array([vz, vy, vx]))
+
+        if len(radii) < 2:
             return None
 
-        valid_areas = areas[valid_mask]
-        valid_skel = sampled_skel[valid_mask]
-
-        # Convert area to equivalent circular radius: A = π * r², so r = sqrt(A / π)
-        # For anisotropic voxels, use geometric mean for the cross-section plane
-        # (cross-section could be at any orientation, so we use 3D geometric mean)
-        radii = np.sqrt(valid_areas / np.pi) * voxel_geom_mean
-
-        # Convert skeleton points back to original coordinates (per-axis scaling)
-        # Skeleton coords are (z, y, x) in voxel indices
-        skel_coords = (valid_skel + min_padded) * np.array([vz, vy, vx])
+        radii = np.array(radii)
+        skel_coords = np.array(valid_skel_points)
 
         result = {
             'label': axon_label,
@@ -483,7 +425,8 @@ def compute_radius_profiles(mat_file: Path,
                             plane_resolution: float = 0.5,
                             step_size: float = 2.0,
                             n_jobs: int = -1,
-                            max_axons: int = 0):
+                            max_axons: int = 0,
+                            anisotropy_mode: str = 'simple'):
     """
     Compute radius profiles for all axons in a labeled volume.
 
@@ -498,9 +441,13 @@ def compute_radius_profiles(mat_file: Path,
         step_size: Step size along skeleton in physical units (μm)
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
+        anisotropy_mode: How to handle anisotropic voxels:
+                        - 'simple': Resample to isotropic (coarsest dimension)
+                        - 'none': Use geometric mean (legacy, less accurate)
     """
     # Parse voxel size to (vx, vy, vz) tuple
     voxel_size_tuple = parse_voxel_size(voxel_size_um)
+
     # Validate input file
     if not mat_file.exists():
         raise FileNotFoundError(f"Input file not found: {mat_file}")
@@ -542,6 +489,13 @@ def compute_radius_profiles(mat_file: Path,
         volume = mat_data[volume_key]
         logger.info(f"Loaded scipy.io format, volume shape: {volume.shape}, dtype: {volume.dtype}")
 
+    # Handle anisotropic voxels
+    if anisotropy_mode == 'simple':
+        volume, iso_voxel_size = resample_to_isotropic(volume, voxel_size_tuple)
+        voxel_size_tuple = (iso_voxel_size, iso_voxel_size, iso_voxel_size)
+    elif anisotropy_mode != 'none':
+        raise ValueError(f"Unknown anisotropy_mode: {anisotropy_mode}. Use 'simple' or 'none'.")
+
     # Get unique axon labels
     axon_labels = np.unique(volume)
     axon_labels = axon_labels[axon_labels > 0]  # Remove background
@@ -563,11 +517,11 @@ def compute_radius_profiles(mat_file: Path,
     ]
 
     # Log voxel size info
-    vx, vy, vz = voxel_size_tuple
-    if vx == vy == vz:
-        logger.info(f"Voxel size (isotropic): {vx:.4f} μm")
+    vz, vy, vx = voxel_size_tuple
+    if vz == vy == vx:
+        logger.info(f"Voxel size (isotropic): {vz:.4f} μm")
     else:
-        logger.info(f"Voxel size (anisotropic): vx={vx:.4f}, vy={vy:.4f}, vz={vz:.4f} μm")
+        logger.info(f"Voxel size (anisotropic, Z,Y,X): vz={vz:.4f}, vy={vy:.4f}, vx={vx:.4f} μm")
 
     logger.info(f"Processing {len(args_list)} axons with {n_jobs} workers")
     logger.info(f"Parameters: plane_radius={plane_radius}, resolution={plane_resolution}, step={step_size} μm")
@@ -622,7 +576,7 @@ def compute_radius_profiles(mat_file: Path,
         radii_profiles_um=radii_profiles,
         skeleton_coords_um=skeleton_coords,
         all_radii_um=all_radii,
-        voxel_size_um=np.array(voxel_size_tuple),  # Store as (vx, vy, vz) array
+        voxel_size_um=np.array(voxel_size_tuple),  # Store as (vz, vy, vx) array matching axes
         plane_radius=plane_radius,
         plane_resolution=plane_resolution,
         step_size=step_size,
@@ -647,7 +601,7 @@ def compute_radius_profiles(mat_file: Path,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Compute axon radius profiles by sampling perpendicular cross-sections'
+        description='Compute axon radius profiles by sampling perpendicular cross-sections (DeepACSON reference implementation)'
     )
     parser.add_argument('mat_file', type=Path,
                         help='Path to .mat file with labeled axons')
@@ -655,7 +609,8 @@ if __name__ == '__main__':
                         help='Output .npz file for results')
     parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=0.05,
                         help='Voxel size in micrometers: single value for isotropic (e.g., 0.05) '
-                             'or vx,vy,vz for anisotropic (e.g., 0.015,0.015,0.05). Default: 0.05')
+                             'or vz,vy,vx for anisotropic matching array axes Z,Y,X '
+                             '(e.g., 0.05,0.015,0.015). Default: 0.05')
     parser.add_argument('--plane-radius', type=float, default=10.0,
                         help='Radius of sampling plane in voxels (default: 10.0)')
     parser.add_argument('--plane-resolution', type=float, default=0.5,
@@ -666,6 +621,11 @@ if __name__ == '__main__':
                         help='Number of parallel jobs (default: -1 = all CPUs)')
     parser.add_argument('--max-axons', type=int, default=0,
                         help='Maximum axons to process (0 = all, default: 0)')
+    parser.add_argument('--anisotropy-mode', type=str, default='simple',
+                        choices=['simple', 'none'],
+                        help="How to handle anisotropic voxels: 'simple' resamples to isotropic "
+                             "(using coarsest dimension), 'none' uses geometric mean (legacy). "
+                             "Default: 'simple'")
 
     args = parser.parse_args()
 
@@ -677,5 +637,6 @@ if __name__ == '__main__':
         plane_resolution=args.plane_resolution,
         step_size=args.step_size,
         n_jobs=args.n_jobs,
-        max_axons=args.max_axons
+        max_axons=args.max_axons,
+        anisotropy_mode=args.anisotropy_mode
     )
