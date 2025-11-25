@@ -7,6 +7,9 @@ h5py>=3.8.0
 scikit-learn>=1.2.0
 scikit-image
 tqdm
+kimimaro
+crackle-codec
+posix-ipc
 
 # Testing and debugging
 pytest
