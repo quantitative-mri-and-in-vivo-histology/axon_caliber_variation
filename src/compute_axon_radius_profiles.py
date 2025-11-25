@@ -17,6 +17,7 @@ import sys
 import traceback
 from pathlib import Path
 import multiprocessing as mp
+from typing import Tuple, Union
 
 import numpy as np
 import numba
@@ -29,6 +30,41 @@ import kimimaro
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def parse_voxel_size(voxel_size_um: Union[float, Tuple[float, float, float]]) -> Tuple[float, float, float]:
+    """
+    Parse voxel size to a (vx, vy, vz) tuple.
+
+    Args:
+        voxel_size_um: Scalar (isotropic) or (vx, vy, vz) tuple (anisotropic)
+
+    Returns:
+        Tuple of (vx, vy, vz) in micrometers
+    """
+    if isinstance(voxel_size_um, (tuple, list)):
+        if len(voxel_size_um) == 3:
+            return tuple(float(v) for v in voxel_size_um)
+        elif len(voxel_size_um) == 1:
+            v = float(voxel_size_um[0])
+            return (v, v, v)
+        else:
+            raise ValueError(f"Expected 1 or 3 voxel size values, got {len(voxel_size_um)}")
+    # Scalar - isotropic
+    v = float(voxel_size_um)
+    return (v, v, v)
+
+
+def parse_voxel_size_arg(value: str) -> Union[float, Tuple[float, float, float]]:
+    """Parse voxel size CLI argument: single float or comma-separated triple."""
+    if ',' in value:
+        parts = value.split(',')
+        if len(parts) != 3:
+            raise argparse.ArgumentTypeError(
+                f"Expected 1 or 3 values, got {len(parts)}: '{value}'"
+            )
+        return tuple(float(p.strip()) for p in parts)
+    return float(value)
 
 # Global variable for volume access in worker processes
 _shared_volume = None
@@ -260,11 +296,17 @@ def process_single_axon(args):
 
     Args:
         args: Tuple of (axon_label, voxel_size_um, plane_radius, plane_resolution, step_size)
+              voxel_size_um: (vx, vy, vz) tuple in micrometers
 
     Returns:
         Dict with radius profile and skeleton coords, or None if failed
     """
     axon_label, voxel_size_um, plane_radius, plane_resolution, step_size = args
+
+    # Parse voxel size to ensure we have (vx, vy, vz)
+    vx, vy, vz = parse_voxel_size(voxel_size_um)
+    # Geometric mean for approximate isotropic conversions
+    voxel_geom_mean = (vx * vy * vz) ** (1/3)
 
     try:
         # Get axon coordinates directly (avoids 20GB boolean array per worker)
@@ -292,13 +334,15 @@ def process_single_axon(args):
 
         # Run skeletonization with Kimimaro
         # Use conservative parameters for axon skeletonization
+        # Note: We keep anisotropy=(1,1,1) so vertices are returned in voxel coordinates.
+        # We handle anisotropy ourselves when computing physical lengths and radii.
         skels = kimimaro.skeletonize(
             cropped,
             teasar_params={
                 "scale": 1.5,
                 "const": 10,  # Small const for thin structures like axons
             },
-            anisotropy=(1, 1, 1),  # Isotropic voxels
+            anisotropy=(1, 1, 1),  # Keep voxel coordinates; scale ourselves later
             dust_threshold=50,  # Remove very small components
             progress=False,
             parallel=1,  # Single thread (already parallelizing at axon level)
@@ -350,11 +394,14 @@ def process_single_axon(args):
             return None
 
         # Subsample skeleton to step_size intervals
-        # Compute cumulative arc length
+        # Compute cumulative arc length in physical units (accounting for anisotropy)
+        # Skeleton coords are (z, y, x) in voxel indices
         diffs = np.diff(main_skel, axis=0)
-        segment_lengths = np.sqrt(np.sum(diffs**2, axis=1))
+        # Scale by voxel sizes: axis 0 = z, axis 1 = y, axis 2 = x
+        diffs_physical = diffs * np.array([vz, vy, vx])
+        segment_lengths = np.sqrt(np.sum(diffs_physical**2, axis=1))
         cumulative_length = np.concatenate([[0], np.cumsum(segment_lengths)])
-        total_length = cumulative_length[-1]
+        total_length = cumulative_length[-1]  # Now in physical units (μm)
 
         if total_length < step_size:
             # Too short - use all points
@@ -401,10 +448,13 @@ def process_single_axon(args):
         valid_skel = sampled_skel[valid_mask]
 
         # Convert area to equivalent circular radius: A = π * r², so r = sqrt(A / π)
-        radii = np.sqrt(valid_areas / np.pi) * voxel_size_um
+        # For anisotropic voxels, use geometric mean for the cross-section plane
+        # (cross-section could be at any orientation, so we use 3D geometric mean)
+        radii = np.sqrt(valid_areas / np.pi) * voxel_geom_mean
 
-        # Convert skeleton points back to original coordinates
-        skel_coords = (valid_skel + min_padded) * voxel_size_um
+        # Convert skeleton points back to original coordinates (per-axis scaling)
+        # Skeleton coords are (z, y, x) in voxel indices
+        skel_coords = (valid_skel + min_padded) * np.array([vz, vy, vx])
 
         result = {
             'label': axon_label,
@@ -413,11 +463,11 @@ def process_single_axon(args):
             'n_points': len(radii),
             'mean_radius_um': np.mean(radii),
             'std_radius_um': np.std(radii),
-            'length_um': total_length * voxel_size_um
+            'length_um': total_length  # Already in physical units (μm)
         }
 
         logger.info(f"Axon {axon_label}: {len(radii)} points, "
-                   f"mean r={np.mean(radii):.3f} μm, length={total_length * voxel_size_um:.1f} μm")
+                   f"mean r={np.mean(radii):.3f} μm, length={total_length:.1f} μm")
 
         return result
 
@@ -428,7 +478,7 @@ def process_single_axon(args):
 
 def compute_radius_profiles(mat_file: Path,
                             output_file: Path,
-                            voxel_size_um: float = 0.05,
+                            voxel_size_um: Union[float, Tuple[float, float, float]] = 0.05,
                             plane_radius: float = 10.0,
                             plane_resolution: float = 0.5,
                             step_size: float = 2.0,
@@ -440,13 +490,17 @@ def compute_radius_profiles(mat_file: Path,
     Args:
         mat_file: Path to .mat file with labeled axons
         output_file: Path to save results (.npz)
-        voxel_size_um: Voxel size in micrometers
+        voxel_size_um: Voxel size in micrometers. Can be:
+                      - float: isotropic voxel size (e.g., 0.05)
+                      - tuple: anisotropic (vx, vy, vz) (e.g., (0.015, 0.015, 0.05))
         plane_radius: Radius of sampling plane in voxels
         plane_resolution: Resolution of sampling plane
-        step_size: Step size along skeleton in voxels
+        step_size: Step size along skeleton in physical units (μm)
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
     """
+    # Parse voxel size to (vx, vy, vz) tuple
+    voxel_size_tuple = parse_voxel_size(voxel_size_um)
     # Validate input file
     if not mat_file.exists():
         raise FileNotFoundError(f"Input file not found: {mat_file}")
@@ -504,12 +558,19 @@ def compute_radius_profiles(mat_file: Path,
 
     # Prepare arguments for parallel processing
     args_list = [
-        (label, voxel_size_um, plane_radius, plane_resolution, step_size)
+        (label, voxel_size_tuple, plane_radius, plane_resolution, step_size)
         for label in axon_labels
     ]
 
+    # Log voxel size info
+    vx, vy, vz = voxel_size_tuple
+    if vx == vy == vz:
+        logger.info(f"Voxel size (isotropic): {vx:.4f} μm")
+    else:
+        logger.info(f"Voxel size (anisotropic): vx={vx:.4f}, vy={vy:.4f}, vz={vz:.4f} μm")
+
     logger.info(f"Processing {len(args_list)} axons with {n_jobs} workers")
-    logger.info(f"Parameters: plane_radius={plane_radius}, resolution={plane_resolution}, step={step_size}")
+    logger.info(f"Parameters: plane_radius={plane_radius}, resolution={plane_resolution}, step={step_size} μm")
 
     results = []
     if n_jobs == 1:
@@ -561,7 +622,7 @@ def compute_radius_profiles(mat_file: Path,
         radii_profiles_um=radii_profiles,
         skeleton_coords_um=skeleton_coords,
         all_radii_um=all_radii,
-        voxel_size_um=voxel_size_um,
+        voxel_size_um=np.array(voxel_size_tuple),  # Store as (vx, vy, vz) array
         plane_radius=plane_radius,
         plane_resolution=plane_resolution,
         step_size=step_size,
@@ -592,14 +653,15 @@ if __name__ == '__main__':
                         help='Path to .mat file with labeled axons')
     parser.add_argument('output_file', type=Path,
                         help='Output .npz file for results')
-    parser.add_argument('--voxel-size', type=float, default=0.05,
-                        help='Voxel size in micrometers (default: 0.05)')
+    parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=0.05,
+                        help='Voxel size in micrometers: single value for isotropic (e.g., 0.05) '
+                             'or vx,vy,vz for anisotropic (e.g., 0.015,0.015,0.05). Default: 0.05')
     parser.add_argument('--plane-radius', type=float, default=10.0,
                         help='Radius of sampling plane in voxels (default: 10.0)')
     parser.add_argument('--plane-resolution', type=float, default=0.5,
                         help='Resolution of sampling plane (default: 0.5)')
     parser.add_argument('--step-size', type=float, default=2.0,
-                        help='Step size along skeleton in voxels (default: 2.0)')
+                        help='Step size along skeleton in physical units μm (default: 2.0)')
     parser.add_argument('--n-jobs', type=int, default=-1,
                         help='Number of parallel jobs (default: -1 = all CPUs)')
     parser.add_argument('--max-axons', type=int, default=0,
