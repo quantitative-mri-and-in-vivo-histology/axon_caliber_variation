@@ -55,12 +55,13 @@ def process_axon_skeleton(label, skel, voxel_size_um):
         # areas are in nm², convert to μm²: divide by 1,000,000
         areas_um2 = valid_areas / 1_000_000
         radii = np.sqrt(areas_um2 / np.pi)
-        skel_coords = valid_vertices * voxel_size_um
+        # Kimimaro vertices are in physical nm units, convert to μm
+        skel_coords = valid_vertices / 1000  # nm → μm
 
-        # Compute total skeleton length
-        diffs = np.diff(vertices, axis=0)
-        segment_lengths = np.sqrt(np.sum(diffs**2, axis=1))
-        total_length = np.sum(segment_lengths) * voxel_size_um
+        # Compute total skeleton length using Kimimaro's cable_length method
+        # This correctly sums edge lengths in the skeleton graph (not sequential vertex diffs)
+        # cable_length() returns length in nm (since vertices are in nm from anisotropy)
+        total_length = skel.cable_length() / 1000  # nm → μm
 
         return {
             'label': label,
@@ -83,7 +84,10 @@ def compute_radius_profiles(mat_file: Path,
                             downsample: int = 1,
                             smoothing_window: int = 5,
                             parallel: int = 0,
-                            max_axons: int = 0):
+                            max_axons: int = 0,
+                            teasar_scale: float = None,
+                            teasar_const: float = None,
+                            tick_threshold: float = 0):
     """
     Compute radius profiles for all axons using batch skeletonization.
 
@@ -91,11 +95,14 @@ def compute_radius_profiles(mat_file: Path,
         mat_file: Path to .mat file with labeled axons
         output_file: Path to save results (.npz)
         voxel_size_um: Original voxel size in micrometers.
-                      Can be a scalar (isotropic) or tuple (vx, vy, vz) for anisotropic data.
+                      Can be a scalar (isotropic) or tuple (vz, vy, vx) for anisotropic data.
         downsample: Downsampling factor (1 = no downsampling)
         smoothing_window: Rolling average window for plane normals
         parallel: Number of parallel workers for Kimimaro (0 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
+        teasar_scale: TEASAR scale parameter (larger = fewer branches). Default: Kimimaro default.
+        teasar_const: TEASAR const parameter in nm (larger = fewer branches). Default: Kimimaro default.
+        tick_threshold: Remove branches shorter than this (nm). Default: 0 (no removal).
     """
     if not mat_file.exists():
         raise FileNotFoundError(f"Input file not found: {mat_file}")
@@ -129,8 +136,9 @@ def compute_radius_profiles(mat_file: Path,
         logger.info(f"Loaded scipy.io format, volume shape: {volume.shape}, dtype: {volume.dtype}")
 
     # Parse voxel size (scalar or tuple)
+    # Input is (vz, vy, vx) matching array axes (Z, Y, X)
     if isinstance(voxel_size_um, (list, tuple)):
-        vx, vy, vz = voxel_size_um
+        vz, vy, vx = voxel_size_um
     else:
         vx = vy = vz = voxel_size_um
 
@@ -170,21 +178,47 @@ def compute_radius_profiles(mat_file: Path,
     logger.info(f"Volume shape: {volume.shape}, dtype: {volume.dtype}")
     logger.info(f"Labels to process: {len(axon_labels)}")
 
-    # Convert voxel sizes from μm to nm for Kimimaro (which assumes nm by default)
-    anisotropy_nm = (vx * 1000, vy * 1000, vz * 1000)
-    logger.info(f"Anisotropy (nm): {anisotropy_nm}")
+    # Convert voxel sizes from μm to nm for Kimimaro
+    # Kimimaro anisotropy should match array axis order (axis0, axis1, axis2)
+    # Our voxel_size is (vz, vy, vx) matching array axes, so anisotropy = (vz, vy, vx) * 1000
+    anisotropy_nm = (vz * 1000, vy * 1000, vx * 1000)
+    logger.info(f"Anisotropy (nm) for axes (0,1,2): {anisotropy_nm}")
 
-    skels = kimimaro.skeletonize(
-        volume,
-        progress=True,
-        parallel=parallel,
-        fix_branching=True,
-        parallel_chunk_size=50,
-        in_place=False,
-        anisotropy=anisotropy_nm,
-    )
+    # Build TEASAR parameters if specified
+    # TEASAR invalidation sphere radius = scale * DBF(p) + const
+    # Larger values = fewer branches (more aggressive pruning during skeletonization)
+    teasar_params = {}
+    if teasar_scale is not None:
+        teasar_params['scale'] = teasar_scale
+        logger.info(f"TEASAR scale: {teasar_scale}")
+    if teasar_const is not None:
+        teasar_params['const'] = teasar_const
+        logger.info(f"TEASAR const: {teasar_const} nm")
+
+    skeletonize_kwargs = {
+        'progress': True,
+        'parallel': parallel,
+        'fix_branching': True,
+        'parallel_chunk_size': 50,
+        'in_place': False,
+        'anisotropy': anisotropy_nm,
+    }
+    if teasar_params:
+        skeletonize_kwargs['teasar_params'] = teasar_params
+
+    skels = kimimaro.skeletonize(volume, **skeletonize_kwargs)
 
     logger.info(f"Skeletonization complete. Got {len(skels)} skeletons")
+
+    # Postprocess to remove short branches (ticks) if requested
+    if tick_threshold > 0:
+        logger.info(f"Removing branches shorter than {tick_threshold} nm...")
+        for label in list(skels.keys()):
+            skels[label] = kimimaro.postprocess(
+                skels[label],
+                tick_threshold=tick_threshold
+            )
+        logger.info("Postprocessing complete")
 
     # Compute cross-sectional areas using Kimimaro's optimized implementation
     logger.info(f"Computing cross-sectional areas (smoothing_window={smoothing_window})...")
@@ -301,6 +335,15 @@ if __name__ == '__main__':
                         help='Parallel workers for Kimimaro (0 = all CPUs)')
     parser.add_argument('--max-axons', type=int, default=0,
                         help='Maximum axons to process (0 = all)')
+    parser.add_argument('--teasar-scale', type=float, default=None,
+                        help='TEASAR scale parameter for invalidation sphere (default: Kimimaro default). '
+                             'Larger values reduce branching.')
+    parser.add_argument('--teasar-const', type=float, default=None,
+                        help='TEASAR const parameter in nm (default: Kimimaro default). '
+                             'Larger values reduce branching.')
+    parser.add_argument('--tick-threshold', type=float, default=0,
+                        help='Remove branches shorter than this threshold in nm (default: 0 = no removal). '
+                             'Recommended: 1000-3000 nm to remove small spurious branches.')
 
     args = parser.parse_args()
 
@@ -314,5 +357,8 @@ if __name__ == '__main__':
         downsample=args.downsample,
         smoothing_window=args.smoothing_window,
         parallel=args.parallel,
-        max_axons=args.max_axons
+        max_axons=args.max_axons,
+        teasar_scale=args.teasar_scale,
+        teasar_const=args.teasar_const,
+        tick_threshold=args.tick_threshold
     )
