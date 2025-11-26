@@ -201,17 +201,17 @@ def _init_worker(volume_data: np.ndarray, slice_axis: int):
     _slice_axis = slice_axis
 
 
-def _process_single_slice(args: Tuple[int, float, np.ndarray, bool, float]) -> Tuple[int, np.ndarray, int]:
+def _process_single_slice(args: Tuple[int, float, np.ndarray, bool, float, float]) -> Tuple[int, np.ndarray, int]:
     """
     Process a single slice to extract radii histogram.
 
     Args:
-        args: Tuple of (slice_index, voxel_size_um, bin_edges, use_minor_axis, max_ellipse_ratio)
+        args: Tuple of (slice_index, voxel_size_um, bin_edges, use_minor_axis, max_ellipse_ratio, max_eccentricity)
 
     Returns:
         Tuple of (slice_index, histogram_counts, n_axons)
     """
-    z, voxel_size_um, bin_edges, use_minor_axis, max_ellipse_ratio = args
+    z, voxel_size_um, bin_edges, use_minor_axis, max_ellipse_ratio, max_eccentricity = args
     pixel_area_um2 = voxel_size_um * voxel_size_um
 
     # Slice from pre-loaded array
@@ -232,6 +232,10 @@ def _process_single_slice(args: Tuple[int, float, np.ndarray, bool, float]) -> T
     radii = []
     for region in regions:
         area_voxels = region.area
+
+        # Filter by eccentricity if specified (0 = circle, 1 = line)
+        if max_eccentricity > 0 and region.eccentricity > max_eccentricity:
+            continue
 
         # Filter by ellipse area ratio if specified
         if max_ellipse_ratio > 0:
@@ -277,7 +281,8 @@ def analyze_mat_file(mat_file: Path,
                      n_jobs: int = -1,
                      min_axon_fraction: float = 0.0,
                      use_minor_axis: bool = False,
-                     max_ellipse_ratio: float = 0.0) -> Dict[str, float]:
+                     max_ellipse_ratio: float = 0.0,
+                     max_eccentricity: float = 0.0) -> Dict[str, float]:
     """
     Analyze effective radius from a .mat file with anisotropy handling.
 
@@ -292,6 +297,7 @@ def analyze_mat_file(mat_file: Path,
         min_axon_fraction: Minimum fraction of max axon count to include slice
         use_minor_axis: If True, use ellipse minor axis
         max_ellipse_ratio: Max ratio of ellipse area to voxel area (0 = no filter)
+        max_eccentricity: Max eccentricity to include (0-1, 0=circle, 1=line, 0=no filter)
 
     Returns:
         Dict with analysis results
@@ -348,11 +354,13 @@ def analyze_mat_file(mat_file: Path,
 
     logger.info(f"Using {n_workers} parallel workers")
     logger.info(f"Radius estimation: {'minor axis' if use_minor_axis else 'circular-equivalent'}")
+    if max_eccentricity > 0:
+        logger.info(f"Filtering regions with eccentricity > {max_eccentricity}")
     if max_ellipse_ratio > 0:
         logger.info(f"Filtering regions with ellipse/voxel area ratio > {max_ellipse_ratio}")
 
     # Prepare arguments
-    args_list = [(z, iso_voxel_size, bin_edges, use_minor_axis, max_ellipse_ratio)
+    args_list = [(z, iso_voxel_size, bin_edges, use_minor_axis, max_ellipse_ratio, max_eccentricity)
                  for z in range(n_slices)]
 
     # Process slices
@@ -486,6 +494,7 @@ def analyze_mat_file(mat_file: Path,
     return {
         'sample_name': sample_name,
         'r_eff_global': float(r_eff_global),
+        'r_eff_std': float(np.std(r_eff_per_slice[r_eff_per_slice > 0])) if np.any(r_eff_per_slice > 0) else 0.0,
         'mean_radius': float(mean_radius),
         'total_measurements': total_measurements,
         'n_slices_used': len(slice_indices),
@@ -502,7 +511,8 @@ def batch_analyze(input_dir: Path,
                   n_jobs: int = -1,
                   min_axon_fraction: float = 0.0,
                   use_minor_axis: bool = False,
-                  max_ellipse_ratio: float = 0.0) -> Dict[str, Dict]:
+                  max_ellipse_ratio: float = 0.0,
+                  max_eccentricity: float = 0.0) -> Dict[str, Dict]:
     """
     Batch analyze all .mat files in a directory.
 
@@ -536,7 +546,8 @@ def batch_analyze(input_dir: Path,
                 n_jobs=n_jobs,
                 min_axon_fraction=min_axon_fraction,
                 use_minor_axis=use_minor_axis,
-                max_ellipse_ratio=max_ellipse_ratio
+                max_ellipse_ratio=max_ellipse_ratio,
+                max_eccentricity=max_eccentricity
             )
             all_results[result['sample_name']] = result
 
@@ -588,6 +599,8 @@ if __name__ == '__main__':
                         help='Use ellipse minor axis instead of circular-equivalent radius')
     parser.add_argument('--max-ellipse-ratio', type=float, default=0.0,
                         help='Max ratio of ellipse area to voxel area (0 = no filter)')
+    parser.add_argument('--max-eccentricity', type=float, default=0.0,
+                        help='Max eccentricity to include regions (0-1 scale, 0=circle, 1=line, 0=no filter)')
 
     args = parser.parse_args()
 
@@ -600,7 +613,8 @@ if __name__ == '__main__':
             n_jobs=args.n_jobs,
             min_axon_fraction=args.min_axon_fraction,
             use_minor_axis=args.use_minor_axis,
-            max_ellipse_ratio=args.max_ellipse_ratio
+            max_ellipse_ratio=args.max_ellipse_ratio,
+            max_eccentricity=args.max_eccentricity
         )
     else:
         analyze_mat_file(
@@ -611,5 +625,6 @@ if __name__ == '__main__':
             n_jobs=args.n_jobs,
             min_axon_fraction=args.min_axon_fraction,
             use_minor_axis=args.use_minor_axis,
-            max_ellipse_ratio=args.max_ellipse_ratio
+            max_ellipse_ratio=args.max_ellipse_ratio,
+            max_eccentricity=args.max_eccentricity
         )
