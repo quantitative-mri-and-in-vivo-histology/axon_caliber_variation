@@ -28,6 +28,7 @@ import scipy.io as sio
 from scipy.interpolate import RegularGridInterpolator as rgi
 from scipy.ndimage import zoom
 from skimage.measure import label, regionprops
+from scipy.ndimage import median_filter
 from tqdm import tqdm
 
 # Import optimized skeleton functions
@@ -177,6 +178,80 @@ def angle_between(vec1, vec2):
     return np.arccos(cos_angle)
 
 
+def validate_skeleton_points(skeleton_points, binary_volume):
+    """
+    Validate that skeleton points are inside the binary volume.
+
+    This catches cases where the Euler path tracing escapes the actual
+    object boundaries (e.g., skeleton Z=13μm when axon only extends to Z=6μm).
+
+    Args:
+        skeleton_points: (N, 3) array of skeleton coordinates in voxel units
+        binary_volume: 3D binary array of the axon
+
+    Returns:
+        Boolean mask of valid points (True = inside the axon)
+    """
+    n_points = len(skeleton_points)
+    valid = np.ones(n_points, dtype=bool)
+    shape = np.array(binary_volume.shape)
+
+    for i, point in enumerate(skeleton_points):
+        # Round to nearest voxel
+        voxel = np.round(point).astype(int)
+
+        # Check bounds
+        if np.any(voxel < 0) or np.any(voxel >= shape):
+            valid[i] = False
+            continue
+
+        # Check if this voxel is inside the axon
+        if binary_volume[voxel[0], voxel[1], voxel[2]] == 0:
+            valid[i] = False
+
+    return valid
+
+
+def filter_radius_outliers(radii, window_size=5, threshold=3.0):
+    """
+    Filter outlier radius measurements using local median comparison.
+
+    Replaces values that are significantly larger than the local median
+    with the local median value.
+
+    Args:
+        radii: 1D array of radius measurements
+        window_size: Size of median filter window (must be odd)
+        threshold: Multiplier for outlier detection (value > threshold * median)
+
+    Returns:
+        Filtered radii array with outliers replaced
+    """
+    if len(radii) < window_size:
+        return radii
+
+    # Ensure window size is odd
+    if window_size % 2 == 0:
+        window_size += 1
+
+    # Compute local median
+    local_median = median_filter(radii, size=window_size, mode='reflect')
+
+    # Find outliers: values significantly larger than local median
+    # Use max to avoid division issues with zero median
+    outlier_mask = radii > threshold * np.maximum(local_median, 0.01)
+
+    # Replace outliers with local median
+    radii_filtered = radii.copy()
+    radii_filtered[outlier_mask] = local_median[outlier_mask]
+
+    n_replaced = np.sum(outlier_mask)
+    if n_replaced > 0:
+        logger.debug(f"  Replaced {n_replaced}/{len(radii)} outlier radius measurements")
+
+    return radii_filtered
+
+
 def sample_perpendicular_cross_section(binary_volume, point, tangent_vec,
                                        plane_radius=5.0, plane_resolution=0.5,
                                        interpolator=None):
@@ -320,6 +395,35 @@ def process_single_axon(args):
         if len(main_skel) < 3:
             return None
 
+        # Validate skeleton points are inside the axon (catches Euler escapes)
+        valid_mask = validate_skeleton_points(main_skel, cropped)
+        if not np.any(valid_mask):
+            return None
+
+        # Keep only valid skeleton points (find longest contiguous segment)
+        if not np.all(valid_mask):
+            # Find contiguous valid segments
+            valid_indices = np.where(valid_mask)[0]
+            if len(valid_indices) < 3:
+                return None
+
+            # Find gaps in valid indices
+            gaps = np.diff(valid_indices)
+            segment_starts = np.concatenate([[0], np.where(gaps > 1)[0] + 1])
+            segment_ends = np.concatenate([np.where(gaps > 1)[0] + 1, [len(valid_indices)]])
+
+            # Find longest contiguous segment
+            segment_lengths = segment_ends - segment_starts
+            longest_seg_idx = np.argmax(segment_lengths)
+            start_idx = segment_starts[longest_seg_idx]
+            end_idx = segment_ends[longest_seg_idx]
+
+            valid_segment_indices = valid_indices[start_idx:end_idx]
+            main_skel = main_skel[valid_segment_indices]
+
+            if len(main_skel) < 3:
+                return None
+
         # Subsample skeleton to step_size intervals
         # Compute cumulative arc length in physical units (accounting for anisotropy)
         diffs = np.diff(main_skel, axis=0)
@@ -368,7 +472,7 @@ def process_single_axon(args):
         radii = []
         valid_skel_points = []
 
-        for i, (point, tangent) in enumerate(zip(sampled_skel, tangent_vecs)):
+        for point, tangent in zip(sampled_skel, tangent_vecs):
             # Skip if tangent is zero
             if np.allclose(tangent, 0):
                 continue
@@ -397,6 +501,9 @@ def process_single_axon(args):
 
         radii = np.array(radii)
         skel_coords = np.array(valid_skel_points)
+
+        # Apply local consistency filter to remove outliers from self-intersection artifacts
+        radii = filter_radius_outliers(radii, window_size=5, threshold=3.0)
 
         result = {
             'label': axon_label,
