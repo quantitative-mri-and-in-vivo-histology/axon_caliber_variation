@@ -26,7 +26,7 @@ import numpy as np
 import h5py
 import scipy.io as sio
 from scipy.interpolate import RegularGridInterpolator as rgi
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, find_objects
 from skimage.measure import label, regionprops
 from scipy.ndimage import median_filter
 from tqdm import tqdm
@@ -117,16 +117,47 @@ def resample_to_isotropic(volume: np.ndarray,
     return resampled, target_size
 
 
-# Global variable for volume access in worker processes
+# Global variables for worker processes
 _shared_volume = None
+_shared_bboxes = None  # Dict mapping label -> (min_coords, max_coords)
 
 
-def init_worker(volume):
-    """Initialize worker process with shared volume reference."""
-    global _shared_volume
+def init_worker(volume, bboxes):
+    """Initialize worker process with shared volume and bounding boxes."""
+    global _shared_volume, _shared_bboxes
     _shared_volume = volume
+    _shared_bboxes = bboxes
     # Warmup Numba JIT in each worker
     skeleton_warmup()
+
+
+def compute_bounding_boxes(volume: np.ndarray) -> dict:
+    """
+    Compute bounding boxes for all labels using scipy.ndimage.find_objects.
+
+    This is O(V) for a single pass over the volume, much faster than
+    calling np.argwhere for each label separately.
+
+    Args:
+        volume: 3D labeled volume
+
+    Returns:
+        Dict mapping label -> (min_coords, max_coords) as numpy arrays
+    """
+    logger.info("Computing bounding boxes with find_objects (single pass)...")
+    slices = find_objects(volume)
+
+    bboxes = {}
+    for label_idx, bbox_slices in enumerate(slices):
+        if bbox_slices is None:
+            continue
+        label = label_idx + 1  # find_objects uses 0-indexed, labels are 1-indexed
+        min_coords = np.array([s.start for s in bbox_slices])
+        max_coords = np.array([s.stop for s in bbox_slices])
+        bboxes[label] = (min_coords, max_coords)
+
+    logger.info(f"Computed bounding boxes for {len(bboxes)} labels")
+    return bboxes
 
 
 def unit_tangent_vector(curve):
@@ -357,27 +388,33 @@ def process_single_axon(args):
     voxel_geom_mean = (vz * vy * vx) ** (1/3)
 
     try:
-        # Extract binary volume from shared memory
-        axon_binary = (_shared_volume == axon_label).astype(np.uint8)
-
-        # Get axon coordinates and bounding box
-        coords = np.argwhere(axon_binary)
-        if len(coords) < 100:  # Skip very small axons
+        # Get precomputed bounding box (much faster than scanning full volume)
+        bbox = _shared_bboxes.get(axon_label)
+        if bbox is None:
             return None
 
-        # Crop to bounding box with padding
-        min_coords = coords.min(axis=0)
-        max_coords = coords.max(axis=0)
+        min_coords, max_coords = bbox
 
+        # Add padding for cross-section sampling
         padding = int(plane_radius) + 5
+        vol_shape = np.array(_shared_volume.shape)
         min_padded = np.maximum(min_coords - padding, 0)
-        max_padded = np.minimum(max_coords + padding, np.array(axon_binary.shape))
+        max_padded = np.minimum(max_coords + padding, vol_shape)
 
-        cropped = axon_binary[
+        # Extract subvolume and create binary mask (only scans small region)
+        subvol = _shared_volume[
             min_padded[0]:max_padded[0],
             min_padded[1]:max_padded[1],
             min_padded[2]:max_padded[2]
-        ].copy()
+        ]
+
+        # Create binary mask within subvolume
+        cropped = (subvol == axon_label).astype(np.uint8)
+
+        # Get local coordinates within cropped region
+        local_coords = np.argwhere(cropped)
+        if len(local_coords) < 100:  # Skip very small axons
+            return None
 
         # Run ACCELERATED skeletonization (using skeleton_tools.py)
         skel_segments = skeleton(cropped, verbose=False, path_method=path_method)
@@ -608,6 +645,9 @@ def compute_radius_profiles(mat_file: Path,
     elif anisotropy_mode != 'none':
         raise ValueError(f"Unknown anisotropy_mode: {anisotropy_mode}. Use 'simple' or 'none'.")
 
+    # Compute bounding boxes for all labels (single pass - much faster than per-axon argwhere)
+    bboxes = compute_bounding_boxes(volume)
+
     # Get unique axon labels
     axon_labels = np.unique(volume)
     axon_labels = axon_labels[axon_labels > 0]  # Remove background
@@ -641,15 +681,16 @@ def compute_radius_profiles(mat_file: Path,
     results = []
     if n_jobs == 1:
         # Sequential processing
-        global _shared_volume
+        global _shared_volume, _shared_bboxes
         _shared_volume = volume
+        _shared_bboxes = bboxes
         for args in tqdm(args_list, desc="Processing axons"):
             result = process_single_axon(args)
             if result is not None:
                 results.append(result)
     else:
         # Parallel processing using fork
-        with mp.Pool(n_jobs, initializer=init_worker, initargs=(volume,)) as pool:
+        with mp.Pool(n_jobs, initializer=init_worker, initargs=(volume, bboxes)) as pool:
             for result in tqdm(pool.imap_unordered(process_single_axon, args_list),
                                total=len(args_list), desc="Processing axons"):
                 if result is not None:
