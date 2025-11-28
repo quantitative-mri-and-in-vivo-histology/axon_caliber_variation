@@ -332,6 +332,10 @@ def skeleton(Ax, verbose=False, path_method='discrete', step_size=0.1, fmm_order
     source_point = np.unravel_index(np.argmax(boundary_dist), boundary_dist.shape)
     max_D = boundary_dist[source_point]
 
+    # Handle degenerate case: very thin axons where max_D ≈ 0
+    if max_D < 1e-6:
+        raise ValueError(f"Axon too thin for skeletonization (max boundary distance = {max_D:.2e})")
+
     # Speed image based on distance (faster near center)
     speed_im = (boundary_dist / max_D) ** 1.5
 
