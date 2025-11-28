@@ -44,7 +44,8 @@ def batch_compute_profiles(input_dir: Path,
                            n_jobs: int = -1,
                            max_axons: int = 0,
                            anisotropy_mode: str = 'simple',
-                           path_method: str = 'discrete'):
+                           path_method: str = 'discrete',
+                           skeleton_downsample: int = 1):
     """
     Compute radius profiles for all *_myelinated_axons.mat files in input directory.
 
@@ -65,6 +66,8 @@ def batch_compute_profiles(input_dir: Path,
         path_method: Skeleton path tracing method:
                     - 'discrete': Fast voxel-level gradient descent (~2.8x faster)
                     - 'euler': Subvoxel Euler integration (slower but smoother)
+        skeleton_downsample: Downsample factor for skeleton extraction (default: 1).
+                            Use 2 for ~8x faster skeletonization when step_size >= 2*voxel_size.
 
     Returns:
         Dict mapping sample_name -> summary statistics
@@ -107,7 +110,8 @@ def batch_compute_profiles(input_dir: Path,
                 n_jobs=n_jobs,
                 max_axons=max_axons,
                 anisotropy_mode=anisotropy_mode,
-                path_method=path_method
+                path_method=path_method,
+                skeleton_downsample=skeleton_downsample
             )
 
             # Load results to get summary stats
@@ -210,6 +214,9 @@ if __name__ == '__main__':
                         help="Skeleton path tracing method: 'discrete' uses fast voxel-level "
                              "gradient descent (~2.8x faster), 'euler' uses subvoxel Euler "
                              "integration (slower but smoother). Default: 'discrete'")
+    parser.add_argument('--skeleton-downsample', type=int, default=1,
+                        help="Downsample factor for skeleton extraction. Use 2 for ~8x faster "
+                             "skeletonization when step-size >= 2*voxel-size. Default: 1 (full resolution)")
 
     args = parser.parse_args()
 
@@ -223,5 +230,6 @@ if __name__ == '__main__':
         n_jobs=args.n_jobs,
         max_axons=args.max_axons,
         anisotropy_mode=args.anisotropy_mode,
-        path_method=args.path_method
+        path_method=args.path_method,
+        skeleton_downsample=args.skeleton_downsample
     )
