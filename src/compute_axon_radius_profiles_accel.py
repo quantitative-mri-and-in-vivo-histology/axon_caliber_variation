@@ -122,11 +122,8 @@ _shared_volume = None
 _shared_bboxes = None  # Dict mapping label -> (min_coords, max_coords)
 
 
-def init_worker(volume, bboxes):
-    """Initialize worker process with shared volume and bounding boxes."""
-    global _shared_volume, _shared_bboxes
-    _shared_volume = volume
-    _shared_bboxes = bboxes
+def init_worker():
+    """Initialize worker process - globals inherited via fork."""
     # Warmup Numba JIT in each worker
     skeleton_warmup()
 
@@ -373,14 +370,15 @@ def process_single_axon(args):
     Process a single axon to extract radius profile along skeleton.
 
     Args:
-        args: Tuple of (axon_label, voxel_size_um, plane_radius, plane_resolution, step_size, path_method)
+        args: Tuple of (axon_label, voxel_size_um, plane_radius, plane_resolution, step_size, path_method, skeleton_downsample)
               voxel_size_um: (vx, vy, vz) tuple in micrometers
               path_method: 'discrete' (fast) or 'euler' (subvoxel accuracy)
+              skeleton_downsample: Downsample factor for skeleton extraction (1=full, 2=half resolution)
 
     Returns:
         Dict with radius profile and skeleton coords, or None if failed
     """
-    axon_label, voxel_size_um, plane_radius, plane_resolution, step_size, path_method = args
+    axon_label, voxel_size_um, plane_radius, plane_resolution, step_size, path_method, skeleton_downsample = args
 
     # Parse voxel size to ensure we have (vz, vy, vx) matching array axes (Z, Y, X)
     vz, vy, vx = parse_voxel_size(voxel_size_um)
@@ -417,7 +415,15 @@ def process_single_axon(args):
             return None
 
         # Run ACCELERATED skeletonization (using skeleton_tools.py)
-        skel_segments = skeleton(cropped, verbose=False, path_method=path_method)
+        # Optionally downsample for faster skeleton extraction
+        if skeleton_downsample > 1:
+            from scipy.ndimage import zoom
+            cropped_ds = zoom(cropped, 1.0 / skeleton_downsample, order=0)
+            skel_segments = skeleton(cropped_ds, verbose=False, path_method=path_method)
+            # Scale skeleton coordinates back to original resolution
+            skel_segments = [seg * skeleton_downsample for seg in skel_segments]
+        else:
+            skel_segments = skeleton(cropped, verbose=False, path_method=path_method)
 
         if len(skel_segments) == 0:
             return None
@@ -568,7 +574,8 @@ def compute_radius_profiles(mat_file: Path,
                             n_jobs: int = -1,
                             max_axons: int = 0,
                             anisotropy_mode: str = 'simple',
-                            path_method: str = 'discrete'):
+                            path_method: str = 'discrete',
+                            skeleton_downsample: int = 1):
     """
     Compute radius profiles for all axons in a labeled volume.
 
@@ -589,6 +596,8 @@ def compute_radius_profiles(mat_file: Path,
         path_method: Skeleton path tracing method:
                     - 'discrete': Fast voxel-level gradient descent (default, ~2.8x faster)
                     - 'euler': Subvoxel Euler integration (slower but smoother)
+        skeleton_downsample: Downsample factor for skeleton extraction (1=full, 2=half resolution).
+                            Use 2 when step_size >= 2*voxel_size for ~8x faster skeletonization.
     """
     # Warmup Numba JIT in main process
     logger.info("Warming up Numba JIT compilation...")
@@ -664,7 +673,7 @@ def compute_radius_profiles(mat_file: Path,
 
     # Prepare arguments for parallel processing
     args_list = [
-        (label, voxel_size_tuple, plane_radius, plane_resolution, step_size, path_method)
+        (label, voxel_size_tuple, plane_radius, plane_resolution, step_size, path_method, skeleton_downsample)
         for label in axon_labels
     ]
 
@@ -678,19 +687,21 @@ def compute_radius_profiles(mat_file: Path,
     logger.info(f"Processing {len(args_list)} axons with {n_jobs} workers")
     logger.info(f"Parameters: plane_radius={plane_radius}, resolution={plane_resolution}, step={step_size} μm")
 
+    # Set globals before forking - inherited via copy-on-write, no pickling needed
+    global _shared_volume, _shared_bboxes
+    _shared_volume = volume
+    _shared_bboxes = bboxes
+
     results = []
     if n_jobs == 1:
         # Sequential processing
-        global _shared_volume, _shared_bboxes
-        _shared_volume = volume
-        _shared_bboxes = bboxes
         for args in tqdm(args_list, desc="Processing axons"):
             result = process_single_axon(args)
             if result is not None:
                 results.append(result)
     else:
-        # Parallel processing using fork
-        with mp.Pool(n_jobs, initializer=init_worker, initargs=(volume, bboxes)) as pool:
+        # Parallel processing using fork - globals inherited, not pickled
+        with mp.Pool(n_jobs, initializer=init_worker) as pool:
             for result in tqdm(pool.imap_unordered(process_single_axon, args_list),
                                total=len(args_list), desc="Processing axons"):
                 if result is not None:
@@ -784,6 +795,9 @@ if __name__ == '__main__':
                         help="Skeleton path tracing method: 'discrete' uses fast voxel-level "
                              "gradient descent (~2.8x faster), 'euler' uses subvoxel Euler "
                              "integration (slower but smoother). Default: 'discrete'")
+    parser.add_argument('--skeleton-downsample', type=int, default=1,
+                        help="Downsample factor for skeleton extraction. Use 2 for ~8x faster "
+                             "skeletonization when step-size >= 2*voxel-size. Default: 1 (full resolution)")
 
     args = parser.parse_args()
 
@@ -797,5 +811,6 @@ if __name__ == '__main__':
         n_jobs=args.n_jobs,
         max_axons=args.max_axons,
         anisotropy_mode=args.anisotropy_mode,
-        path_method=args.path_method
+        path_method=args.path_method,
+        skeleton_downsample=args.skeleton_downsample
     )
