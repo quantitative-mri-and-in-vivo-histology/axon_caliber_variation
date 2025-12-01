@@ -407,7 +407,8 @@ def batch_compute_fiber_profiles(
     max_axons: int,
     anisotropy_mode: str,
     path_method: str,
-    skeleton_downsample: int
+    skeleton_downsample: int,
+    output_suffix: str = '_axon_profiles'
 ):
     """
     Batch process multiple .mat files matched by glob pattern.
@@ -425,6 +426,7 @@ def batch_compute_fiber_profiles(
         anisotropy_mode: Anisotropy handling mode
         path_method: Skeleton path extraction method
         skeleton_downsample: Skeleton extraction downsample factor
+        output_suffix: Suffix to append to output filenames (default: '_axon_profiles')
     """
     # Find common root directory
     if len(matched_files) == 1:
@@ -451,7 +453,8 @@ def batch_compute_fiber_profiles(
             # If relative_to fails, just use the filename
             relative_path = mat_file.name
 
-        output_file = output_root / relative_path.with_suffix('.npz')
+        # Construct output path with suffix: stem + suffix + .npz
+        output_file = output_root / relative_path.parent / f"{relative_path.stem}{output_suffix}.npz"
 
         logger.info(f"\n{'='*80}")
         logger.info(f"Processing {i}/{len(matched_files)}: {mat_file.name}")
@@ -529,6 +532,8 @@ if __name__ == '__main__':
                         help="Skeleton path method: 'discrete' (fast) or 'euler' (subvoxel)")
     parser.add_argument('--skeleton-downsample', type=int, default=1,
                         help="Downsample factor for skeleton extraction (default: 1)")
+    parser.add_argument('--output-suffix', type=str, default='_axon_profiles',
+                        help='Suffix to append to output filenames in batch mode (default: "_axon_profiles")')
 
     args = parser.parse_args()
 
@@ -568,5 +573,6 @@ if __name__ == '__main__':
             max_axons=args.max_axons,
             anisotropy_mode=args.anisotropy_mode,
             path_method=args.path_method,
-            skeleton_downsample=args.skeleton_downsample
+            skeleton_downsample=args.skeleton_downsample,
+            output_suffix=args.output_suffix
         )
