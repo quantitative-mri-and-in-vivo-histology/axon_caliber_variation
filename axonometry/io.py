@@ -3,13 +3,15 @@ I/O utilities for loading labeled volumes and handling voxel sizes.
 
 Supports:
 - MATLAB .mat files (HDF5 v7.3 and older scipy formats)
+- JSON metadata files with voxel size information
 - Voxel size parsing (isotropic and anisotropic)
 - Resampling anisotropic volumes to isotropic
 """
 
+import json
 import logging
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional, Dict, Any
 
 import numpy as np
 import h5py
@@ -94,6 +96,89 @@ def load_mat_volume(mat_file: Union[str, Path]) -> np.ndarray:
         volume = mat_data[volume_key]
         logger.info(f"Loaded scipy.io format, volume shape: {volume.shape}, dtype: {volume.dtype}")
         return volume
+
+
+def load_json_metadata(volume_file: Path) -> Optional[Dict[str, Any]]:
+    """
+    Load companion JSON metadata file for a volume.
+
+    Args:
+        volume_file: Path to the volume file (.mat, .h5, etc.)
+
+    Returns:
+        Dictionary with metadata, or None if not found
+    """
+    json_file = volume_file.with_suffix('.json')
+
+    if not json_file.exists():
+        return None
+
+    try:
+        with open(json_file, 'r') as f:
+            metadata = json.load(f)
+        logger.info(f"Loaded metadata from {json_file.name}")
+        return metadata
+    except Exception as e:
+        logger.warning(f"Failed to load metadata from {json_file}: {e}")
+        return None
+
+
+def load_volume_with_metadata(
+    volume_file: Union[str, Path],
+    voxel_size_override: Optional[Union[float, Tuple[float, float, float]]] = None
+) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[Dict[str, Any]]]:
+    """
+    Load a labeled volume and its metadata (voxel size, etc.) from disk.
+
+    Priority for voxel size:
+    1. voxel_size_override (if provided)
+    2. Companion JSON metadata file
+    3. Default (0.05 μm isotropic)
+
+    Args:
+        volume_file: Path to volume file (.mat, .h5, etc.)
+        voxel_size_override: Optional voxel size to override metadata/default
+
+    Returns:
+        Tuple of (volume, voxel_size_tuple, metadata_dict)
+        - volume: 3D numpy array of labels
+        - voxel_size_tuple: (vz, vy, vx) in micrometers
+        - metadata_dict: Full metadata dictionary, or None if not found
+    """
+    volume_file = Path(volume_file)
+
+    # Load volume
+    logger.info(f"Loading volume from {volume_file.name}")
+    volume = load_mat_volume(volume_file)
+
+    # Load metadata
+    metadata = load_json_metadata(volume_file)
+
+    # Determine voxel size with priority: override > JSON > default
+    voxel_size: Union[float, Tuple[float, float, float]]
+
+    if voxel_size_override is not None:
+        voxel_size = voxel_size_override
+        logger.info(f"Using voxel size from override: {voxel_size}")
+    elif metadata is not None and 'voxel_size' in metadata:
+        vs = metadata['voxel_size']
+        if isinstance(vs, list) and len(vs) == 3:
+            # Check if isotropic
+            if vs[0] == vs[1] == vs[2]:
+                voxel_size = float(vs[0])
+            else:
+                voxel_size = tuple(vs)
+        else:
+            voxel_size = float(vs)
+        logger.info(f"Using voxel size from JSON metadata: {voxel_size}")
+    else:
+        voxel_size = 0.05
+        logger.info(f"No voxel size found, using default: {voxel_size} μm")
+
+    # Parse to tuple
+    voxel_size_tuple = parse_voxel_size(voxel_size)
+
+    return volume, voxel_size_tuple, metadata
 
 
 def resample_to_isotropic(volume: np.ndarray,

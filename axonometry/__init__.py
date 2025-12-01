@@ -25,6 +25,8 @@ from .geometry import (
 
 from .io import (
     load_mat_volume,
+    load_json_metadata,
+    load_volume_with_metadata,
     parse_voxel_size,
     resample_to_isotropic,
 )
@@ -53,6 +55,8 @@ __all__ = [
     "create_perpendicular_plane_grid",
     # I/O
     "load_mat_volume",
+    "load_json_metadata",
+    "load_volume_with_metadata",
     "parse_voxel_size",
     "resample_to_isotropic",
     # Sampling

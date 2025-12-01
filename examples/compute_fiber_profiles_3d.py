@@ -12,11 +12,13 @@ Output: Per-axon arrays of (radius_profile, skeleton_coords, length)
 """
 
 import argparse
+import glob
 import logging
+import os
 import traceback
 from pathlib import Path
 import multiprocessing as mp
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional, List
 
 import numpy as np
 from scipy.ndimage import zoom, find_objects, median_filter
@@ -29,8 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from axonometry import (
     extract_skeleton,
     skeleton_warmup,
-    load_mat_volume,
-    parse_voxel_size,
+    load_volume_with_metadata,
     resample_to_isotropic,
     unit_tangent_vector,
     compute_arc_length,
@@ -108,16 +109,16 @@ def process_single_axon(args):
     Process a single axon to extract radius profile along skeleton.
 
     Args:
-        args: Tuple of (axon_label, voxel_size_um, plane_radius, plane_resolution,
+        args: Tuple of (axon_label, voxel_size_tuple, plane_radius, plane_resolution,
                        step_size, path_method, skeleton_downsample)
 
     Returns:
         Dict with radius profile and skeleton coords, or None if failed
     """
-    (axon_label, voxel_size_um, plane_radius, plane_resolution,
+    (axon_label, voxel_size_tuple, plane_radius, plane_resolution,
      step_size, path_method, skeleton_downsample) = args
 
-    vz, vy, vx = parse_voxel_size(voxel_size_um)
+    vz, vy, vx = voxel_size_tuple
     voxel_geom_mean = (vz * vy * vx) ** (1/3)
 
     try:
@@ -251,10 +252,9 @@ def process_single_axon(args):
 
 def compute_fiber_profiles(mat_file: Path,
                            output_file: Path,
-                           voxel_size_um: Union[float, Tuple[float, float, float]] = 0.05,
-                           plane_radius: float = 10.0,
-                           plane_resolution: float = 0.5,
-                           step_size: float = 2.0,
+                           voxel_size_um: Optional[Union[float, Tuple[float, float, float]]] = None,
+                           max_axon_radius_um: float = 5.0,
+                           step_size_um: float = 0.1,
                            n_jobs: int = -1,
                            max_axons: int = 0,
                            anisotropy_mode: str = 'simple',
@@ -266,10 +266,10 @@ def compute_fiber_profiles(mat_file: Path,
     Args:
         mat_file: Path to .mat file with labeled axons
         output_file: Path to save results (.npz)
-        voxel_size_um: Voxel size in micrometers (scalar or (vz, vy, vx) tuple)
-        plane_radius: Radius of sampling plane in voxels
-        plane_resolution: Resolution of sampling plane
-        step_size: Step size along skeleton in μm
+        voxel_size_um: Voxel size in micrometers (scalar or (vz, vy, vx) tuple).
+                       If None, loads from companion JSON file.
+        max_axon_radius_um: Maximum expected axon radius in micrometers (sets sampling plane size)
+        step_size_um: Step size along skeleton in micrometers
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
         anisotropy_mode: 'simple' (resample to isotropic) or 'none' (use geometric mean)
@@ -279,11 +279,9 @@ def compute_fiber_profiles(mat_file: Path,
     logger.info("Warming up Numba JIT compilation...")
     skeleton_warmup()
 
-    voxel_size_tuple = parse_voxel_size(voxel_size_um)
-
-    # Load volume
+    # Load volume and metadata (voxel size from override, JSON, or default)
     logger.info(f"Loading {mat_file}")
-    volume = load_mat_volume(mat_file)
+    volume, voxel_size_tuple, _ = load_volume_with_metadata(mat_file, voxel_size_um)
 
     # Handle anisotropic voxels
     if anisotropy_mode == 'simple':
@@ -291,6 +289,14 @@ def compute_fiber_profiles(mat_file: Path,
         voxel_size_tuple = (iso_voxel_size, iso_voxel_size, iso_voxel_size)
     elif anisotropy_mode != 'none':
         raise ValueError(f"Unknown anisotropy_mode: {anisotropy_mode}")
+
+    # Convert max_axon_radius from micrometers to voxels (use geometric mean for anisotropic)
+    vz, vy, vx = voxel_size_tuple
+    voxel_size_geom_mean = (vz * vy * vx) ** (1/3)
+    plane_radius_voxels = int(np.ceil(max_axon_radius_um / voxel_size_geom_mean))
+    plane_resolution = 1.0  # Always sample at voxel resolution
+
+    logger.info(f"Max axon radius: {max_axon_radius_um:.2f} μm = {plane_radius_voxels} voxels")
 
     # Compute bounding boxes
     bboxes = compute_bounding_boxes(volume)
@@ -309,19 +315,18 @@ def compute_fiber_profiles(mat_file: Path,
         n_jobs = mp.cpu_count()
 
     args_list = [
-        (label, voxel_size_tuple, plane_radius, plane_resolution,
-         step_size, path_method, skeleton_downsample)
+        (label, voxel_size_tuple, plane_radius_voxels, plane_resolution,
+         step_size_um, path_method, skeleton_downsample)
         for label in axon_labels
     ]
 
-    vz, vy, vx = voxel_size_tuple
     if vz == vy == vx:
         logger.info(f"Voxel size (isotropic): {vz:.4f} μm")
     else:
         logger.info(f"Voxel size (anisotropic, Z,Y,X): vz={vz:.4f}, vy={vy:.4f}, vx={vx:.4f} μm")
 
     logger.info(f"Processing {len(args_list)} axons with {n_jobs} workers")
-    logger.info(f"Parameters: plane_radius={plane_radius}, resolution={plane_resolution}, step={step_size} μm")
+    logger.info(f"Parameters: plane_radius={plane_radius_voxels} voxels ({max_axon_radius_um:.2f} μm), step={step_size_um} μm")
 
     # Set globals for workers
     global _shared_volume, _shared_bboxes
@@ -370,9 +375,10 @@ def compute_fiber_profiles(mat_file: Path,
         skeleton_coords_um=skeleton_coords,
         all_radii_um=all_radii,
         voxel_size_um=np.array(voxel_size_tuple),
-        plane_radius=plane_radius,
+        max_axon_radius_um=max_axon_radius_um,
+        plane_radius_voxels=plane_radius_voxels,
         plane_resolution=plane_resolution,
-        step_size=step_size,
+        step_size_um=step_size_um,
         source_file=str(mat_file)
     )
 
@@ -391,6 +397,101 @@ def compute_fiber_profiles(mat_file: Path,
     logger.info(f"  Effective radius (r_eff): {r_eff:.3f} μm")
 
 
+def batch_compute_fiber_profiles(
+    matched_files: List[Path],
+    output_root: Path,
+    voxel_size_um: Optional[Union[float, Tuple[float, float, float]]],
+    max_axon_radius_um: float,
+    step_size_um: float,
+    n_jobs: int,
+    max_axons: int,
+    anisotropy_mode: str,
+    path_method: str,
+    skeleton_downsample: int
+):
+    """
+    Batch process multiple .mat files matched by glob pattern.
+
+    Preserves directory structure relative to common root and derives output filenames.
+
+    Args:
+        matched_files: List of matched .mat file paths
+        output_root: Root directory for outputs
+        voxel_size_um: Voxel size (same as compute_fiber_profiles)
+        max_axon_radius_um: Max axon radius in micrometers
+        step_size_um: Step size along skeleton in micrometers
+        n_jobs: Number of parallel jobs
+        max_axons: Max number of axons to process per file
+        anisotropy_mode: Anisotropy handling mode
+        path_method: Skeleton path extraction method
+        skeleton_downsample: Skeleton extraction downsample factor
+    """
+    # Find common root directory
+    if len(matched_files) == 1:
+        common_root = matched_files[0].parent
+    else:
+        common_root = Path(os.path.commonpath([str(f.parent) for f in matched_files]))
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Batch Processing Mode")
+    logger.info(f"{'='*80}")
+    logger.info(f"Found {len(matched_files)} files to process")
+    logger.info(f"Common root: {common_root}")
+    logger.info(f"Output root: {output_root}")
+    logger.info(f"{'='*80}\n")
+
+    successful = []
+    failed = []
+
+    for i, mat_file in enumerate(matched_files, 1):
+        # Compute relative path and output path
+        try:
+            relative_path = mat_file.relative_to(common_root)
+        except ValueError:
+            # If relative_to fails, just use the filename
+            relative_path = mat_file.name
+
+        output_file = output_root / relative_path.with_suffix('.npz')
+
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Processing {i}/{len(matched_files)}: {mat_file.name}")
+        logger.info(f"Output: {output_file.relative_to(output_root) if output_file.is_relative_to(output_root) else output_file}")
+        logger.info(f"{'='*80}")
+
+        try:
+            compute_fiber_profiles(
+                mat_file,
+                output_file,
+                voxel_size_um=voxel_size_um,
+                max_axon_radius_um=max_axon_radius_um,
+                step_size_um=step_size_um,
+                n_jobs=n_jobs,
+                max_axons=max_axons,
+                anisotropy_mode=anisotropy_mode,
+                path_method=path_method,
+                skeleton_downsample=skeleton_downsample
+            )
+            successful.append(mat_file.name)
+        except Exception as e:
+            error_msg = str(e)
+            failed.append((mat_file.name, error_msg))
+            logger.error(f"Failed to process {mat_file.name}: {error_msg}")
+            traceback.print_exc()
+            continue
+
+    # Print summary
+    logger.info(f"\n{'='*80}")
+    logger.info("Batch Processing Complete")
+    logger.info(f"{'='*80}")
+    logger.info(f"Successfully processed: {len(successful)}/{len(matched_files)} files")
+
+    if len(failed) > 0:
+        logger.info(f"Failed: {len(failed)} files")
+        for filename, error in failed:
+            logger.info(f"  - {filename}: {error}")
+    logger.info(f"{'='*80}\n")
+
+
 def parse_voxel_size_arg(value: str) -> Union[float, Tuple[float, float, float]]:
     """Parse voxel size CLI argument."""
     if ',' in value:
@@ -405,18 +506,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Compute fiber morphometry profiles by sampling perpendicular cross-sections'
     )
-    parser.add_argument('mat_file', type=Path,
-                        help='Path to .mat file with labeled axons')
+    parser.add_argument('mat_file', type=str,
+                        help="Path to .mat file or glob pattern (e.g., 'data/raw/**/*.mat')")
     parser.add_argument('output_file', type=Path,
-                        help='Output .npz file for results')
-    parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=0.05,
-                        help='Voxel size in μm: single value (isotropic) or vz,vy,vx (default: 0.05)')
-    parser.add_argument('--plane-radius', type=float, default=10.0,
-                        help='Radius of sampling plane in voxels (default: 10.0)')
-    parser.add_argument('--plane-resolution', type=float, default=0.5,
-                        help='Resolution of sampling plane (default: 0.5)')
-    parser.add_argument('--step-size', type=float, default=2.0,
-                        help='Step size along skeleton in μm (default: 2.0)')
+                        help='Output .npz file (single file) OR output root directory (batch mode)')
+    parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=None,
+                        help='Voxel size in μm: single value (isotropic) or vz,vy,vx. '
+                             'If not specified, loads from companion .json file (default: from JSON or 0.05)')
+    parser.add_argument('--max-axon-radius', type=float, default=5.0,
+                        help='Maximum expected axon radius in μm (sets sampling plane size, default: 5.0)')
+    parser.add_argument('--step-size', type=float, default=0.1,
+                        help='Step size along skeleton in μm (default: 0.1)')
     parser.add_argument('--n-jobs', type=int, default=-1,
                         help='Number of parallel jobs (-1 = all CPUs)')
     parser.add_argument('--max-axons', type=int, default=0,
@@ -432,16 +532,41 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    compute_fiber_profiles(
-        args.mat_file,
-        args.output_file,
-        voxel_size_um=args.voxel_size,
-        plane_radius=args.plane_radius,
-        plane_resolution=args.plane_resolution,
-        step_size=args.step_size,
-        n_jobs=args.n_jobs,
-        max_axons=args.max_axons,
-        anisotropy_mode=args.anisotropy_mode,
-        path_method=args.path_method,
-        skeleton_downsample=args.skeleton_downsample
-    )
+    # Expand glob pattern to find matching files
+    input_pattern = args.mat_file
+    output_path = Path(args.output_file)
+
+    matched_files = sorted(glob.glob(input_pattern, recursive=True))
+
+    if len(matched_files) == 0:
+        parser.error(f"No files matched pattern: {input_pattern}")
+    elif len(matched_files) == 1:
+        # Single file mode (existing behavior)
+        mat_path = Path(matched_files[0])
+        compute_fiber_profiles(
+            mat_path,
+            output_path,  # Treat as output file
+            voxel_size_um=args.voxel_size,
+            max_axon_radius_um=args.max_axon_radius,
+            step_size_um=args.step_size,
+            n_jobs=args.n_jobs,
+            max_axons=args.max_axons,
+            anisotropy_mode=args.anisotropy_mode,
+            path_method=args.path_method,
+            skeleton_downsample=args.skeleton_downsample
+        )
+    else:
+        # Batch mode - multiple files matched
+        matched_paths = [Path(f) for f in matched_files]
+        batch_compute_fiber_profiles(
+            matched_paths,
+            output_path,  # Treat as output root directory
+            voxel_size_um=args.voxel_size,
+            max_axon_radius_um=args.max_axon_radius,
+            step_size_um=args.step_size,
+            n_jobs=args.n_jobs,
+            max_axons=args.max_axons,
+            anisotropy_mode=args.anisotropy_mode,
+            path_method=args.path_method,
+            skeleton_downsample=args.skeleton_downsample
+        )
