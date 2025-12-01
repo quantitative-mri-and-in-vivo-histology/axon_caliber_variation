@@ -160,6 +160,15 @@ models/
 
 .claude/*
 
+# User-specific devcontainer overrides
+.devcontainer/docker-compose.override.yml
+
+# Environment variables
+.env
+
+# User-specific symlinks
+/CLAUDE.md
+
 # LaTeX temporary files
 *.aux
 *.fdb_latexmk

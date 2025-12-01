@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  devcontainer:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+      args:
+        TZ: ${TZ:-America/Los_Angeles}
+        CLAUDE_CODE_VERSION: latest
+        GIT_DELTA_VERSION: 0.18.2
+        ZSH_IN_DOCKER_VERSION: 1.2.0       
+    command: sleep infinity
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    shm_size: 4g
+    volumes:
+      - ..:/workspace:delegated
+      - claude-code-bashhistory:/commandhistory
+      - claude-code-config:/home/node/.claude
+      - ${HOME}/.ssh:/home/node/.ssh-host:cached
+    environment:
+      NODE_OPTIONS: "--max-old-space-size=4096"
+      CLAUDE_CONFIG_DIR: "/home/node/.claude"
+      POWERLEVEL9K_DISABLE_GITSTATUS: "true"
+      PYTHONPATH: "/workspace"
+    user: node
+
+volumes:
+  claude-code-bashhistory:
+  claude-code-config:
