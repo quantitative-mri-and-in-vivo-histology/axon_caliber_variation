@@ -1,0 +1,64 @@
+"""
+Axonometry: Tools for axon morphometry analysis.
+
+Includes utilities for:
+- 3D skeletonization
+- Cross-section sampling
+- Radius profile extraction
+- Effective radius computation
+"""
+
+from .skeleton import (
+    extract_skeleton,
+    skeleton,  # backwards compatibility alias
+    warmup as skeleton_warmup,
+    get_line_length,
+)
+
+from .geometry import (
+    unit_tangent_vector,
+    rotation_matrix_3d,
+    compute_arc_length,
+    resample_curve_by_arc_length,
+    create_perpendicular_plane_grid,
+)
+
+from .io import (
+    load_mat_volume,
+    parse_voxel_size,
+    resample_to_isotropic,
+)
+
+from .sampling import (
+    sample_perpendicular_cross_section,
+    area_to_equivalent_radius,
+    validate_skeleton_points,
+    find_longest_contiguous_segment,
+    nearest_interp_3d,
+)
+
+__version__ = "0.1.0"
+
+__all__ = [
+    # Skeleton
+    "extract_skeleton",
+    "skeleton",
+    "skeleton_warmup",
+    "get_line_length",
+    # Geometry
+    "unit_tangent_vector",
+    "rotation_matrix_3d",
+    "compute_arc_length",
+    "resample_curve_by_arc_length",
+    "create_perpendicular_plane_grid",
+    # I/O
+    "load_mat_volume",
+    "parse_voxel_size",
+    "resample_to_isotropic",
+    # Sampling
+    "sample_perpendicular_cross_section",
+    "area_to_equivalent_radius",
+    "validate_skeleton_points",
+    "find_longest_contiguous_segment",
+    "nearest_interp_3d",
+]
