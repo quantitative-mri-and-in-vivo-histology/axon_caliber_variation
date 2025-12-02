@@ -40,6 +40,15 @@ from .sampling import (
     nearest_interp_3d,
 )
 
+from .populations import (
+    load_volume_downsampled,
+    precompute_axon_voxels,
+    compute_all_orientations,
+    classify_by_dominant_axis,
+    filter_sparse_axons,
+    create_populations,
+)
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -67,4 +76,11 @@ __all__ = [
     "validate_skeleton_points",
     "find_longest_contiguous_segment",
     "nearest_interp_3d",
+    # Populations
+    "load_volume_downsampled",
+    "precompute_axon_voxels",
+    "compute_all_orientations",
+    "classify_by_dominant_axis",
+    "filter_sparse_axons",
+    "create_populations",
 ]
