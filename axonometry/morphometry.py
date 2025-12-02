@@ -30,8 +30,9 @@ def assign_myelin_to_axons(
     via watershed algorithm based on Euclidean distance transform.
 
     Strategy for overlap regions (axon AND myelin voxels):
-    - Keep axon labels (prioritize axoplasm interior)
-    - Only assign myelin labels to pure myelin voxels
+    - Axon takes priority (overlap voxels remain as axon, not myelin)
+    - Watershed runs on combined axon+myelin region (full fiber)
+    - Output = pure myelin only (myelin mask minus axon mask)
 
     Args:
         axon_volume: Instance-labeled axon volume (0=background, n=axon n)
@@ -57,67 +58,66 @@ def assign_myelin_to_axons(
     axon_mask = axon_volume > 0
     myelin_mask = myelin_volume > 0
 
-    # Identify pure myelin regions (myelin NOT in axon)
+    # Overlap voxels will be assigned to myelin (not axon)
+    overlap_mask = axon_mask & myelin_mask
+
+    # Pure myelin = myelin regions that don't overlap with axon
     pure_myelin_mask = myelin_mask & ~axon_mask
 
     logger.info(f"  Axon voxels: {axon_mask.sum():,}")
     logger.info(f"  Myelin voxels: {myelin_mask.sum():,}")
-    logger.info(f"  Overlap voxels: {(axon_mask & myelin_mask).sum():,}")
+    logger.info(f"  Overlap voxels: {overlap_mask.sum():,}")
     logger.info(f"  Pure myelin voxels: {pure_myelin_mask.sum():,}")
 
-    # Label connected components in pure myelin
+    # Label connected components in pure myelin (for diagnostics)
     myelin_components, n_components = label(
         pure_myelin_mask, connectivity=connectivity, return_num=True
     )
-    logger.info(f"  Myelin connected components: {n_components}")
+    logger.info(f"  Pure myelin connected components: {n_components}")
 
-    if n_components == 0:
-        logger.warning("No myelin components found - returning empty volume")
+    if myelin_mask.sum() == 0:
+        logger.warning("No myelin voxels found - returning empty volume")
         return np.zeros_like(axon_volume)
 
     # Compute distance transform for watershed
-    # Distance from each myelin voxel to nearest axon
+    # Distance from each voxel to nearest axon
     distance = ndimage.distance_transform_edt(~axon_mask)
 
-    # Mask distance to only pure myelin regions
-    distance_masked = np.where(pure_myelin_mask, distance, 0)
+    # Mask distance to myelin regions (all myelin including overlap)
+    distance_masked = np.where(myelin_mask, distance, 0)
 
     # Apply max distance threshold if specified
     if max_distance is not None:
         logger.info(f"  Applying max distance threshold: {max_distance} voxels")
         distance_masked = np.where(distance_masked <= max_distance, distance_masked, 0)
-        pure_myelin_mask = pure_myelin_mask & (distance_masked > 0)
-
-    # Use watershed to assign myelin to nearest axon
-    # Seeds are the axon instances, propagate into pure myelin regions
-    logger.info("  Running watershed assignment...")
-
-    # Create markers: axon instances + background
-    # Pure myelin regions are unlabeled (0) and will be assigned by watershed
-    # Ensure markers are int32 (required by watershed_ift)
-    markers = axon_volume.astype(np.int32)
-
-    # Watershed propagates from markers into regions with label 0
-    # We want to assign pure myelin, so invert distance (watershed flows downhill)
-    # Scale distance to uint8 range for watershed_ift
-    max_dist = distance_masked.max()
-    if max_dist > 0:
-        # Scale and invert: closer to axon = higher value
-        distance_scaled = ((max_dist - distance_masked) / max_dist * 255).astype(np.uint8)
+        myelin_mask_filtered = myelin_mask & (distance <= max_distance)
     else:
-        distance_scaled = np.zeros_like(distance_masked, dtype=np.uint8)
+        myelin_mask_filtered = myelin_mask
 
-    myelin_assigned = ndimage.watershed_ift(
-        distance_scaled,
-        markers
+    # Assign each myelin voxel to the nearest axon instance
+    # Use distance transform with labeled indices
+    logger.info("  Assigning myelin to nearest axon...")
+
+    # Get distance and indices to nearest axon voxel
+    # indices[i] gives the coordinate of the nearest axon voxel along axis i
+    distance_from_axon, indices = ndimage.distance_transform_edt(
+        ~axon_mask, return_indices=True
     )
 
-    # Extract only the myelin labels (keep only pure myelin voxels)
-    myelin_instances = np.where(pure_myelin_mask, myelin_assigned, 0)
+    # For each myelin voxel, look up the axon label at its nearest axon voxel
+    # indices has shape (ndim, *volume_shape)
+    myelin_assigned = axon_volume[tuple(indices)]
+
+    # Apply max distance filter if specified
+    if max_distance is not None:
+        myelin_assigned = np.where(distance_from_axon <= max_distance, myelin_assigned, 0)
+
+    # Extract only the pure myelin portion (myelin minus axon overlap)
+    myelin_instances = np.where(myelin_mask_filtered & ~axon_mask, myelin_assigned, 0)
     myelin_instances = myelin_instances.astype(axon_volume.dtype)
 
     n_assigned = (myelin_instances > 0).sum()
-    logger.info(f"  Assigned myelin voxels: {n_assigned:,} / {pure_myelin_mask.sum():,}")
+    logger.info(f"  Assigned myelin voxels: {n_assigned:,} / {myelin_mask_filtered.sum():,}")
     logger.info(f"  Unique myelin instances: {len(np.unique(myelin_instances)) - 1}")
 
     return myelin_instances
