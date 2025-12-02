@@ -1,14 +1,41 @@
 """
 Optimized 3D skeletonization tools.
 
-Based on DeepACSON CSD/skeleton3D.py (MIT License).
-Original: https://github.com/DeepACSON/CSD
+This is a runtime-optimized implementation of the skeletonization method
+described in:
+    Abdollahzadeh A, Belevich I, Jokitalo E, Tohka J, Sierra A.
+    "DeepACSON automated segmentation of white matter in 3D electron microscopy."
+    Commun Biol. 2021 Feb 18;4(1):179.
+    https://pubmed.ncbi.nlm.nih.gov/33568775/
 
-Optimizations:
+Original implementation: https://github.com/aAbdz/DeepACSON
+Copyright (c) 2021 Abdollahzadeh et al.
+Licensed under the MIT License.
+
+This runtime-optimized version includes modifications for performance:
 - Discrete gradient descent (default): ~2.8x faster, voxel-level accuracy
 - Numba JIT compilation for inner loops
 - Euler integration (optional): subvoxel accuracy, slower
 - MaskedArray optimization: avoid expensive filled() operations
+
+MIT License:
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
 import numpy as np
