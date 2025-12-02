@@ -408,7 +408,8 @@ def batch_compute_fiber_profiles(
     anisotropy_mode: str,
     path_method: str,
     skeleton_downsample: int,
-    output_suffix: str = '_axon_profiles'
+    output_suffix: str = '_axon_profiles',
+    organize_by_microscopy: bool = False
 ):
     """
     Batch process multiple .mat files matched by glob pattern.
@@ -427,6 +428,7 @@ def batch_compute_fiber_profiles(
         path_method: Skeleton path extraction method
         skeleton_downsample: Skeleton extraction downsample factor
         output_suffix: Suffix to append to output filenames (default: '_axon_profiles')
+        organize_by_microscopy: If True, organize outputs by microscopy type (HM/LM)
     """
     # Find common root directory
     if len(matched_files) == 1:
@@ -453,8 +455,30 @@ def batch_compute_fiber_profiles(
             # If relative_to fails, just use the filename
             relative_path = mat_file.name
 
-        # Construct output path with suffix: stem + suffix + .npz
-        output_file = output_root / relative_path.parent / f"{relative_path.stem}{output_suffix}.npz"
+        # Construct output path
+        if organize_by_microscopy:
+            # Extract microscopy type from filename (HM or LM)
+            filename = mat_file.stem
+            if filename.startswith('HM_'):
+                microscopy_type = 'HM'
+                # Remove HM_ prefix from filename
+                output_filename = filename[3:] + output_suffix + '.npz'
+            elif filename.startswith('LM_'):
+                microscopy_type = 'LM'
+                # Remove LM_ prefix from filename
+                output_filename = filename[3:] + output_suffix + '.npz'
+            else:
+                # No recognized prefix, use default structure
+                microscopy_type = None
+                output_filename = f"{filename}{output_suffix}.npz"
+
+            if microscopy_type:
+                output_file = output_root / microscopy_type / output_filename
+            else:
+                output_file = output_root / relative_path.parent / output_filename
+        else:
+            # Default: preserve directory structure
+            output_file = output_root / relative_path.parent / f"{relative_path.stem}{output_suffix}.npz"
 
         logger.info(f"\n{'='*80}")
         logger.info(f"Processing {i}/{len(matched_files)}: {mat_file.name}")
@@ -534,6 +558,10 @@ if __name__ == '__main__':
                         help="Downsample factor for skeleton extraction (default: 1)")
     parser.add_argument('--output-suffix', type=str, default='_axon_profiles',
                         help='Suffix to append to output filenames in batch mode (default: "_axon_profiles")')
+    parser.add_argument('--organize-by-microscopy', action='store_true',
+                        help='Organize outputs by microscopy type (HM/LM folders). '
+                             'Files starting with HM_/LM_ will be placed in data/processed/HM/ or data/processed/LM/ '
+                             'with the microscopy prefix removed from the filename.')
 
     args = parser.parse_args()
 
@@ -574,5 +602,6 @@ if __name__ == '__main__':
             anisotropy_mode=args.anisotropy_mode,
             path_method=args.path_method,
             skeleton_downsample=args.skeleton_downsample,
-            output_suffix=args.output_suffix
+            output_suffix=args.output_suffix,
+            organize_by_microscopy=args.organize_by_microscopy
         )

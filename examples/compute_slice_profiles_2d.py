@@ -305,7 +305,8 @@ def batch_compute_slice_profiles(
     slice_axis: int,
     n_jobs: int,
     min_axon_fraction: float,
-    output_suffix: str = '_slice_profiles'
+    output_suffix: str = '_slice_profiles',
+    organize_by_microscopy: bool = False
 ):
     """
     Batch process multiple .mat files matched by glob pattern.
@@ -318,6 +319,7 @@ def batch_compute_slice_profiles(
         n_jobs: Number of parallel jobs
         min_axon_fraction: Minimum fraction of max axon count
         output_suffix: Suffix to append to output filenames (default: '_slice_profiles')
+        organize_by_microscopy: If True, organize outputs by microscopy type (HM/LM)
     """
     # Find common root directory
     if len(matched_files) == 1:
@@ -344,8 +346,30 @@ def batch_compute_slice_profiles(
             # If relative_to fails, just use the filename
             relative_path = mat_file.name
 
-        # Construct output path with suffix: stem + suffix + .npz
-        output_file = output_root / relative_path.parent / f"{relative_path.stem}{output_suffix}.npz"
+        # Construct output path
+        if organize_by_microscopy:
+            # Extract microscopy type from filename (HM or LM)
+            filename = mat_file.stem
+            if filename.startswith('HM_'):
+                microscopy_type = 'HM'
+                # Remove HM_ prefix from filename
+                output_filename = filename[3:] + output_suffix + '.npz'
+            elif filename.startswith('LM_'):
+                microscopy_type = 'LM'
+                # Remove LM_ prefix from filename
+                output_filename = filename[3:] + output_suffix + '.npz'
+            else:
+                # No recognized prefix, use default structure
+                microscopy_type = None
+                output_filename = f"{filename}{output_suffix}.npz"
+
+            if microscopy_type:
+                output_file = output_root / microscopy_type / output_filename
+            else:
+                output_file = output_root / relative_path.parent / output_filename
+        else:
+            # Default: preserve directory structure
+            output_file = output_root / relative_path.parent / f"{relative_path.stem}{output_suffix}.npz"
 
         logger.info(f"\n{'='*80}")
         logger.info(f"Processing {i}/{len(matched_files)}: {mat_file.name}")
@@ -411,6 +435,10 @@ if __name__ == '__main__':
                         help='Minimum fraction of max axon count to include slice (default: 0.0)')
     parser.add_argument('--output-suffix', type=str, default='_slice_profiles',
                         help='Suffix to append to output filenames in batch mode (default: "_slice_profiles")')
+    parser.add_argument('--organize-by-microscopy', action='store_true',
+                        help='Organize outputs by microscopy type (HM/LM folders). '
+                             'Files starting with HM_/LM_ will be placed in data/processed/HM/ or data/processed/LM/ '
+                             'with the microscopy prefix removed from the filename.')
 
     args = parser.parse_args()
 
@@ -443,5 +471,6 @@ if __name__ == '__main__':
             slice_axis=args.slice_axis,
             n_jobs=args.n_jobs,
             min_axon_fraction=args.min_axon_fraction,
-            output_suffix=args.output_suffix
+            output_suffix=args.output_suffix,
+            organize_by_microscopy=args.organize_by_microscopy
         )
