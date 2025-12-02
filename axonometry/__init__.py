@@ -49,6 +49,11 @@ from .populations import (
     create_populations,
 )
 
+from .morphometry import (
+    assign_myelin_to_axons,
+    compute_fiber_metrics,
+)
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -83,4 +88,7 @@ __all__ = [
     "classify_by_dominant_axis",
     "filter_sparse_axons",
     "create_populations",
+    # Morphometry
+    "assign_myelin_to_axons",
+    "compute_fiber_metrics",
 ]
