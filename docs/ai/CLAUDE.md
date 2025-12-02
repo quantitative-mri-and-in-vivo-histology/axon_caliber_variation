@@ -19,13 +19,50 @@ The focus is on characterizing and visualizing:
 
 ## Repository Structure
 
-**data/raw/LM/** – Expected location for raw .mat files from the FAIR dataset (10 volumes: LM_2_ipsi, LM_2_contra, LM_24_ipsi, LM_24_contra, LM_25_ipsi, LM_25_contra, LM_28_ipsi, LM_28_contra, LM_49_ipsi, LM_49_contra)
+### Directory Layout
 
-**data/processed/** – Extracted bundle volumes as OME-Zarr with multi-resolution pyramids
+```
+data/
+├── raw/                    # Raw .mat files organized by condition and hemisphere
+│   ├── Sham_25_ipsi/
+│   │   └── HM_25_ipsi_myelinated_axons.mat
+│   ├── Sham_25_contra/
+│   │   └── HM_25_contra_myelinated_axons.mat
+│   ├── TBI_2_ipsi/
+│   │   └── HM_2_ipsi_myelinated_axons.mat
+│   └── ...
+│
+├── processed/              # Processed NPZ files organized by microscopy type
+│   ├── HM/                 # High magnification data
+│   │   ├── sham_25_ipsi_axon_profiles.npz
+│   │   ├── sham_25_ipsi_slice_profiles.npz
+│   │   ├── sham_25_contra_axon_profiles.npz
+│   │   ├── tbi_2_ipsi_axon_profiles.npz
+│   │   └── ...
+│   └── LM/                 # Low magnification data
+│       ├── sham_25_ipsi_axon_profiles.npz
+│       └── ...
+│
+fig/                        # Generated figures and plots
+│
+src/                        # Python source code for preprocessing, analysis, and visualization
+│
+examples/                   # Example scripts for batch processing and visualization
+```
 
-**fig/** – Output folder for generated figures
+**Naming Convention**: When using `--organize-by-microscopy` flag:
+- Output files are organized into `HM/` and `LM/` subdirectories based on microscopy type
+- Microscopy prefix (HM_/LM_) is removed from filenames (encoded in directory structure)
+- "_myelinated_axons" suffix is removed from filenames (redundant)
+- Condition prefix (Sham/TBI) is extracted from parent directory and converted to lowercase
+- Files are named as `{condition}_{ratid}_{hemisphere}_{suffix}.npz` (all lowercase)
+  - `suffix` is either `axon_profiles` (3D skeleton-based analysis) or `slice_profiles` (2D slice-based analysis)
 
-**src/** – Python source code for preprocessing, analysis, and visualization
+**Example transformation**:
+- Input: `data/raw/Sham_25_ipsi/HM_25_ipsi_myelinated_axons.mat`
+- Output: `data/processed/HM/sham_25_ipsi_axon_profiles.npz`
+
+**Rationale**: This structure enables easy comparison between different imaging modalities (HM/LM) for the same biological sample, while preserving critical experimental metadata (condition, subject ID, hemisphere) in filenames for analysis and filtering.
 
 ## Main Components
 

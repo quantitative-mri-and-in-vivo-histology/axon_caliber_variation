@@ -29,6 +29,7 @@ from .io import (
     load_volume_with_metadata,
     parse_voxel_size,
     resample_to_isotropic,
+    construct_output_path,
 )
 
 from .sampling import (
@@ -59,6 +60,7 @@ __all__ = [
     "load_volume_with_metadata",
     "parse_voxel_size",
     "resample_to_isotropic",
+    "construct_output_path",
     # Sampling
     "sample_perpendicular_cross_section",
     "area_to_equivalent_radius",

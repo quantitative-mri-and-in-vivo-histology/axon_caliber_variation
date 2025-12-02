@@ -33,6 +33,7 @@ from axonometry import (
     skeleton_warmup,
     load_volume_with_metadata,
     resample_to_isotropic,
+    construct_output_path,
     unit_tangent_vector,
     compute_arc_length,
     resample_curve_by_arc_length,
@@ -448,37 +449,13 @@ def batch_compute_fiber_profiles(
     failed = []
 
     for i, mat_file in enumerate(matched_files, 1):
-        # Compute relative path and output path
-        try:
-            relative_path = mat_file.relative_to(common_root)
-        except ValueError:
-            # If relative_to fails, just use the filename
-            relative_path = mat_file.name
-
-        # Construct output path
-        if organize_by_microscopy:
-            # Extract microscopy type from filename (HM or LM)
-            filename = mat_file.stem
-            if filename.startswith('HM_'):
-                microscopy_type = 'HM'
-                # Remove HM_ prefix from filename
-                output_filename = filename[3:] + output_suffix + '.npz'
-            elif filename.startswith('LM_'):
-                microscopy_type = 'LM'
-                # Remove LM_ prefix from filename
-                output_filename = filename[3:] + output_suffix + '.npz'
-            else:
-                # No recognized prefix, use default structure
-                microscopy_type = None
-                output_filename = f"{filename}{output_suffix}.npz"
-
-            if microscopy_type:
-                output_file = output_root / microscopy_type / output_filename
-            else:
-                output_file = output_root / relative_path.parent / output_filename
-        else:
-            # Default: preserve directory structure
-            output_file = output_root / relative_path.parent / f"{relative_path.stem}{output_suffix}.npz"
+        # Construct output path using helper function
+        output_file = construct_output_path(
+            input_file=mat_file,
+            output_root=output_root,
+            output_suffix=output_suffix,
+            organize_by_microscopy=organize_by_microscopy
+        )
 
         logger.info(f"\n{'='*80}")
         logger.info(f"Processing {i}/{len(matched_files)}: {mat_file.name}")

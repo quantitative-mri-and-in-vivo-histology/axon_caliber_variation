@@ -33,7 +33,7 @@ axonometry/
 
 ```
 examples/
-└── compute_fiber_profiles_3d.py   # Along-axon radius profiling (from compute_axon_radius_profiles_accel.py)
+└── compute_axon_profiles_3d.py   # Along-axon radius profiling (from compute_axon_radius_profiles_accel.py)
 ```
 
 ### Test Suite ✓
@@ -108,5 +108,5 @@ pytest
 pytest --cov=axonometry --cov-report=term-missing
 
 # Run example script
-python examples/compute_fiber_profiles_3d.py input.mat output.npz --voxel-size 0.05
+python examples/compute_axon_profiles_3d.py input.mat output.npz --voxel-size 0.05
 ```

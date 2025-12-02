@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 # Import from axonometry library
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from axonometry.io import load_volume_with_metadata, resample_to_isotropic
+from axonometry.io import load_volume_with_metadata, resample_to_isotropic, construct_output_path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -50,17 +50,17 @@ def _init_worker(volume_data: np.ndarray, slice_axis: int):
     _slice_axis = slice_axis
 
 
-def _process_single_slice(args: Tuple[int, float, np.ndarray]) -> Tuple[int, np.ndarray, int]:
+def _process_single_slice(args: Tuple[int, float, np.ndarray, float, float]) -> Tuple[int, np.ndarray, np.ndarray, int]:
     """
-    Process a single slice to extract radius histogram.
+    Process a single slice to extract radius histograms (circular-equivalent and minor axis).
 
     Args:
-        args: Tuple of (slice_index, voxel_size_um, bin_edges)
+        args: Tuple of (slice_index, voxel_size_um, bin_edges, max_ellipse_ratio, max_eccentricity)
 
     Returns:
-        Tuple of (slice_index, histogram_counts, n_axons)
+        Tuple of (slice_index, histogram_counts_circular, histogram_counts_minor, n_axons)
     """
-    z, voxel_size_um, bin_edges = args
+    z, voxel_size_um, bin_edges, max_ellipse_ratio, max_eccentricity = args
     pixel_area_um2 = voxel_size_um * voxel_size_um
 
     # Extract slice from pre-loaded array
@@ -75,21 +75,41 @@ def _process_single_slice(args: Tuple[int, float, np.ndarray]) -> Tuple[int, np.
     regions = regionprops(slice_2d.astype(np.int32))
 
     if len(regions) == 0:
-        return (z, np.zeros(len(bin_edges) - 1, dtype=np.int32), 0)
+        empty_hist = np.zeros(len(bin_edges) - 1, dtype=np.int32)
+        return (z, empty_hist, empty_hist, 0)
 
-    # Compute circular-equivalent radius for each region
-    radii = []
+    # Compute both circular-equivalent and minor axis radii for each region
+    radii_circular = []
+    radii_minor = []
+
     for region in regions:
         area_voxels = region.area
+
+        # Filter by eccentricity if specified (0 = circle, 1 = line)
+        if max_eccentricity < 1.0 and region.eccentricity > max_eccentricity:
+            continue
+
+        # Filter by ellipse area ratio if specified
+        if max_ellipse_ratio > 0:
+            # Compute ellipse area from fitted axes (in pixels)
+            ellipse_area = np.pi * (region.axis_major_length / 2) * (region.axis_minor_length / 2)
+            if ellipse_area > max_ellipse_ratio * area_voxels:
+                continue  # Skip sparse/fragmented regions
+
+        # Circular-equivalent radius from area
         area_um2 = area_voxels * pixel_area_um2
-        radius_um = np.sqrt(area_um2 / np.pi)
-        radii.append(radius_um)
+        radius_circular_um = np.sqrt(area_um2 / np.pi)
+        radii_circular.append(radius_circular_um)
 
-    # Compute histogram
-    radii_array = np.array(radii)
-    counts, _ = np.histogram(radii_array, bins=bin_edges)
+        # Minor axis radius (diameter/2) in micrometers
+        radius_minor_um = (region.axis_minor_length / 2) * voxel_size_um
+        radii_minor.append(radius_minor_um)
 
-    return (z, counts.astype(np.int32), len(radii))
+    # Compute histograms
+    counts_circular, _ = np.histogram(np.array(radii_circular), bins=bin_edges)
+    counts_minor, _ = np.histogram(np.array(radii_minor), bins=bin_edges)
+
+    return (z, counts_circular.astype(np.int32), counts_minor.astype(np.int32), len(radii_circular))
 
 
 def compute_effective_radius_from_histogram(counts: np.ndarray, bin_centers: np.ndarray) -> float:
@@ -124,19 +144,28 @@ def compute_slice_profiles(
     voxel_size_um: Optional[Union[float, Tuple[float, float, float]]] = None,
     slice_axis: int = 0,
     n_jobs: int = -1,
-    min_axon_fraction: float = 0.0
+    min_axon_fraction: float = 0.0,
+    max_ellipse_ratio: float = 2.0,
+    max_eccentricity: float = 1.0
 ) -> Dict[str, Any]:
     """
     Compute per-slice radius histograms from a labeled volume.
+
+    Computes TWO separate histograms:
+    1. Circular-equivalent radius (from area)
+    2. Minor axis radius (from fitted ellipse)
 
     Args:
         mat_file: Path to .mat file with labeled axons
         output_file: Path for output .npz file
         voxel_size_um: Voxel size in micrometers (vz, vy, vx) or scalar.
                        If None, loads from companion JSON metadata file.
-        slice_axis: Axis to slice along (0=Z, 1=Y, 2=X)
+        slice_axis: Axis to slice along (0=Z, 1=Y, 2=X).
+                    Automatically overridden by 'dominant_axis' from metadata if present.
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         min_axon_fraction: Minimum fraction of max axon count to include slice (0-1)
+        max_ellipse_ratio: Max ratio of ellipse area to voxel area (0 = no filter, 2.0 recommended)
+        max_eccentricity: Max eccentricity to include (0-1, where 0=circle, 1=line, 1.0=no filter)
 
     Returns:
         Dictionary with analysis results
@@ -144,6 +173,16 @@ def compute_slice_profiles(
     # Load volume and metadata
     logger.info(f"Loading volume from {mat_file.name}")
     volume, voxel_size_tuple, metadata = load_volume_with_metadata(mat_file, voxel_size_um)
+
+    # Check for dominant_axis in metadata and use it if available
+    if metadata is not None and 'dominant_axis' in metadata:
+        detected_axis = metadata['dominant_axis']
+        logger.info(f"Found dominant_axis in metadata: {detected_axis}")
+        if slice_axis != detected_axis:
+            logger.info(f"Overriding slice_axis {slice_axis} with dominant_axis {detected_axis} from metadata")
+            slice_axis = detected_axis
+    else:
+        logger.info(f"No dominant_axis in metadata, using slice_axis: {slice_axis}")
 
     # Resample to isotropic if needed
     volume, iso_voxel_size = resample_to_isotropic(volume, voxel_size_tuple)
@@ -169,9 +208,12 @@ def compute_slice_profiles(
         n_workers = min(n_jobs, cpu_count())
 
     logger.info(f"Using {n_workers} parallel workers")
+    logger.info(f"Filtering options:")
+    logger.info(f"  max_ellipse_ratio: {max_ellipse_ratio:.2f} {'(disabled)' if max_ellipse_ratio == 0 else ''}")
+    logger.info(f"  max_eccentricity: {max_eccentricity:.2f} {'(disabled)' if max_eccentricity >= 1.0 else ''}")
 
     # Prepare arguments for parallel processing
-    args_list = [(z, iso_voxel_size, bin_edges) for z in range(n_slices)]
+    args_list = [(z, iso_voxel_size, bin_edges, max_ellipse_ratio, max_eccentricity) for z in range(n_slices)]
 
     # Set globals for workers (works for both parallel and serial)
     global _volume_data, _slice_axis
@@ -192,12 +234,13 @@ def compute_slice_profiles(
         # Serial fallback for debugging - globals already set above
         results = [_process_single_slice(args) for args in tqdm(args_list, desc="Processing slices")]
 
-    # Convert to dictionaries
-    histogram_per_slice = {z: counts for z, counts, _ in results}
-    n_axons_per_slice = {z: n_axons for z, _, n_axons in results}
+    # Convert to dictionaries (separate for circular and minor axis)
+    histogram_circular_per_slice = {z: counts_circ for z, counts_circ, _, _ in results}
+    histogram_minor_per_slice = {z: counts_minor for z, _, counts_minor, _ in results}
+    n_axons_per_slice = {z: n_axons for z, _, _, n_axons in results}
 
     # Filter slices by axon count (symmetric extent around peak)
-    slice_indices = sorted(histogram_per_slice.keys())
+    slice_indices = sorted(histogram_circular_per_slice.keys())
     n_axons_array = np.array([n_axons_per_slice[z] for z in slice_indices])
 
     if min_axon_fraction > 0.0 and n_axons_array.max() > 0:
@@ -231,25 +274,42 @@ def compute_slice_profiles(
         slice_indices = slice_indices[start_idx:end_idx]
         n_axons_array = n_axons_array[start_idx:end_idx]
 
-    # Compute effective radius per slice
-    r_eff_per_slice = []
+    # Compute effective radius per slice (for both circular and minor)
+    r_eff_circular_per_slice = []
+    r_eff_minor_per_slice = []
     for z in slice_indices:
-        counts = histogram_per_slice[z]
-        r_eff = compute_effective_radius_from_histogram(counts, bin_centers)
-        r_eff_per_slice.append(r_eff)
-    r_eff_per_slice = np.array(r_eff_per_slice)
+        # Circular-equivalent
+        counts_circ = histogram_circular_per_slice[z]
+        r_eff_circ = compute_effective_radius_from_histogram(counts_circ, bin_centers)
+        r_eff_circular_per_slice.append(r_eff_circ)
+
+        # Minor axis
+        counts_minor = histogram_minor_per_slice[z]
+        r_eff_minor = compute_effective_radius_from_histogram(counts_minor, bin_centers)
+        r_eff_minor_per_slice.append(r_eff_minor)
+
+    r_eff_circular_per_slice = np.array(r_eff_circular_per_slice)
+    r_eff_minor_per_slice = np.array(r_eff_minor_per_slice)
 
     # Compute global effective radius (pooled across all filtered slices)
-    total_histogram = np.sum([histogram_per_slice[z] for z in slice_indices], axis=0)
-    r_eff_global = compute_effective_radius_from_histogram(total_histogram, bin_centers)
+    total_histogram_circular = np.sum([histogram_circular_per_slice[z] for z in slice_indices], axis=0)
+    total_histogram_minor = np.sum([histogram_minor_per_slice[z] for z in slice_indices], axis=0)
+
+    r_eff_circular_global = compute_effective_radius_from_histogram(total_histogram_circular, bin_centers)
+    r_eff_minor_global = compute_effective_radius_from_histogram(total_histogram_minor, bin_centers)
 
     # Statistics
-    total_measurements = int(total_histogram.sum())
-    mean_radius = np.sum(bin_centers * total_histogram) / total_measurements if total_measurements > 0 else 0.0
+    total_measurements = int(total_histogram_circular.sum())
+    mean_radius_circular = np.sum(bin_centers * total_histogram_circular) / total_measurements if total_measurements > 0 else 0.0
+    mean_radius_minor = np.sum(bin_centers * total_histogram_minor) / total_measurements if total_measurements > 0 else 0.0
 
-    logger.info(f"\nResults:")
-    logger.info(f"  Global effective radius: {r_eff_global:.3f} μm")
-    logger.info(f"  Mean radius: {mean_radius:.3f} μm")
+    logger.info(f"\nResults (Circular-Equivalent):")
+    logger.info(f"  Global effective radius: {r_eff_circular_global:.3f} μm")
+    logger.info(f"  Mean radius: {mean_radius_circular:.3f} μm")
+    logger.info(f"\nResults (Minor Axis):")
+    logger.info(f"  Global effective radius: {r_eff_minor_global:.3f} μm")
+    logger.info(f"  Mean radius: {mean_radius_minor:.3f} μm")
+    logger.info(f"\nGeneral:")
     logger.info(f"  Total measurements: {total_measurements}")
     logger.info(f"  Slices used: {len(slice_indices)}/{n_slices}")
 
@@ -257,20 +317,31 @@ def compute_slice_profiles(
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Prepare data for saving
-    histograms_array = np.array([histogram_per_slice[z] for z in slice_indices], dtype=np.int32)
+    histograms_circular_array = np.array([histogram_circular_per_slice[z] for z in slice_indices], dtype=np.int32)
+    histograms_minor_array = np.array([histogram_minor_per_slice[z] for z in slice_indices], dtype=np.int32)
     n_axons_array_filtered = np.array([n_axons_per_slice[z] for z in slice_indices], dtype=np.int32)
 
     np.savez(
         output_file,
-        # Per-slice data
+        # Per-slice data (circular-equivalent)
         slice_indices=np.array(slice_indices, dtype=np.int32),
-        histograms=histograms_array,  # Shape: (n_slices, n_bins)
+        histograms=histograms_circular_array,  # Shape: (n_slices, n_bins) - circular-equivalent (for backward compatibility)
+        histograms_circular=histograms_circular_array,  # Explicit circular-equivalent
+        histograms_minor=histograms_minor_array,  # Minor axis
         n_axons_per_slice=n_axons_array_filtered,
-        r_eff_per_slice=r_eff_per_slice,
-        # Global pooled data
-        total_histogram=total_histogram.astype(np.int32),
-        r_eff_global=np.float64(r_eff_global),
-        mean_radius=np.float64(mean_radius),
+        r_eff_per_slice=r_eff_circular_per_slice,  # Circular (backward compatibility)
+        r_eff_circular_per_slice=r_eff_circular_per_slice,
+        r_eff_minor_per_slice=r_eff_minor_per_slice,
+        # Global pooled data (circular-equivalent)
+        total_histogram=total_histogram_circular.astype(np.int32),  # Backward compatibility
+        total_histogram_circular=total_histogram_circular.astype(np.int32),
+        total_histogram_minor=total_histogram_minor.astype(np.int32),
+        r_eff_global=np.float64(r_eff_circular_global),  # Backward compatibility
+        r_eff_circular_global=np.float64(r_eff_circular_global),
+        r_eff_minor_global=np.float64(r_eff_minor_global),
+        mean_radius=np.float64(mean_radius_circular),  # Backward compatibility
+        mean_radius_circular=np.float64(mean_radius_circular),
+        mean_radius_minor=np.float64(mean_radius_minor),
         # Metadata
         bin_edges=bin_edges,
         bin_centers=bin_centers,
@@ -278,6 +349,8 @@ def compute_slice_profiles(
         voxel_size_isotropic=np.float64(iso_voxel_size),
         slice_axis=np.int32(slice_axis),
         slice_axis_name=axis_names[slice_axis],
+        max_ellipse_ratio=np.float64(max_ellipse_ratio),
+        max_eccentricity=np.float64(max_eccentricity),
         source_file=str(mat_file)
     )
 
@@ -286,9 +359,19 @@ def compute_slice_profiles(
     # Return results summary
     return {
         'sample_name': mat_file.stem.replace('_myelinated_axons', ''),
-        'r_eff_global': float(r_eff_global),
-        'r_eff_std': float(np.std(r_eff_per_slice[r_eff_per_slice > 0])) if np.any(r_eff_per_slice > 0) else 0.0,
-        'mean_radius': float(mean_radius),
+        # Circular-equivalent (for backward compatibility)
+        'r_eff_global': float(r_eff_circular_global),
+        'r_eff_std': float(np.std(r_eff_circular_per_slice[r_eff_circular_per_slice > 0])) if np.any(r_eff_circular_per_slice > 0) else 0.0,
+        'mean_radius': float(mean_radius_circular),
+        # Explicit circular
+        'r_eff_circular_global': float(r_eff_circular_global),
+        'r_eff_circular_std': float(np.std(r_eff_circular_per_slice[r_eff_circular_per_slice > 0])) if np.any(r_eff_circular_per_slice > 0) else 0.0,
+        'mean_radius_circular': float(mean_radius_circular),
+        # Minor axis
+        'r_eff_minor_global': float(r_eff_minor_global),
+        'r_eff_minor_std': float(np.std(r_eff_minor_per_slice[r_eff_minor_per_slice > 0])) if np.any(r_eff_minor_per_slice > 0) else 0.0,
+        'mean_radius_minor': float(mean_radius_minor),
+        # General
         'total_measurements': total_measurements,
         'n_slices_used': len(slice_indices),
         'n_slices_total': n_slices,
@@ -305,6 +388,8 @@ def batch_compute_slice_profiles(
     slice_axis: int,
     n_jobs: int,
     min_axon_fraction: float,
+    max_ellipse_ratio: float,
+    max_eccentricity: float,
     output_suffix: str = '_slice_profiles',
     organize_by_microscopy: bool = False
 ):
@@ -318,6 +403,8 @@ def batch_compute_slice_profiles(
         slice_axis: Axis to slice along (0=Z, 1=Y, 2=X)
         n_jobs: Number of parallel jobs
         min_axon_fraction: Minimum fraction of max axon count
+        max_ellipse_ratio: Max ratio of ellipse area to voxel area
+        max_eccentricity: Max eccentricity to include (0-1)
         output_suffix: Suffix to append to output filenames (default: '_slice_profiles')
         organize_by_microscopy: If True, organize outputs by microscopy type (HM/LM)
     """
@@ -339,37 +426,13 @@ def batch_compute_slice_profiles(
     failed = []
 
     for i, mat_file in enumerate(matched_files, 1):
-        # Compute relative path and output path
-        try:
-            relative_path = mat_file.relative_to(common_root)
-        except ValueError:
-            # If relative_to fails, just use the filename
-            relative_path = mat_file.name
-
-        # Construct output path
-        if organize_by_microscopy:
-            # Extract microscopy type from filename (HM or LM)
-            filename = mat_file.stem
-            if filename.startswith('HM_'):
-                microscopy_type = 'HM'
-                # Remove HM_ prefix from filename
-                output_filename = filename[3:] + output_suffix + '.npz'
-            elif filename.startswith('LM_'):
-                microscopy_type = 'LM'
-                # Remove LM_ prefix from filename
-                output_filename = filename[3:] + output_suffix + '.npz'
-            else:
-                # No recognized prefix, use default structure
-                microscopy_type = None
-                output_filename = f"{filename}{output_suffix}.npz"
-
-            if microscopy_type:
-                output_file = output_root / microscopy_type / output_filename
-            else:
-                output_file = output_root / relative_path.parent / output_filename
-        else:
-            # Default: preserve directory structure
-            output_file = output_root / relative_path.parent / f"{relative_path.stem}{output_suffix}.npz"
+        # Construct output path using helper function
+        output_file = construct_output_path(
+            input_file=mat_file,
+            output_root=output_root,
+            output_suffix=output_suffix,
+            organize_by_microscopy=organize_by_microscopy
+        )
 
         logger.info(f"\n{'='*80}")
         logger.info(f"Processing {i}/{len(matched_files)}: {mat_file.name}")
@@ -383,7 +446,9 @@ def batch_compute_slice_profiles(
                 voxel_size_um=voxel_size_um,
                 slice_axis=slice_axis,
                 n_jobs=n_jobs,
-                min_axon_fraction=min_axon_fraction
+                min_axon_fraction=min_axon_fraction,
+                max_ellipse_ratio=max_ellipse_ratio,
+                max_eccentricity=max_eccentricity
             )
             successful.append(mat_file.name)
         except Exception as e:
@@ -439,6 +504,10 @@ if __name__ == '__main__':
                         help='Organize outputs by microscopy type (HM/LM folders). '
                              'Files starting with HM_/LM_ will be placed in data/processed/HM/ or data/processed/LM/ '
                              'with the microscopy prefix removed from the filename.')
+    parser.add_argument('--max-ellipse-ratio', type=float, default=2.0,
+                        help='Max ratio of ellipse area to voxel area (0 = no filter, default: 2.0)')
+    parser.add_argument('--max-eccentricity', type=float, default=1.0,
+                        help='Max eccentricity to include (0-1, where 0=circle, 1=line, default: 1.0 = no filter)')
 
     args = parser.parse_args()
 
@@ -459,7 +528,9 @@ if __name__ == '__main__':
             voxel_size_um=args.voxel_size,
             slice_axis=args.slice_axis,
             n_jobs=args.n_jobs,
-            min_axon_fraction=args.min_axon_fraction
+            min_axon_fraction=args.min_axon_fraction,
+            max_ellipse_ratio=args.max_ellipse_ratio,
+            max_eccentricity=args.max_eccentricity
         )
     else:
         # Batch mode
@@ -471,6 +542,8 @@ if __name__ == '__main__':
             slice_axis=args.slice_axis,
             n_jobs=args.n_jobs,
             min_axon_fraction=args.min_axon_fraction,
+            max_ellipse_ratio=args.max_ellipse_ratio,
+            max_eccentricity=args.max_eccentricity,
             output_suffix=args.output_suffix,
             organize_by_microscopy=args.organize_by_microscopy
         )
