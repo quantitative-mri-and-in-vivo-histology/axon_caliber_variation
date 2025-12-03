@@ -28,8 +28,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
 
+from axonometry import get_plot_settings
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Load plot settings
+settings = get_plot_settings()
 
 
 def load_population_labels(json_file: Path, population_name: str) -> Set[int]:
@@ -267,9 +272,10 @@ def plot_combined_2d_vs_3d_comparison(
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Color and marker mappings
-    group_colors = {'Sham': '#1f77b4', 'TBI': '#d62728', 'Unknown': '#7f7f7f'}  # Blue, Red, Gray
-    pop_markers = {'CC': 'o', 'CG': '^', None: 's'}  # Circle, Triangle, Square
+    # Get settings
+    font_settings = settings.fonts
+    grid_settings = settings.grid
+    err_settings = settings.error_bars
 
     # Organize data by group and population
     data_by_category = {}
@@ -302,8 +308,8 @@ def plot_combined_2d_vs_3d_comparison(
 
     # Plot each category
     for (group, population), data in sorted(data_by_category.items()):
-        color = group_colors.get(group, '#7f7f7f')
-        marker = pop_markers.get(population, 's')
+        color = settings.get_group_color(group)
+        marker = settings.get_marker(population)
 
         # Create label
         if population:
@@ -311,26 +317,28 @@ def plot_combined_2d_vs_3d_comparison(
         else:
             label = group
 
-        # Subplot 1: Mean radius (asymmetric error bars for 95% CI)
+        # Subplot 1: Mean radius (asymmetric error bars for IQR)
         yerr_mean = [data['yerr_mean_lo'], data['yerr_mean_hi']]
         ax1.errorbar(
             data['x_mean'], data['y_mean'], yerr=yerr_mean,
             fmt=marker, color=color, markersize=9,
-            capsize=4, capthick=1.2, elinewidth=1.2,
+            capsize=err_settings['capsize'], capthick=err_settings['capthick'],
+            elinewidth=err_settings['linewidth'],
             markeredgecolor='black', markeredgewidth=0.5,
-            alpha=0.7, label=label
+            alpha=err_settings['alpha'], label=label
         )
         all_x_mean.extend(data['x_mean'])
         all_y_mean.extend(data['y_mean'])
 
-        # Subplot 2: Effective radius (asymmetric error bars for 95% CI)
+        # Subplot 2: Effective radius (asymmetric error bars for IQR)
         yerr_eff = [data['yerr_eff_lo'], data['yerr_eff_hi']]
         ax2.errorbar(
             data['x_eff'], data['y_eff'], yerr=yerr_eff,
             fmt=marker, color=color, markersize=9,
-            capsize=4, capthick=1.2, elinewidth=1.2,
+            capsize=err_settings['capsize'], capthick=err_settings['capthick'],
+            elinewidth=err_settings['linewidth'],
             markeredgecolor='black', markeredgewidth=0.5,
-            alpha=0.7, label=label
+            alpha=err_settings['alpha'], label=label
         )
         all_x_eff.extend(data['x_eff'])
         all_y_eff.extend(data['y_eff'])
@@ -350,14 +358,17 @@ def plot_combined_2d_vs_3d_comparison(
     ax1.set_xlim(min_val_mean, max_val_mean)
     ax1.set_ylim(min_val_mean, max_val_mean)
     ax1.set_aspect('equal')
-    ax1.grid(True, alpha=0.3, zorder=0)
-    ax1.set_xlabel('3D Mean Radius (μm)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('2D Mean Radius, median [IQR] (μm)', fontsize=12, fontweight='bold')
+    ax1.grid(grid_settings['enabled'], alpha=grid_settings['alpha'], zorder=0)
+    ax1.set_xlabel('3D Mean Radius (μm)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax1.set_ylabel('2D Mean Radius, median [IQR] (μm)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
 
     # Add correlation to title
     title_mean = f'Arithmetic Mean Radius\nr = {r_mean:.3f}, p = {p_mean:.2e}'
-    ax1.set_title(title_mean, fontsize=12, fontweight='bold')
-    ax1.legend(loc='upper left', fontsize=9, framealpha=0.9)
+    ax1.set_title(title_mean, fontsize=font_settings['label_size'],
+                  fontweight=font_settings['weight'])
+    ax1.legend(loc='upper left', fontsize=font_settings['legend_size'], framealpha=0.9)
 
     # === Subplot 2: Effective Radius ===
     all_vals_eff = all_x_eff + all_y_eff
@@ -370,23 +381,27 @@ def plot_combined_2d_vs_3d_comparison(
     ax2.set_xlim(min_val_eff, max_val_eff)
     ax2.set_ylim(min_val_eff, max_val_eff)
     ax2.set_aspect('equal')
-    ax2.grid(True, alpha=0.3, zorder=0)
-    ax2.set_xlabel('3D Effective Radius (μm)', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('2D Effective Radius, median [IQR] (μm)', fontsize=12, fontweight='bold')
+    ax2.grid(grid_settings['enabled'], alpha=grid_settings['alpha'], zorder=0)
+    ax2.set_xlabel('3D Effective Radius (μm)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax2.set_ylabel('2D Effective Radius, median [IQR] (μm)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
 
     # Add correlation to title
     title_eff = f'Effective Radius (r_eff)\nr = {r_eff:.3f}, p = {p_eff:.2e}'
-    ax2.set_title(title_eff, fontsize=12, fontweight='bold')
-    ax2.legend(loc='upper left', fontsize=9, framealpha=0.9)
+    ax2.set_title(title_eff, fontsize=font_settings['label_size'],
+                  fontweight=font_settings['weight'])
+    ax2.legend(loc='upper left', fontsize=font_settings['legend_size'], framealpha=0.9)
 
     # Overall title
-    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+    fig.suptitle(title, fontsize=font_settings['title_size'],
+                 fontweight=font_settings['weight'], y=0.98)
 
     plt.tight_layout()
 
     # Save figure
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=200, bbox_inches='tight')
+    plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
     plt.close()
 
     logger.info(f"Saved combined plot to {output_file}")

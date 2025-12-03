@@ -22,6 +22,9 @@ The focus is on characterizing and visualizing:
 ### Directory Layout
 
 ```
+config/
+├── plot_settings.yaml      # Global plot styling settings (colors, fonts, etc.)
+│
 data/
 ├── raw/                    # Raw .mat files organized by condition and hemisphere
 │   ├── Sham_25_ipsi/
@@ -237,3 +240,60 @@ Opens Neuroglancer viewer with multi-resolution support.
   - 0.7 = moderate (~45° tolerance, recommended)
   - 1.0 = permissive (~60° tolerance)
 - **k-neighbors / max-neighbor-distance**: KNN-based sparse axon filtering
+
+### Plot Settings
+
+All plot scripts in `examples/` must use centralized plot settings from `config/plot_settings.yaml` via the `axonometry` module. This ensures consistent styling across all figures.
+
+**Usage in plot scripts:**
+```python
+from axonometry import get_plot_settings
+
+settings = get_plot_settings()
+
+# Colors
+color = settings.get_group_color('Sham')  # '#1f77b4' (blue)
+color = settings.get_group_color('TBI')   # '#d62728' (red)
+
+# Markers for populations
+marker = settings.get_marker('CC')   # 'o' (circle)
+marker = settings.get_marker('CG')   # '^' (triangle)
+
+# Font settings
+fontsize = settings.fonts['label_size']      # 12
+fontsize = settings.fonts['title_size']      # 14
+fontsize = settings.fonts['legend_size']     # 10
+fontweight = settings.fonts['weight']        # 'bold'
+
+# Grid settings
+ax.grid(settings.grid['enabled'], alpha=settings.grid['alpha'])
+
+# Error bar settings
+ax.errorbar(..., capsize=settings.error_bars['capsize'],
+            capthick=settings.error_bars['capthick'],
+            elinewidth=settings.error_bars['linewidth'],
+            alpha=settings.error_bars['alpha'])
+
+# Histogram settings
+ax.hist(..., bins=settings.histogram['bins'],
+        alpha=settings.histogram['alpha'],
+        edgecolor=settings.histogram['edgecolor'])
+
+# Line plot settings
+ax.plot(..., linewidth=settings.line['linewidth'],
+        markersize=settings.line['marker_size'])
+ax.fill_between(..., alpha=settings.line['fill_alpha'])
+
+# Figure DPI
+plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
+```
+
+**Settings file structure** (`config/plot_settings.yaml`):
+- `colors`: Group colors (sham, tbi), indicator lines (mean_line, median_line)
+- `markers`: Population markers (cc, cg, default)
+- `figure`: DPI, default figure size
+- `fonts`: Label, title, legend sizes and weight
+- `grid`: Enable flag and alpha
+- `error_bars`: Capsize, thickness, linewidth, alpha
+- `histogram`: Bin count, alpha, edge color
+- `line`: Linewidth, marker size, fill alpha

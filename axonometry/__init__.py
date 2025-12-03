@@ -54,6 +54,12 @@ from .morphometry import (
     compute_fiber_metrics,
 )
 
+from .plotting import (
+    load_plot_settings,
+    PlotSettings,
+    get_plot_settings,
+)
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -91,4 +97,8 @@ __all__ = [
     # Morphometry
     "assign_myelin_to_axons",
     "compute_fiber_metrics",
+    # Plotting
+    "load_plot_settings",
+    "PlotSettings",
+    "get_plot_settings",
 ]

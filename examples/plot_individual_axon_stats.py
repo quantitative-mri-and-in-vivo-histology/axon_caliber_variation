@@ -18,11 +18,14 @@ from typing import List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
-from scipy.ndimage import gaussian_filter
-from matplotlib.colors import LogNorm
+
+from axonometry import get_plot_settings
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Load plot settings
+settings = get_plot_settings()
 
 
 def extract_group(sample_name: str) -> str:
@@ -115,31 +118,46 @@ def plot_cv_vs_radius(
     all_y = np.concatenate([cv for _, cv, _, _ in all_data])
     all_std = np.concatenate([std for _, _, std, _ in all_data])
 
-    # === Panel 0: Radius histogram ===
-    ax0.hist(all_x, bins=50, color='#1f77b4', edgecolor='black', alpha=0.7)
-    ax0.axvline(np.mean(all_x), color='red', linestyle='--', linewidth=2,
-                label=f'Mean = {np.mean(all_x):.3f}')
-    ax0.axvline(np.median(all_x), color='orange', linestyle=':', linewidth=2,
-                label=f'Median = {np.median(all_x):.3f}')
+    # Get settings
+    hist_settings = settings.histogram
+    font_settings = settings.fonts
+    grid_settings = settings.grid
+    line_settings = settings.line
+    main_color = settings.get_group_color('sham')  # Use sham color as default blue
 
-    ax0.set_xlabel('Mean Axon Radius (um)', fontsize=12, fontweight='bold')
-    ax0.set_ylabel('Count', fontsize=12, fontweight='bold')
-    ax0.set_title(f'Radius Distribution (n = {len(all_x):,})', fontsize=12, fontweight='bold')
-    ax0.legend(loc='upper right', fontsize=10)
-    ax0.grid(True, alpha=0.3)
+    # === Panel 0: Radius histogram ===
+    ax0.hist(all_x, bins=hist_settings['bins'], color=main_color,
+             edgecolor=hist_settings['edgecolor'], alpha=hist_settings['alpha'])
+    ax0.axvline(np.mean(all_x), color=settings.colors['mean_line'], linestyle='--',
+                linewidth=line_settings['linewidth'], label=f'Mean = {np.mean(all_x):.3f}')
+    ax0.axvline(np.median(all_x), color=settings.colors['median_line'], linestyle=':',
+                linewidth=line_settings['linewidth'], label=f'Median = {np.median(all_x):.3f}')
+
+    ax0.set_xlabel('Mean Axon Radius (um)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax0.set_ylabel('Count', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax0.set_title(f'Radius Distribution (n = {len(all_x):,})', fontsize=font_settings['label_size'],
+                  fontweight=font_settings['weight'])
+    ax0.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    ax0.grid(grid_settings['enabled'], alpha=grid_settings['alpha'])
 
     # === Panel 1: CV histogram ===
-    ax1.hist(all_y, bins=50, color='#1f77b4', edgecolor='black', alpha=0.7)
-    ax1.axvline(np.mean(all_y), color='red', linestyle='--', linewidth=2,
-                label=f'Mean = {np.mean(all_y):.3f}')
-    ax1.axvline(np.median(all_y), color='orange', linestyle=':', linewidth=2,
-                label=f'Median = {np.median(all_y):.3f}')
+    ax1.hist(all_y, bins=hist_settings['bins'], color=main_color,
+             edgecolor=hist_settings['edgecolor'], alpha=hist_settings['alpha'])
+    ax1.axvline(np.mean(all_y), color=settings.colors['mean_line'], linestyle='--',
+                linewidth=line_settings['linewidth'], label=f'Mean = {np.mean(all_y):.3f}')
+    ax1.axvline(np.median(all_y), color=settings.colors['median_line'], linestyle=':',
+                linewidth=line_settings['linewidth'], label=f'Median = {np.median(all_y):.3f}')
 
-    ax1.set_xlabel('Coefficient of Variation (CV)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('Count', fontsize=12, fontweight='bold')
-    ax1.set_title('CV Distribution', fontsize=12, fontweight='bold')
-    ax1.legend(loc='upper right', fontsize=10)
-    ax1.grid(True, alpha=0.3)
+    ax1.set_xlabel('Coefficient of Variation (CV)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax1.set_ylabel('Count', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax1.set_title('CV Distribution', fontsize=font_settings['label_size'],
+                  fontweight=font_settings['weight'])
+    ax1.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    ax1.grid(grid_settings['enabled'], alpha=grid_settings['alpha'])
 
     # === Panel 2: CV vs radius trend ===
     # Compute binned statistics
@@ -154,7 +172,7 @@ def plot_cv_vs_radius(
     for i in range(n_bins):
         mask = (all_x >= bin_edges[i]) & (all_x < bin_edges[i + 1])
         count = np.sum(mask)
-        if count >= 10:
+        if count >= 50:
             bin_means.append(np.mean(all_y[mask]))
             bin_stds.append(np.std(all_y[mask]))
             bin_counts.append(count)
@@ -167,21 +185,25 @@ def plot_cv_vs_radius(
     bin_stds = np.array(bin_stds)
     valid = ~np.isnan(bin_means)
 
-    ax2.plot(bin_centers[valid], bin_means[valid], 'b-', linewidth=2, marker='o',
-             markersize=5, label='Mean CV')
+    ax2.plot(bin_centers[valid], bin_means[valid], color=main_color, linestyle='-',
+             linewidth=line_settings['linewidth'], marker='o',
+             markersize=line_settings['marker_size'], label='Mean CV')
     ax2.fill_between(bin_centers[valid],
                     bin_means[valid] - bin_stds[valid],
                     bin_means[valid] + bin_stds[valid],
-                    color='blue', alpha=0.2, label='±1 std')
+                    color=main_color, alpha=line_settings['fill_alpha'], label='±1 std')
 
     # Compute correlation
     r, p = stats.pearsonr(all_x, all_y)
 
-    ax2.set_xlabel('Mean Axon Radius (um)', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('Coefficient of Variation (CV)', fontsize=12, fontweight='bold')
-    ax2.set_title(f'CV vs Radius\nr = {r:.3f}, p = {p:.2e}', fontsize=12, fontweight='bold')
-    ax2.legend(loc='upper right', fontsize=10)
-    ax2.grid(True, alpha=0.3)
+    ax2.set_xlabel('Mean Axon Radius (um)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax2.set_ylabel('Coefficient of Variation (CV)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax2.set_title(f'CV vs Radius\nr = {r:.3f}, p = {p:.2e}', fontsize=font_settings['label_size'],
+                  fontweight=font_settings['weight'])
+    ax2.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    ax2.grid(grid_settings['enabled'], alpha=grid_settings['alpha'])
     ax2.set_xlim(0, x_max)
 
     # === Panel 3: Absolute std vs radius trend ===
@@ -192,7 +214,7 @@ def plot_cv_vs_radius(
     for i in range(n_bins):
         mask = (all_x >= bin_edges[i]) & (all_x < bin_edges[i + 1])
         count = np.sum(mask)
-        if count >= 10:
+        if count >= 50:
             bin_means_std.append(np.mean(all_std[mask]))
             bin_stds_std.append(np.std(all_std[mask]))
         else:
@@ -203,31 +225,35 @@ def plot_cv_vs_radius(
     bin_stds_std = np.array(bin_stds_std)
     valid_std = ~np.isnan(bin_means_std)
 
-    ax3.plot(bin_centers[valid_std], bin_means_std[valid_std], 'b-', linewidth=2, marker='o',
-             markersize=5, label='Mean std')
+    ax3.plot(bin_centers[valid_std], bin_means_std[valid_std], color=main_color, linestyle='-',
+             linewidth=line_settings['linewidth'], marker='o',
+             markersize=line_settings['marker_size'], label='Mean std')
     ax3.fill_between(bin_centers[valid_std],
                     bin_means_std[valid_std] - bin_stds_std[valid_std],
                     bin_means_std[valid_std] + bin_stds_std[valid_std],
-                    color='blue', alpha=0.2, label='±1 std')
+                    color=main_color, alpha=line_settings['fill_alpha'], label='±1 std')
 
     # Compute correlation for std vs radius
     r_std, p_std = stats.pearsonr(all_x, all_std)
 
-    ax3.set_xlabel('Mean Axon Radius (um)', fontsize=12, fontweight='bold')
-    ax3.set_ylabel('Std of Radius (um)', fontsize=12, fontweight='bold')
-    ax3.set_title(f'Std vs Radius\nr = {r_std:.3f}, p = {p_std:.2e}', fontsize=12, fontweight='bold')
-    ax3.legend(loc='upper left', fontsize=10)
-    ax3.grid(True, alpha=0.3)
+    ax3.set_xlabel('Mean Axon Radius (um)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax3.set_ylabel('Std of Radius (um)', fontsize=font_settings['label_size'],
+                   fontweight=font_settings['weight'])
+    ax3.set_title(f'Std vs Radius\nr = {r_std:.3f}, p = {p_std:.2e}', fontsize=font_settings['label_size'],
+                  fontweight=font_settings['weight'])
+    ax3.legend(loc='upper left', fontsize=font_settings['legend_size'])
+    ax3.grid(grid_settings['enabled'], alpha=grid_settings['alpha'])
     ax3.set_xlim(0, x_max)
 
     # Overall title
-    fig.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
+    fig.suptitle(title, fontsize=font_settings['title_size'], fontweight=font_settings['weight'], y=1.02)
 
     plt.tight_layout()
 
     # Save figure
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=200, bbox_inches='tight')
+    plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
     plt.close()
 
     logger.info(f"Saved plot to {output_file}")

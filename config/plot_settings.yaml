@@ -1,0 +1,55 @@
+# Plot settings for axon caliber variation figures
+# These settings ensure consistent styling across all plots
+
+# Color palettes
+colors:
+  sham: "#1f77b4"      # Blue
+  tbi: "#d62728"       # Red
+  unknown: "#7f7f7f"   # Gray
+
+  # For mean/median indicator lines in histograms
+  mean_line: "red"
+  median_line: "orange"
+
+# Marker styles for populations
+markers:
+  cc: "o"              # Circle
+  cg: "^"              # Triangle
+  default: "s"         # Square
+
+# Figure settings
+figure:
+  dpi: 200
+  default_figsize: [10, 6]
+  tight_layout: true
+
+# Font settings
+fonts:
+  label_size: 12
+  title_size: 14
+  legend_size: 10
+  weight: "normal"
+
+# Grid settings
+grid:
+  alpha: 0.3
+  enabled: false
+
+# Error bar settings
+error_bars:
+  capsize: 4
+  capthick: 1.2
+  linewidth: 1.2
+  alpha: 0.7
+
+# Histogram settings
+histogram:
+  bins: 50
+  alpha: 0.7
+  edgecolor: "black"
+
+# Line plot settings
+line:
+  linewidth: 2
+  marker_size: 5
+  fill_alpha: 0.2
