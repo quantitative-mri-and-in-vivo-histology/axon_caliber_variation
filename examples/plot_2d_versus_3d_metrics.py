@@ -86,17 +86,16 @@ def load_2d_metrics(npz_file: Path, radius_type: str = 'minor') -> Dict[str, flo
     Load 2D slice-based metrics from NPZ file.
 
     Computes:
-    - Arithmetic mean radius (from total histogram)
-    - Arithmetic mean radius std (from per-slice means)
-    - Effective radius (mean across slices)
-    - Effective radius std (across slices)
+    - Arithmetic mean radius: median across slices with 95% CI
+    - Effective radius: median across slices with 95% CI
 
     Args:
         npz_file: Path to 2D slice profiles NPZ file
         radius_type: 'circular' (from area) or 'minor' (from ellipse), default: 'minor'
 
     Returns:
-        Dictionary with keys: mean_radius, mean_radius_std, r_eff, r_eff_std
+        Dictionary with keys: mean_radius, mean_radius_lo, mean_radius_hi,
+                              r_eff, r_eff_lo, r_eff_hi
     """
     data = np.load(npz_file)
 
@@ -106,24 +105,13 @@ def load_2d_metrics(npz_file: Path, radius_type: str = 'minor') -> Dict[str, flo
     if radius_type == 'minor':
         # Load minor axis histograms
         histograms = data['histograms_minor']  # Shape: (n_slices, n_bins)
-        total_histogram = data['total_histogram_minor']
         r_eff_per_slice = data['r_eff_minor_per_slice']
-        r_eff_global = float(data['r_eff_minor_global'])
     else:  # circular
         # Load circular-equivalent histograms
         histograms = data['histograms_circular']  # Shape: (n_slices, n_bins)
-        total_histogram = data['total_histogram_circular']
         r_eff_per_slice = data['r_eff_circular_per_slice']
-        r_eff_global = float(data['r_eff_circular_global'])
 
-    # Compute arithmetic mean radius from total histogram
-    total_counts = total_histogram.sum()
-    if total_counts > 0:
-        mean_radius_global = np.sum(bin_centers * total_histogram) / total_counts
-    else:
-        mean_radius_global = np.nan
-
-    # Compute per-slice arithmetic mean for std calculation
+    # Compute per-slice arithmetic mean
     mean_radius_per_slice = []
     for hist_slice in histograms:
         counts = hist_slice.sum()
@@ -131,29 +119,40 @@ def load_2d_metrics(npz_file: Path, radius_type: str = 'minor') -> Dict[str, flo
             mean_r = np.sum(bin_centers * hist_slice) / counts
             mean_radius_per_slice.append(mean_r)
 
+    mean_radius_per_slice = np.array(mean_radius_per_slice)
+
+    # Compute median and IQR (25th-75th percentile) for mean radius
     if len(mean_radius_per_slice) > 0:
-        mean_radius_std = np.std(mean_radius_per_slice)
+        mean_radius_median = np.median(mean_radius_per_slice)
+        mean_radius_lo = np.percentile(mean_radius_per_slice, 25)
+        mean_radius_hi = np.percentile(mean_radius_per_slice, 75)
     else:
-        mean_radius_std = np.nan
+        mean_radius_median = np.nan
+        mean_radius_lo = np.nan
+        mean_radius_hi = np.nan
 
-    # Global pooled effective radius was already loaded above based on radius_type
-
-    # Compute std of per-slice effective radii for error bars
+    # Compute median and IQR for effective radius
     valid_r_eff = r_eff_per_slice[r_eff_per_slice > 0]
     if len(valid_r_eff) > 0:
-        r_eff_std = np.std(valid_r_eff)
+        r_eff_median = np.median(valid_r_eff)
+        r_eff_lo = np.percentile(valid_r_eff, 25)
+        r_eff_hi = np.percentile(valid_r_eff, 75)
     else:
-        r_eff_std = np.nan
+        r_eff_median = np.nan
+        r_eff_lo = np.nan
+        r_eff_hi = np.nan
 
     logger.info(f"2D metrics from {npz_file.name}:")
-    logger.info(f"  Mean radius: {mean_radius_global:.3f} ± {mean_radius_std:.3f} μm")
-    logger.info(f"  Effective radius: {r_eff_global:.3f} ± {r_eff_std:.3f} μm")
+    logger.info(f"  Mean radius: {mean_radius_median:.3f} [{mean_radius_lo:.3f}, {mean_radius_hi:.3f}] μm")
+    logger.info(f"  Effective radius: {r_eff_median:.3f} [{r_eff_lo:.3f}, {r_eff_hi:.3f}] μm")
 
     return {
-        'mean_radius': mean_radius_global,
-        'mean_radius_std': mean_radius_std,
-        'r_eff': r_eff_global,
-        'r_eff_std': r_eff_std
+        'mean_radius': mean_radius_median,
+        'mean_radius_lo': mean_radius_lo,
+        'mean_radius_hi': mean_radius_hi,
+        'r_eff': r_eff_median,
+        'r_eff_lo': r_eff_lo,
+        'r_eff_hi': r_eff_hi
     }
 
 
@@ -281,19 +280,21 @@ def plot_combined_2d_vs_3d_comparison(
 
         if category not in data_by_category:
             data_by_category[category] = {
-                'x_mean': [], 'y_mean': [], 'yerr_mean': [],
-                'x_eff': [], 'y_eff': [], 'yerr_eff': []
+                'x_mean': [], 'y_mean': [], 'yerr_mean_lo': [], 'yerr_mean_hi': [],
+                'x_eff': [], 'y_eff': [], 'yerr_eff_lo': [], 'yerr_eff_hi': []
             }
 
-        # Mean radius
+        # Mean radius (asymmetric error bars: distance from median to lo/hi)
         data_by_category[category]['x_mean'].append(metrics_3d['mean_radius'])
         data_by_category[category]['y_mean'].append(metrics_2d['mean_radius'])
-        data_by_category[category]['yerr_mean'].append(metrics_2d['mean_radius_std'])
+        data_by_category[category]['yerr_mean_lo'].append(metrics_2d['mean_radius'] - metrics_2d['mean_radius_lo'])
+        data_by_category[category]['yerr_mean_hi'].append(metrics_2d['mean_radius_hi'] - metrics_2d['mean_radius'])
 
-        # Effective radius
+        # Effective radius (asymmetric error bars)
         data_by_category[category]['x_eff'].append(metrics_3d['r_eff'])
         data_by_category[category]['y_eff'].append(metrics_2d['r_eff'])
-        data_by_category[category]['yerr_eff'].append(metrics_2d['r_eff_std'])
+        data_by_category[category]['yerr_eff_lo'].append(metrics_2d['r_eff'] - metrics_2d['r_eff_lo'])
+        data_by_category[category]['yerr_eff_hi'].append(metrics_2d['r_eff_hi'] - metrics_2d['r_eff'])
 
     # Collect all data for axis limits and correlation
     all_x_mean, all_y_mean = [], []
@@ -310,9 +311,10 @@ def plot_combined_2d_vs_3d_comparison(
         else:
             label = group
 
-        # Subplot 1: Mean radius
+        # Subplot 1: Mean radius (asymmetric error bars for 95% CI)
+        yerr_mean = [data['yerr_mean_lo'], data['yerr_mean_hi']]
         ax1.errorbar(
-            data['x_mean'], data['y_mean'], yerr=data['yerr_mean'],
+            data['x_mean'], data['y_mean'], yerr=yerr_mean,
             fmt=marker, color=color, markersize=9,
             capsize=4, capthick=1.2, elinewidth=1.2,
             markeredgecolor='black', markeredgewidth=0.5,
@@ -321,9 +323,10 @@ def plot_combined_2d_vs_3d_comparison(
         all_x_mean.extend(data['x_mean'])
         all_y_mean.extend(data['y_mean'])
 
-        # Subplot 2: Effective radius
+        # Subplot 2: Effective radius (asymmetric error bars for 95% CI)
+        yerr_eff = [data['yerr_eff_lo'], data['yerr_eff_hi']]
         ax2.errorbar(
-            data['x_eff'], data['y_eff'], yerr=data['yerr_eff'],
+            data['x_eff'], data['y_eff'], yerr=yerr_eff,
             fmt=marker, color=color, markersize=9,
             capsize=4, capthick=1.2, elinewidth=1.2,
             markeredgecolor='black', markeredgewidth=0.5,
@@ -349,7 +352,7 @@ def plot_combined_2d_vs_3d_comparison(
     ax1.set_aspect('equal')
     ax1.grid(True, alpha=0.3, zorder=0)
     ax1.set_xlabel('3D Mean Radius (μm)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('2D Mean Radius ± std (μm)', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('2D Mean Radius, median [IQR] (μm)', fontsize=12, fontweight='bold')
 
     # Add correlation to title
     title_mean = f'Arithmetic Mean Radius\nr = {r_mean:.3f}, p = {p_mean:.2e}'
@@ -369,7 +372,7 @@ def plot_combined_2d_vs_3d_comparison(
     ax2.set_aspect('equal')
     ax2.grid(True, alpha=0.3, zorder=0)
     ax2.set_xlabel('3D Effective Radius (μm)', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('2D Effective Radius ± std (μm)', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('2D Effective Radius, median [IQR] (μm)', fontsize=12, fontweight='bold')
 
     # Add correlation to title
     title_eff = f'Effective Radius (r_eff)\nr = {r_eff:.3f}, p = {p_eff:.2e}'
