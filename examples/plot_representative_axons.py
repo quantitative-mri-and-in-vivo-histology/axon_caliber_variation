@@ -196,13 +196,43 @@ def generate_tube_mesh(skeleton: np.ndarray, radii: np.ndarray,
     return X, Y, Z, R
 
 
-def straighten_axon(skeleton: np.ndarray, radii: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def smooth_radii(radii: np.ndarray, window_size: int = 3) -> np.ndarray:
+    """
+    Apply moving average smoothing to radius profile.
+
+    Args:
+        radii: (N,) array of radii
+        window_size: Size of the smoothing window (must be odd)
+
+    Returns:
+        Smoothed radii array
+    """
+    if window_size <= 1 or len(radii) < window_size:
+        return radii
+
+    # Ensure window_size is odd
+    if window_size % 2 == 0:
+        window_size += 1
+
+    # Use numpy convolution for moving average
+    kernel = np.ones(window_size) / window_size
+    # Pad edges to preserve length
+    pad_width = window_size // 2
+    padded = np.pad(radii, pad_width, mode='edge')
+    smoothed = np.convolve(padded, kernel, mode='valid')
+
+    return smoothed
+
+
+def straighten_axon(skeleton: np.ndarray, radii: np.ndarray,
+                    smooth_window: int = 1) -> Tuple[np.ndarray, np.ndarray]:
     """
     Straighten an axon by computing arc length along the skeleton.
 
     Args:
         skeleton: (N, 3) array of skeleton points
         radii: (N,) array of radii
+        smooth_window: Window size for smoothing radii (1 = no smoothing)
 
     Returns:
         Tuple of (arc_lengths, radii)
@@ -211,6 +241,10 @@ def straighten_axon(skeleton: np.ndarray, radii: np.ndarray) -> Tuple[np.ndarray
     diffs = np.diff(skeleton, axis=0)
     segment_lengths = np.sqrt(np.sum(diffs**2, axis=1))
     arc_lengths = np.concatenate([[0], np.cumsum(segment_lengths)])
+
+    # Optionally smooth the radii
+    if smooth_window > 1:
+        radii = smooth_radii(radii, smooth_window)
 
     return arc_lengths, radii
 
@@ -244,6 +278,74 @@ def generate_straight_tube_mesh(arc_lengths: np.ndarray, radii: np.ndarray,
             R[i, j] = radii[i]
 
     return X, Y, Z, R
+
+
+def get_cross_section_at_arc_length(skeleton: np.ndarray, radii: np.ndarray,
+                                     target_arc_length: float,
+                                     n_circle_points: int = 32,
+                                     scale_factor: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Get cross-section circle at a specific arc length along the axon.
+
+    Args:
+        skeleton: (N, 3) array of skeleton points
+        radii: (N,) array of radii
+        target_arc_length: Target arc length position in μm
+        n_circle_points: Number of points for the circle
+        scale_factor: Scale factor for the circle radius (for visualization)
+
+    Returns:
+        Tuple of (X, Y, Z, radius) for the circle points, or None if target is beyond axon length
+    """
+    # Compute arc lengths
+    diffs = np.diff(skeleton, axis=0)
+    segment_lengths = np.sqrt(np.sum(diffs**2, axis=1))
+    arc_lengths = np.concatenate([[0], np.cumsum(segment_lengths)])
+
+    if target_arc_length > arc_lengths[-1]:
+        return None
+
+    # Find the segment containing target arc length
+    idx = np.searchsorted(arc_lengths, target_arc_length) - 1
+    idx = max(0, min(idx, len(skeleton) - 2))
+
+    # Interpolate position and radius
+    t = (target_arc_length - arc_lengths[idx]) / (arc_lengths[idx + 1] - arc_lengths[idx] + 1e-10)
+    center = skeleton[idx] + t * (skeleton[idx + 1] - skeleton[idx])
+    radius = radii[idx] + t * (radii[idx + 1] - radii[idx])
+
+    # Apply scale factor for visualization
+    display_radius = radius * scale_factor
+
+    # Get tangent direction
+    tangent = skeleton[idx + 1] - skeleton[idx]
+    tangent = tangent / (np.linalg.norm(tangent) + 1e-10)
+
+    # Find perpendicular vectors
+    if abs(tangent[0]) < 0.9:
+        ref = np.array([1, 0, 0])
+    else:
+        ref = np.array([0, 1, 0])
+
+    perp1 = ref - np.dot(ref, tangent) * tangent
+    perp1 = perp1 / (np.linalg.norm(perp1) + 1e-10)
+    perp2 = np.cross(tangent, perp1)
+    perp2 = perp2 / (np.linalg.norm(perp2) + 1e-10)
+
+    # Generate circle points
+    theta = np.linspace(0, 2 * np.pi, n_circle_points, endpoint=True)
+    X = np.zeros(n_circle_points)
+    Y = np.zeros(n_circle_points)
+    Z = np.zeros(n_circle_points)
+
+    for j, t in enumerate(theta):
+        offset = display_radius * (np.cos(t) * perp1 + np.sin(t) * perp2)
+        point = center + offset
+        X[j] = point[2]  # X axis (skeleton coord index 2)
+        Y[j] = point[1]  # Y axis (skeleton coord index 1)
+        Z[j] = point[0]  # Z axis (skeleton coord index 0)
+
+    return X, Y, Z, radius
 
 
 def radius_to_color(radii: np.ndarray, base_color: np.ndarray,
@@ -319,8 +421,22 @@ def plot_representative_axons(data: dict, indices: Tuple[int, int, int],
         ax_3d.plot_surface(X, Y, Z, facecolors=colors, shade=False,
                            antialiased=True, linewidth=0)
 
-        # Generate straightened tube
-        arc_lengths, straight_radii = straighten_axon(skeleton, radii)
+        # Add cross-section circles at regular intervals (25, 50, 75, ... μm)
+        max_arc_length = np.sum(np.sqrt(np.sum(np.diff(skeleton, axis=0)**2, axis=1)))
+        cross_section_positions = np.arange(25, max_arc_length, 25)  # μm
+        for pos in cross_section_positions:
+            # Use scale_factor to make cross-sections more visible
+            result = get_cross_section_at_arc_length(skeleton, radii, pos, scale_factor=2.0)
+            if result is not None:
+                Xc, Yc, Zc, _ = result
+                # Draw circle outline
+                ax_3d.plot(Xc, Yc, Zc, color='black', linewidth=1.5, alpha=0.8)
+                # Add small annotation
+                ax_3d.text(Xc.mean(), Yc.mean(), Zc.max() + 0.3,
+                           f'{int(pos)}', fontsize=6, ha='center', va='bottom', alpha=0.7)
+
+        # Generate straightened tube (with slight smoothing for cleaner visualization)
+        arc_lengths, straight_radii = straighten_axon(skeleton, radii, smooth_window=5)
         # Offset each axon vertically for visibility
         offset = i * (r_max * 3)
         Xs, Ys, Zs, Rs = generate_straight_tube_mesh(arc_lengths, straight_radii)
@@ -349,6 +465,10 @@ def plot_representative_axons(data: dict, indices: Tuple[int, int, int],
     ax_straight.set_zlabel('', fontsize=font_settings['label_size'])
     ax_straight.set_title('Straightened Axons\n(caliber variation along length)',
                           fontsize=font_settings['title_size'], fontweight=font_settings['weight'])
+
+    # Set x-axis ticks at 25 μm intervals to match cross-sections
+    x_max = ax_straight.get_xlim()[1]
+    ax_straight.set_xticks(np.arange(0, x_max + 1, 25))
 
     # Set viewing angle for straightened view (side view - looking along Y axis)
     ax_straight.view_init(elev=15, azim=-85)
