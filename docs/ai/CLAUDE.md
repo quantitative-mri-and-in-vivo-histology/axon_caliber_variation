@@ -2,20 +2,31 @@
 
 ## Project Overview
 
-This repository contains Python-based analysis and figure generation code for the manuscript on axon caliber variability and the effective axon radius, based on publicly available high-resolution axon segmentation data (Abdollazadeh et al., Nat. Commun., 2025; originally from a 2021 dataset).
+This repository contains Python-based analysis and figure generation code for the manuscript on axon caliber variability and the effective axon radius, based on publicly available high-resolution axon segmentation data.
 
-The dataset consists of 10 labeled 3D volumes of myelinated axons from 5 rats:
-- 2 rats with TBI (traumatic brain injury)
-- 3 rats with sham operation
+### Datasets
+
+**1. Rat Brain 3D Segmentation Data** (Abdollazadeh et al., Nat. Commun., 2025)
+- 10 labeled 3D volumes of myelinated axons from 5 rats
+- 2 rats with TBI (traumatic brain injury), 3 rats with sham operation
 - Each rat has both ipsilateral and contralateral hemisphere volumes
+- Multiple white matter tract populations identified by orientation-based clustering
+- Used for: along-bundle stability analysis, effective radius profiles
 
-Each volume contains multiple white matter tract populations identified by orientation-based clustering.
+**2. Human Corpus Callosum 2D Light Microscopy Data** (`data/raw_LM/`)
+- Large-scale 2D axon radius distributions from human corpus callosum
+- Pre-processed histogram data (bin edges, bin centers, counts)
+- Multiple radius measures: circular equivalent, major axis, minor axis
+- Multiple subjects (sub-ev01, sub-ev02) with ROI metadata
+- Used for: parametric distribution fitting
 
-The focus is on characterizing and visualizing:
+### Analysis Focus
+
 - Axon radius distributions in white matter tracts
 - Effective MRI-visible radius (r_eff = (⟨r⁶⟩/⟨r²⟩)^(1/4)) along tract length
 - Per-slice radius profiles and global pooled statistics
 - Comparisons between sham and TBI groups
+- **Parametric distribution fitting** for radius distributions (following Sepehrband et al., 2016)
 
 ## Repository Structure
 
@@ -26,7 +37,7 @@ config/
 ├── plot_settings.yaml      # Global plot styling settings (colors, fonts, etc.)
 │
 data/
-├── raw/                    # Raw .mat files organized by condition and hemisphere
+├── raw/                    # Raw .mat files organized by condition and hemisphere (rat 3D data)
 │   ├── Sham_25_ipsi/
 │   │   └── HM_25_ipsi_myelinated_axons.mat
 │   ├── Sham_25_contra/
@@ -34,6 +45,17 @@ data/
 │   ├── TBI_2_ipsi/
 │   │   └── HM_2_ipsi_myelinated_axons.mat
 │   └── ...
+│
+├── raw_LM/                 # Human corpus callosum 2D light microscopy data
+│   ├── desc-binCenters_radii.tsv      # Histogram bin centers
+│   ├── desc-binEdges_radii.tsv        # Histogram bin edges
+│   ├── desc-countsCircularEq_radii.tsv    # Counts (circular equivalent radius)
+│   ├── desc-countsMajorAxis_radii.tsv     # Counts (major axis radius)
+│   ├── desc-countsMinorAxis_radii.tsv     # Counts (minor axis radius)
+│   ├── roiinfo.tsv                    # ROI metadata
+│   ├── desc-polygons_roicoords.tsv    # ROI polygon coordinates
+│   ├── sub-ev01/                      # Subject 1 data
+│   └── sub-ev02/                      # Subject 2 data
 │
 ├── processed/              # Processed NPZ files organized by microscopy type
 │   ├── HM/                 # High magnification data
@@ -102,6 +124,67 @@ examples/                   # Example scripts for batch processing and visualiza
 - Parallel processing with multiprocessing Pool
 - Memory-efficient: reads slices directly from file
 - Axon count filtering (min_axon_fraction) for symmetric slice selection
+
+**Parametric Distribution Fitting** (human corpus callosum data)
+
+Fit parametric distributions to axon radius histograms following the methodology of Sepehrband et al. (2016, NeuroImage). This analysis applies to the 2D light microscopy data in `data/raw_LM/`.
+
+*Candidate distributions* (in order of expected performance):
+- **Generalized Extreme Value (GEV)** - best performer in Sepehrband et al.
+- Gamma - commonly used baseline
+- Log-normal
+- Inverse Gaussian
+- Log-logistic
+- Birnbaum-Saunders
+
+*Light microscopy resolution limit*:
+- Small axons with radius r < 0.3 μm cannot be reliably resolved
+- Fits must account for this **left-truncation** (or left-censoring)
+- Options:
+  1. Fit truncated distributions with lower bound at r_min = 0.3 μm
+  2. Fit to histogram data starting from first reliable bin
+  3. Model the truncation explicitly in the likelihood function
+- Report both raw fitted parameters and truncation-corrected estimates
+
+*Fitting approach*:
+- Input: histogram counts from TSV files (bin edges + counts)
+- Method: maximum likelihood estimation (MLE) on binned data
+- Goodness-of-fit: AIC, BIC, Kolmogorov-Smirnov test
+- Output: fitted parameters, confidence intervals, diagnostic plots
+
+*Reference*: Sepehrband F, et al. (2016). "Towards higher sensitivity and stability of axon diameter estimation with diffusion-weighted MRI." NMR Biomed. 29(3):293-308. PMID: 27303273
+
+**Combined Distribution Fitting** ([fit_combined_distributions.py](examples/fit_combined_distributions.py))
+
+Compares distribution fits and radius estimation bias across Human CC and Rat WM datasets:
+
+*Outputs*:
+1. **Summary figure** (2×4 layout): histogram + AIC + r_arith bias + r_eff bias for each dataset
+2. **Scatter figures** (2×7 layout): subsampled vs whole-section values for Raw + 6 distributions
+
+*Key features*:
+- 6 Sepehrband distributions: GEV, Inverse Gaussian, Birnbaum-Saunders, Log Normal, Log Logistic, Gamma
+- Fixed colors per distribution (consistent across all panels)
+- Per-ROI/volume fitting with summed AIC aggregation
+- Subsampling analysis: 50 subsamples × 1000 axons each, showing mean ± std error bars
+- Optional EM correction for human data (`--em-correction` flag)
+
+*Usage*:
+```bash
+python examples/fit_combined_distributions.py \
+    --human-data data/raw_LM \
+    --rat-data data/processed/LM \
+    --output fig/combined_distribution_fits.png
+
+# With EM correction for human data:
+python examples/fit_combined_distributions.py \
+    --human-data data/raw_LM \
+    --rat-data data/processed/LM \
+    --output fig/combined_distribution_fits_em.png \
+    --em-correction data/raw_EM
+```
+
+*Key finding*: Best AIC (GEV) ≠ best r_eff predictor. Log Normal has near-zero r_eff bias for Human CC despite worse AIC.
 
 ### Visualization
 
