@@ -11,6 +11,9 @@ This repository contains Python-based analysis and figure generation code for th
 - 2 rats with TBI (traumatic brain injury), 3 rats with sham operation
 - Each rat has both ipsilateral and contralateral hemisphere volumes
 - Multiple white matter tract populations identified by orientation-based clustering
+- Available in two magnifications:
+  - **LM (Low Magnification)**: Primary dataset for all manuscript figures and analyses
+  - **HM (High Magnification)**: Small test set for algorithm validation only; data too limited to report
 - Used for: along-bundle stability analysis, effective radius profiles
 
 **2. Human Corpus Callosum 2D Light Microscopy Data** (`data/raw_LM/`)
