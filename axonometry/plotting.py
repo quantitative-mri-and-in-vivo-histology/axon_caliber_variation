@@ -5,8 +5,9 @@ Provides consistent styling across all plots by loading settings from
 config/plot_settings.yaml.
 """
 
+import string
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
@@ -80,6 +81,11 @@ class PlotSettings:
         return self._settings.get('grid', {})
 
     @property
+    def frame(self) -> Dict[str, Any]:
+        """Frame/box settings."""
+        return self._settings.get('frame', {'box': True, 'linewidth': 1.0})
+
+    @property
     def error_bars(self) -> Dict[str, Any]:
         """Error bar settings."""
         return self._settings.get('error_bars', {})
@@ -93,6 +99,18 @@ class PlotSettings:
     def line(self) -> Dict[str, Any]:
         """Line plot settings."""
         return self._settings.get('line', {})
+
+    @property
+    def panel_labels(self) -> Dict[str, Any]:
+        """Panel label settings (a, b, c, ...)."""
+        return self._settings.get('panel_labels', {
+            'enabled': True,
+            'fontsize': 16,
+            'fontweight': 'bold',
+            'position': [-0.12, 1.05],
+            'va': 'bottom',
+            'ha': 'left'
+        })
 
     def get_group_color(self, group: str) -> str:
         """Get color for a group (sham/tbi), case-insensitive."""
@@ -115,3 +133,108 @@ def get_plot_settings() -> PlotSettings:
     if _default_settings is None:
         _default_settings = PlotSettings()
     return _default_settings
+
+
+def style_axis(
+    ax,
+    settings: Optional[PlotSettings] = None,
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
+) -> None:
+    """
+    Apply consistent font styling to an axis.
+
+    Args:
+        ax: Matplotlib axis
+        settings: Optional PlotSettings instance. If None, uses default.
+        xlabel: Optional x-axis label
+        ylabel: Optional y-axis label
+    """
+    if settings is None:
+        settings = get_plot_settings()
+
+    fonts = settings.fonts
+    grid_settings = settings.grid
+    frame_settings = settings.frame
+
+    # Apply tick label size
+    ax.tick_params(labelsize=fonts.get('tick_size', 12))
+
+    # Apply axis labels if provided
+    if xlabel is not None:
+        ax.set_xlabel(xlabel, fontsize=fonts.get('label_size', 14))
+    elif ax.get_xlabel():
+        ax.set_xlabel(ax.get_xlabel(), fontsize=fonts.get('label_size', 14))
+
+    if ylabel is not None:
+        ax.set_ylabel(ylabel, fontsize=fonts.get('label_size', 14))
+    elif ax.get_ylabel():
+        ax.set_ylabel(ax.get_ylabel(), fontsize=fonts.get('label_size', 14))
+
+    # Apply grid (disabled by default)
+    if grid_settings.get('enabled', False):
+        ax.grid(True, alpha=grid_settings.get('alpha', 0.3))
+    else:
+        ax.grid(False)
+
+    # Apply frame/box settings
+    if frame_settings.get('box', True):
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(frame_settings.get('linewidth', 1.0))
+
+
+def add_panel_labels(
+    axes: Union[List, "np.ndarray"],
+    labels: Optional[List[str]] = None,
+    settings: Optional[PlotSettings] = None
+) -> None:
+    """
+    Add panel labels (a, b, c, ...) to a list of axes.
+
+    Uses settings from plot_settings.yaml for consistent styling.
+
+    Args:
+        axes: List of matplotlib axes, or 2D array from plt.subplots()
+        labels: Optional custom labels. If None, uses lowercase letters (a, b, c, ...)
+        settings: Optional PlotSettings instance. If None, uses default.
+
+    Example:
+        fig, axes = plt.subplots(2, 3)
+        add_panel_labels(axes)  # Adds 'a' through 'f'
+    """
+    import numpy as np
+
+    if settings is None:
+        settings = get_plot_settings()
+
+    panel_settings = settings.panel_labels
+    if not panel_settings.get('enabled', True):
+        return
+
+    # Flatten axes array if needed
+    if isinstance(axes, np.ndarray):
+        axes_flat = axes.flat
+    else:
+        axes_flat = axes
+
+    # Generate default labels if not provided
+    if labels is None:
+        labels = list(string.ascii_lowercase[:len(list(axes_flat))])
+        # Reset iterator
+        if isinstance(axes, np.ndarray):
+            axes_flat = axes.flat
+        else:
+            axes_flat = axes
+
+    pos = panel_settings.get('position', [-0.12, 1.05])
+
+    for ax, label in zip(axes_flat, labels):
+        ax.text(
+            pos[0], pos[1], label,
+            transform=ax.transAxes,
+            fontsize=panel_settings.get('fontsize', 16),
+            fontweight=panel_settings.get('fontweight', 'bold'),
+            va=panel_settings.get('va', 'bottom'),
+            ha=panel_settings.get('ha', 'left')
+        )

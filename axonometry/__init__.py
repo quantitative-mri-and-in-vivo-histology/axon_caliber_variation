@@ -58,6 +58,8 @@ from .plotting import (
     load_plot_settings,
     PlotSettings,
     get_plot_settings,
+    add_panel_labels,
+    style_axis,
 )
 
 __version__ = "0.1.0"
@@ -101,4 +103,6 @@ __all__ = [
     "load_plot_settings",
     "PlotSettings",
     "get_plot_settings",
+    "add_panel_labels",
+    "style_axis",
 ]

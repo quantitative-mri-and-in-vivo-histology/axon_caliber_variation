@@ -331,9 +331,14 @@ Opens Neuroglancer viewer with multi-resolution support.
 
 All plot scripts in `examples/` must use centralized plot settings from `config/plot_settings.yaml` via the `axonometry` module. This ensures consistent styling across all figures.
 
+**Figure conventions:**
+- **No suptitles**: Do not add figure-level titles (`fig.suptitle()`)
+- **No subplot titles**: Do not add individual panel titles (`ax.set_title()`)
+- **Panel labels**: Add lowercase letter labels (a, b, c, ...) to each panel
+
 **Usage in plot scripts:**
 ```python
-from axonometry import get_plot_settings
+from axonometry import get_plot_settings, add_panel_labels
 
 settings = get_plot_settings()
 
@@ -345,14 +350,15 @@ color = settings.get_group_color('TBI')   # '#d62728' (red)
 marker = settings.get_marker('CC')   # 'o' (circle)
 marker = settings.get_marker('CG')   # '^' (triangle)
 
-# Font settings
-fontsize = settings.fonts['label_size']      # 12
-fontsize = settings.fonts['title_size']      # 14
-fontsize = settings.fonts['legend_size']     # 10
-fontweight = settings.fonts['weight']        # 'bold'
+# Apply consistent styling to axis (fonts, grid, box frame)
+from axonometry import style_axis
+style_axis(ax)                          # Apply all settings
+style_axis(ax, xlabel='X', ylabel='Y')  # With labels
 
-# Grid settings
-ax.grid(settings.grid['enabled'], alpha=settings.grid['alpha'])
+# Or manually:
+ax.set_xlabel('X', fontsize=settings.fonts['label_size'])  # 14
+ax.tick_params(labelsize=settings.fonts['tick_size'])      # 12
+ax.legend(fontsize=settings.fonts['legend_size'])          # 11
 
 # Error bar settings
 ax.errorbar(..., capsize=settings.error_bars['capsize'],
@@ -370,6 +376,12 @@ ax.plot(..., linewidth=settings.line['linewidth'],
         markersize=settings.line['marker_size'])
 ax.fill_between(..., alpha=settings.line['fill_alpha'])
 
+# Panel labels (a, b, c, ...) - add after tight_layout()
+fig, axes = plt.subplots(2, 3)
+# ... create plots ...
+plt.tight_layout()
+add_panel_labels(axes)  # Adds 'a' through 'f' with consistent styling
+
 # Figure DPI
 plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
 ```
@@ -377,9 +389,11 @@ plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
 **Settings file structure** (`config/plot_settings.yaml`):
 - `colors`: Group colors (sham, tbi), indicator lines (mean_line, median_line)
 - `markers`: Population markers (cc, cg, default)
-- `figure`: DPI, default figure size
-- `fonts`: Label, title, legend sizes and weight
-- `grid`: Enable flag and alpha
+- `figure`: DPI, default figure size, suptitle/subplot_titles flags
+- `panel_labels`: Enabled, fontsize, fontweight, position, alignment
+- `fonts`: label_size (14), tick_size (12), title_size (16), legend_size (11)
+- `grid`: enabled (false), alpha
+- `frame`: box (true), linewidth - controls plot border
 - `error_bars`: Capsize, thickness, linewidth, alpha
 - `histogram`: Bin count, alpha, edge color
 - `line`: Linewidth, marker size, fill alpha

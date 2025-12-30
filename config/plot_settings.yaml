@@ -22,18 +22,34 @@ figure:
   dpi: 200
   default_figsize: [10, 6]
   tight_layout: true
+  suptitle: false          # No figure-level titles
+  subplot_titles: false    # No individual panel titles
+
+# Panel labels (a, b, c, ...)
+panel_labels:
+  enabled: true
+  fontsize: 18
+  fontweight: "bold"
+  position: [-0.18, 0.98]  # [x, y] in axes coordinates (above ylabel)
+  va: "bottom"
+  ha: "right"
 
 # Font settings
 fonts:
-  label_size: 12
-  title_size: 14
-  legend_size: 10
+  label_size: 14       # xlabel, ylabel
+  tick_size: 12        # tick labels
+  title_size: 16       # panel titles (if used)
+  legend_size: 11      # legend text
   weight: "normal"
 
-# Grid settings
+# Grid and frame settings
 grid:
-  alpha: 0.3
   enabled: false
+  alpha: 0.3
+
+frame:
+  box: true            # Show all four spines (box around plot)
+  linewidth: 1.0       # Spine linewidth
 
 # Error bar settings
 error_bars:
