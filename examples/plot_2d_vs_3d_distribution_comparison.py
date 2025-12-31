@@ -2,8 +2,8 @@
 """
 Compare 2D slice-based vs 3D skeleton-based radius distributions.
 
-Creates a 1×4 panel figure:
-(a) PDF stability across slices for one representative sample (median ± IQR)
+Creates a 2×2 panel figure:
+(a) PDF stability across slices for multiple samples (small/medium/large mean radius)
 (b) QQ-plot comparing 2D vs 3D distributions with slice variability
 (c) Arithmetic mean radius scatter plot (2D vs 3D) for all samples
 (d) Effective radius scatter plot (2D vs 3D) for all samples
@@ -246,11 +246,10 @@ def plot_pdf_stability(ax, slice_file: Path, radius_type: str = 'circular',
                   fontweight=font_settings['weight'])
     ax.set_ylabel('Probability Density', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_title('(a) PDF Stability Across Slices', fontsize=font_settings['label_size'],
-                 fontweight=font_settings['weight'])
     ax.legend(loc='upper right', fontsize=font_settings['legend_size'])
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
+    ax.set_box_aspect(1)  # Square subplot box
 
 
 def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
@@ -317,11 +316,10 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
                   fontweight=font_settings['weight'])
     ax.set_ylabel('Probability Density', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_title('(a) PDF Stability Across Slices', fontsize=font_settings['label_size'],
-                 fontweight=font_settings['weight'])
     ax.legend(loc='upper right', fontsize=font_settings['legend_size'])
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
+    ax.set_box_aspect(1)  # Square subplot box
 
 
 def plot_qq_with_variability(ax, slice_file: Path, axon_file: Path,
@@ -411,10 +409,8 @@ def plot_qq_with_variability(ax, slice_file: Path, axon_file: Path,
                   fontweight=font_settings['weight'])
     ax.set_ylabel('2D Quantiles (μm)', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_title('(b) QQ-Plot (2D vs 3D)', fontsize=font_settings['label_size'],
-                 fontweight=font_settings['weight'])
     ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
-    ax.set_aspect('equal')
+    ax.set_box_aspect(1)  # Square subplot box
     ax.set_xlim(min_val, max_val)
     ax.set_ylim(min_val, max_val)
 
@@ -612,14 +608,12 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
 
     ax.set_xlim(min_val, max_val)
     ax.set_ylim(min_val, max_val)
-    ax.set_aspect('equal')
+    ax.set_box_aspect(1)  # Square subplot box
 
     if metric == 'mean_radius':
-        title = f'{panel_label} Mean Radius'
         xlabel = '3D Mean Radius (μm)'
         ylabel = '2D Mean Radius (μm)'
     else:
-        title = f'{panel_label} Effective Radius'
         xlabel = '3D Effective Radius (μm)'
         ylabel = '2D Effective Radius (μm)'
 
@@ -627,9 +621,11 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
                   fontweight=font_settings['weight'])
     ax.set_ylabel(ylabel, fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_title(f'{title}\nr = {r:.3f}', fontsize=font_settings['label_size'],
-                 fontweight=font_settings['weight'])
     ax.legend(loc='upper left', fontsize=font_settings['legend_size'] - 1, framealpha=0.9)
+
+    # Add correlation as text annotation
+    ax.text(0.95, 0.05, f'r = {r:.3f}', transform=ax.transAxes,
+            fontsize=font_settings['legend_size'], ha='right', va='bottom')
 
 
 def main():
@@ -640,7 +636,7 @@ def main():
 
     parser.add_argument('--data-dir', type=Path, default=Path('data/processed/LM'),
                         help='Directory containing LM slice and axon profiles')
-    parser.add_argument('--output', type=Path, default=Path('fig/distribution_2d_vs_3d_comparison.png'),
+    parser.add_argument('--output', type=Path, default=Path('fig/distribution_2d_vs_3d_comparison.svg'),
                         help='Output figure path')
     parser.add_argument('--radius-type', type=str, default='circular',
                         choices=['circular', 'minor'],
@@ -680,27 +676,27 @@ def main():
         m3d = load_3d_metrics(af, labels)
         all_metrics.append((m2d, m3d, sn))
 
-    # Create figure
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    # Create figure (2x2 layout)
+    fig, axes = plt.subplots(2, 2, figsize=(10, 9))
 
     # Panel (a): PDF stability with 3 samples (small, medium, high mean radius)
     logger.info("\nPlotting panel (a): PDF stability (3 samples)...")
-    plot_pdf_stability_multi(axes[0], pdf_samples, args.radius_type, args.x_max)
+    plot_pdf_stability_multi(axes[0, 0], pdf_samples, args.radius_type, args.x_max)
 
     # Panel (b): QQ-plot (using largest sample)
     logger.info("\nPlotting panel (b): QQ-plot...")
-    plot_qq_with_variability(axes[1], slice_file, axon_file, pop_labels,
+    plot_qq_with_variability(axes[0, 1], slice_file, axon_file, pop_labels,
                              args.radius_type)
 
     # Panel (c): Mean radius scatter
     logger.info("\nPlotting panel (c): Mean radius scatter...")
-    plot_ensemble_scatter(axes[2], all_metrics, 'mean_radius', '(c)')
+    plot_ensemble_scatter(axes[1, 0], all_metrics, 'mean_radius', '(c)')
 
     # Panel (d): Effective radius scatter
     logger.info("\nPlotting panel (d): Effective radius scatter...")
-    plot_ensemble_scatter(axes[3], all_metrics, 'r_eff', '(d)')
+    plot_ensemble_scatter(axes[1, 1], all_metrics, 'r_eff', '(d)')
 
-    plt.tight_layout()
+    plt.subplots_adjust(wspace=0.25, hspace=0.25)
 
     # Save
     args.output.parent.mkdir(parents=True, exist_ok=True)

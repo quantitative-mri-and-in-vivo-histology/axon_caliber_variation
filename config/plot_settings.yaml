@@ -20,6 +20,7 @@ markers:
 # Figure settings
 figure:
   dpi: 200
+  format: "svg"            # Default output format (svg or png)
   default_figsize: [10, 6]
   tight_layout: true
   suptitle: false          # No figure-level titles
