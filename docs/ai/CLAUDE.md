@@ -335,6 +335,8 @@ All plot scripts in `examples/` must use centralized plot settings from `config/
 - **No suptitles**: Do not add figure-level titles (`fig.suptitle()`)
 - **No subplot titles**: Do not add individual panel titles (`ax.set_title()`)
 - **Panel labels**: Add lowercase letter labels (a, b, c, ...) to each panel
+- **Units in square brackets**: Use square brackets for units in axis labels (e.g., `Radius [μm]`, not `Radius (μm)`)
+- **Radius notation**: Use `$\bar{r}$` for arithmetic mean radius, `$r_{\mathrm{MRI}}$` for effective MRI-visible radius
 
 **Usage in plot scripts:**
 ```python

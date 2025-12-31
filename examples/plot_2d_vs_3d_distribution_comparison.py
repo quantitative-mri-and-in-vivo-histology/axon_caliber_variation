@@ -242,9 +242,9 @@ def plot_pdf_stability(ax, slice_file: Path, radius_type: str = 'circular',
     ax.fill_between(x, y_lo, y_hi, alpha=0.3, color='steelblue', label='IQR')
     ax.plot(x, y_med, color='steelblue', linewidth=line_settings['linewidth'], label='Median')
 
-    ax.set_xlabel('Radius (μm)', fontsize=font_settings['label_size'],
+    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_ylabel('Probability Density', fontsize=font_settings['label_size'],
+    ax.set_ylabel('Probability density', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
     ax.legend(loc='upper right', fontsize=font_settings['legend_size'])
     ax.set_xlim(0, x_max)
@@ -253,14 +253,16 @@ def plot_pdf_stability(ax, slice_file: Path, radius_type: str = 'circular',
 
 
 def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
+                              data_dir: Path,
                               radius_type: str = 'circular',
                               x_max: float = 2.0) -> None:
     """
-    Plot PDF stability for multiple samples with different mean radii.
+    Plot PDF comparison: 3D (solid) vs 2D (dashed + IQR) for multiple samples.
 
     Args:
         ax: Matplotlib axes
         samples: List of (slice_file, axon_file, sample_name, mean_radius) tuples
+        data_dir: Directory containing population JSON files
         radius_type: 'circular' or 'minor'
         x_max: Maximum x-axis value for cropping
     """
@@ -269,12 +271,13 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
 
     # Colors for small, medium, high
     colors = ['#2ecc71', '#3498db', '#e74c3c']  # green, blue, red
-    labels = ['Small', 'Medium', 'Large']
+    sample_info = []  # Store (color, short_name, mean_r) for custom legend
 
-    for idx, (slice_file, _, sample_name, mean_r) in enumerate(samples):
-        npz = np.load(slice_file)
-        bin_centers = npz['bin_centers']
-        histograms = npz[f'histograms_{radius_type}']
+    for idx, (slice_file, axon_file, sample_name, mean_r) in enumerate(samples):
+        # Load 2D slice data
+        npz_2d = np.load(slice_file)
+        bin_centers = npz_2d['bin_centers']
+        histograms = npz_2d[f'histograms_{radius_type}']
 
         n_slices, n_bins = histograms.shape
 
@@ -293,30 +296,84 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
 
         pdfs_valid = pdfs[valid_slices]
 
-        # Compute median and IQR
-        pdf_median = np.median(pdfs_valid, axis=0)
-        pdf_lo = np.percentile(pdfs_valid, 25, axis=0)
-        pdf_hi = np.percentile(pdfs_valid, 75, axis=0)
+        # Compute 2D median and IQR
+        pdf_2d_median = np.median(pdfs_valid, axis=0)
+        pdf_2d_lo = np.percentile(pdfs_valid, 25, axis=0)
+        pdf_2d_hi = np.percentile(pdfs_valid, 75, axis=0)
+
+        # Load 3D axon data and filter by population
+        population = sample_name.split('_')[-1].lower()  # e.g., 'cc' or 'cg'
+        base_name = slice_file.stem.replace(f'_{population}_slice_profiles', '')
+        pop_labels = load_population_labels(data_dir, base_name, population)
+
+        npz_3d = np.load(axon_file, allow_pickle=True)
+        axon_labels = npz_3d['labels']
+        radii_profiles = npz_3d['radii_profiles_um']
+
+        # Collect all 3D radii for this population
+        all_radii_3d = []
+        for i, label in enumerate(axon_labels):
+            if int(label) in pop_labels:
+                all_radii_3d.extend(radii_profiles[i])
+        all_radii_3d = np.array(all_radii_3d)
+
+        # Compute 3D PDF using same bin centers
+        bin_width = bin_centers[1] - bin_centers[0]
+        bin_edges = np.concatenate([
+            [bin_centers[0] - bin_width / 2],
+            bin_centers + bin_width / 2
+        ])
+        hist_3d, _ = np.histogram(all_radii_3d, bins=bin_edges)
+        pdf_3d = histogram_to_pdf(hist_3d, bin_centers)
 
         # Crop to x_max
         mask = bin_centers <= x_max
         x = bin_centers[mask]
-        y_med = pdf_median[mask]
-        y_lo = pdf_lo[mask]
-        y_hi = pdf_hi[mask]
+        y_2d_med = pdf_2d_median[mask]
+        y_2d_lo = pdf_2d_lo[mask]
+        y_2d_hi = pdf_2d_hi[mask]
+        y_3d = pdf_3d[mask]
 
         # Plot
         color = colors[idx]
-        label = f"{labels[idx]} (r̄={mean_r:.2f})"
+        # Extract short name like "25 ipsi CC" from "sham_25_ipsi_CC"
+        parts = sample_name.split('_')
+        short_name = f"{parts[1]} {parts[2]} {parts[3]}"
 
-        ax.fill_between(x, y_lo, y_hi, alpha=0.2, color=color)
-        ax.plot(x, y_med, color=color, linewidth=line_settings['linewidth'], label=label)
+        # 3D: solid line (no label, we'll build custom legend)
+        ax.plot(x, y_3d, color=color, linewidth=line_settings['linewidth'],
+                linestyle='-')
+        # 2D: IQR shading only (no median line)
+        ax.fill_between(x, y_2d_lo, y_2d_hi, alpha=0.3, color=color)
 
-    ax.set_xlabel('Radius (μm)', fontsize=font_settings['label_size'],
+        # Store info for custom legend
+        sample_info.append((color, short_name, mean_r))
+
+    # Build custom legend
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    handles = []
+    labels = []
+
+    # Style indicators (first row)
+    handles.append(Line2D([0], [0], color='gray', linewidth=line_settings['linewidth'], linestyle='-'))
+    labels.append('3D')
+    handles.append(Patch(facecolor='gray', alpha=0.3, edgecolor='none'))
+    labels.append('2D IQR')
+
+    # Sample indicators with colors
+    for color, short_name, mean_r in sample_info:
+        handles.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=color,
+                              markersize=8, markeredgecolor='none'))
+        labels.append(rf"{short_name} ($\bar{{r}}$ = {mean_r:.2f})")
+
+    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_ylabel('Probability Density', fontsize=font_settings['label_size'],
+    ax.set_ylabel('Probability density', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    ax.legend(handles, labels, loc='upper right', fontsize=font_settings['legend_size'] - 1,
+              framealpha=0.9)
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
     ax.set_box_aspect(1)  # Square subplot box
@@ -405,9 +462,9 @@ def plot_qq_with_variability(ax, slice_file: Path, axon_file: Path,
     ax.plot(q_3d, q_2d_median, color='steelblue', linewidth=line_settings['linewidth'],
             label='Median')
 
-    ax.set_xlabel('3D Quantiles (μm)', fontsize=font_settings['label_size'],
+    ax.set_xlabel('3D axon radius quantile [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_ylabel('2D Quantiles (μm)', fontsize=font_settings['label_size'],
+    ax.set_ylabel('2D axon radius quantile [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
     ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
     ax.set_box_aspect(1)  # Square subplot box
@@ -611,11 +668,11 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
     ax.set_box_aspect(1)  # Square subplot box
 
     if metric == 'mean_radius':
-        xlabel = '3D Mean Radius (μm)'
-        ylabel = '2D Mean Radius (μm)'
+        xlabel = r'3D $\bar{r}$ [μm]'
+        ylabel = r'2D $\bar{r}$ [μm]'
     else:
-        xlabel = '3D Effective Radius (μm)'
-        ylabel = '2D Effective Radius (μm)'
+        xlabel = r'3D $r_{\mathrm{MRI}}$ [μm]'
+        ylabel = r'2D $r_{\mathrm{MRI}}$ [μm]'
 
     ax.set_xlabel(xlabel, fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
@@ -624,7 +681,11 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
     ax.legend(loc='upper left', fontsize=font_settings['legend_size'] - 1, framealpha=0.9)
 
     # Add correlation as text annotation
-    ax.text(0.95, 0.05, f'r = {r:.3f}', transform=ax.transAxes,
+    if p < 0.001:
+        p_str = f'p < 0.001'
+    else:
+        p_str = f'p = {p:.3f}'
+    ax.text(0.95, 0.05, f'$R$ = {r:.3f}, {p_str}', transform=ax.transAxes,
             fontsize=font_settings['legend_size'], ha='right', va='bottom')
 
 
@@ -681,7 +742,7 @@ def main():
 
     # Panel (a): PDF stability with 3 samples (small, medium, high mean radius)
     logger.info("\nPlotting panel (a): PDF stability (3 samples)...")
-    plot_pdf_stability_multi(axes[0, 0], pdf_samples, args.radius_type, args.x_max)
+    plot_pdf_stability_multi(axes[0, 0], pdf_samples, args.data_dir, args.radius_type, args.x_max)
 
     # Panel (b): QQ-plot (using largest sample)
     logger.info("\nPlotting panel (b): QQ-plot...")
