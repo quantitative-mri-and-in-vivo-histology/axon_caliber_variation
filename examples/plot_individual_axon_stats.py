@@ -15,11 +15,12 @@ import logging
 from pathlib import Path
 from typing import List, Tuple
 
+import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
 
-from axonometry import get_plot_settings, add_panel_labels, style_axis
+from axonometry import add_panel_labels, get_plot_settings, style_axis
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -250,34 +251,51 @@ def select_representative_axons(
         length = axon['length']
         n_points = len(profile)
         arc_lengths = np.linspace(0, length, n_points)
+
+        # Get full skeleton coordinates for this axon
+        skeleton_coords = None
+        file_idx = axon['file_idx']
+        if file_idx in skeleton_coords_by_file and skeleton_coords_by_file[file_idx] is not None:
+            skeleton_coords = skeleton_coords_by_file[file_idx][axon['idx']]
+
         result.append({
             'arc_lengths': arc_lengths,
             'radii': profile,
             'cv': axon['cv'],
             'label': axon['label'],
-            'file_idx': axon['file_idx'],
+            'file_idx': file_idx,
             'mean_radius': axon['mean_radius'],
             'length': length,
-            'centroid': axon.get('centroid'),  # Keep for bounding box computation
+            'centroid': axon.get('centroid'),
+            'skeleton_coords': skeleton_coords,  # Full skeleton for arc length annotation
         })
 
     return result
 
 
-def render_multiple_axons(volume: np.ndarray, labels: List[int], colors: List[str],
-                          voxel_size: float, ax, title: str = ''):
+def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List[str],
+                             voxel_size: float, ax, rep_axons: List[dict] = None,
+                             arc_interval: float = 10.0, subsample: int = 4,
+                             padding_um: float = 2.0):
     """
-    Render multiple axons in one volume view as maximum intensity projection.
+    Render multiple axons in 3D with local radius shown as color intensity.
+
+    Uses distance transform to compute local thickness at each voxel,
+    displays surface voxels in 3D scatter plot.
 
     Args:
         volume: 3D labeled volume (can be cropped region)
         labels: List of axon labels to extract
         colors: List of colors for each axon
         voxel_size: Voxel size in μm
-        ax: Matplotlib axis to plot on
-        title: Plot title
+        ax: Matplotlib 3D axis
+        rep_axons: List of representative axon dicts with skeleton_coords
+        arc_interval: Interval in μm for arc length markers (default 10)
+        subsample: Subsampling factor for surface points (default 4)
+        padding_um: Padding around bounding box in μm (default 2.0)
     """
-    from matplotlib.colors import to_rgba
+    from matplotlib.colors import to_rgb
+    from scipy import ndimage
 
     # Find combined bounding box for all axons
     all_coords = []
@@ -288,54 +306,186 @@ def render_multiple_axons(volume: np.ndarray, labels: List[int], colors: List[st
             all_coords.append(coords)
 
     if not all_coords:
-        ax.text(0.5, 0.5, 'No axons found', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title(title)
+        ax.text2D(0.5, 0.5, 'No axons found', ha='center', va='center', transform=ax.transAxes)
         return
 
     all_coords = np.vstack(all_coords)
     min_coords = all_coords.min(axis=0)
     max_coords = all_coords.max(axis=0)
 
-    # Add padding
-    pad = 10
-    min_coords = np.maximum(min_coords - pad, 0)
-    max_coords = np.minimum(max_coords + pad, np.array(volume.shape))
+    # Add padding in voxels (convert from μm)
+    pad_voxels = int(np.ceil(padding_um / voxel_size))
+    min_coords = np.maximum(min_coords - pad_voxels, 0)
+    max_coords = np.minimum(max_coords + pad_voxels, np.array(volume.shape))
 
     # Extract subvolume
     slices = tuple(slice(mi, ma) for mi, ma in zip(min_coords, max_coords))
     sub_volume = volume[slices]
-    shape = sub_volume.shape
 
-    # Project along shortest axis
-    proj_axis = np.argmin(shape)
-
-    # Create RGBA image
-    other_axes = [i for i in range(3) if i != proj_axis]
-    out_shape = (shape[other_axes[0]], shape[other_axes[1]], 4)
-    rgba = np.zeros(out_shape, dtype=np.float32)
+    # First pass: collect all surface points to compute principal axis
+    all_surface_points = []
+    axon_data = []  # Store (coords_um, point_colors, point_sizes) for each axon
 
     for label, color in zip(labels, colors):
         mask = sub_volume == label
         if not mask.any():
             continue
 
-        # MIP of mask
-        mask_mip = np.max(mask, axis=proj_axis)
+        # Find surface voxels (erode and subtract)
+        eroded = ndimage.binary_erosion(mask)
+        surface = mask & ~eroded
 
-        # Get RGBA color
-        c = to_rgba(color)
-        for ch in range(3):
-            rgba[:, :, ch] = np.where(mask_mip, c[ch], rgba[:, :, ch])
-        rgba[:, :, 3] = np.where(mask_mip, 1.0, rgba[:, :, 3])
+        # Get surface coordinates
+        surface_coords = np.argwhere(surface)
+        if len(surface_coords) == 0:
+            continue
 
-    # Compute extent in μm
-    extent = [0, shape[other_axes[1]] * voxel_size,
-              0, shape[other_axes[0]] * voxel_size]
+        # Subsample for performance (keep more points for denser appearance)
+        n_original = len(surface_coords)
+        if len(surface_coords) > 20000:
+            indices = np.random.choice(len(surface_coords),
+                                       size=min(len(surface_coords) // 2, 20000),
+                                       replace=False)
+            surface_coords = surface_coords[indices]
 
-    ax.imshow(rgba, origin='lower', extent=extent)
-    ax.set_xlabel('μm', fontsize=9)
-    ax.set_ylabel('μm', fontsize=9)
-    ax.set_aspect('equal')
+        # Log extent in Z (after rotation this will be the vertical extent)
+        z_extent = (surface_coords[:, 0].max() - surface_coords[:, 0].min()) * voxel_size
+        logging.info(f"  Axon {label}: {n_original} surface pts -> {len(surface_coords)} rendered, Z-extent: {z_extent:.1f} μm")
+
+        # Convert to physical coordinates (μm) - account for subvolume offset
+        coords_um = (surface_coords + min_coords) * voxel_size
+
+        # Use distance transform for smooth local radius estimation
+        dist = ndimage.distance_transform_edt(mask)
+        from scipy.ndimage import maximum_filter
+        filter_size = 21  # Captures radius up to ~0.5 μm at 0.05 μm voxels
+        dist_local_max = maximum_filter(dist, size=filter_size)
+        dist_values = dist_local_max[surface_coords[:, 0], surface_coords[:, 1], surface_coords[:, 2]]
+
+        # Convert to physical units (μm)
+        dist_values_um = dist_values * voxel_size
+
+        # Normalize to [0.15, 1.0] for intensity
+        dist_max_um = dist.max() * voxel_size
+        if dist_max_um > 0:
+            intensities = 0.15 + 0.85 * (dist_values_um / dist_max_um)
+            point_sizes = 1 + 7 * (dist_values_um / dist_max_um)
+        else:
+            intensities = np.ones(len(surface_coords)) * 0.5
+            point_sizes = np.ones(len(surface_coords)) * 3
+
+        # Create colors with varying intensity
+        base_color = np.array(to_rgb(color))
+        point_colors = np.outer(intensities, base_color)
+
+        all_surface_points.append(coords_um)
+        axon_data.append((coords_um, point_colors, point_sizes))
+
+    if not all_surface_points:
+        return
+
+    # Compute principal axes using PCA on all points
+    all_points = np.vstack(all_surface_points)
+    centroid = all_points.mean(axis=0)
+    centered = all_points - centroid
+
+    # SVD to get principal directions
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    pc1 = Vt[0]  # First principal component (axon direction)
+    pc2 = Vt[1]  # Second principal component (spread direction)
+
+    # Step 1: Rotate to align PC1 with Z (vertical)
+    target_z = np.array([0, 0, 1])
+    v = np.cross(pc1, target_z)
+    c = np.dot(pc1, target_z)
+
+    if np.linalg.norm(v) < 1e-6:
+        if c < 0:
+            R1 = np.diag([-1, -1, 1])
+        else:
+            R1 = np.eye(3)
+    else:
+        vx = np.array([[0, -v[2], v[1]],
+                       [v[2], 0, -v[0]],
+                       [-v[1], v[0], 0]])
+        R1 = np.eye(3) + vx + vx @ vx * (1 / (1 + c))
+
+    # Step 2: Rotate around Z to align PC2 with X (spread axons horizontally)
+    pc2_rotated = R1 @ pc2
+    pc2_xy = np.array([pc2_rotated[0], pc2_rotated[1], 0])
+    pc2_xy_norm = np.linalg.norm(pc2_xy)
+
+    if pc2_xy_norm > 1e-6:
+        pc2_xy = pc2_xy / pc2_xy_norm
+        # Angle to rotate around Z to align with X-axis
+        angle = np.arctan2(pc2_xy[1], pc2_xy[0])
+        cos_a, sin_a = np.cos(-angle), np.sin(-angle)
+        R2 = np.array([[cos_a, -sin_a, 0],
+                       [sin_a, cos_a, 0],
+                       [0, 0, 1]])
+    else:
+        R2 = np.eye(3)
+
+    # Combined rotation
+    R = R2 @ R1
+
+    # Check if we need to flip Z so that arc length 0 is at the bottom
+    # Use the first axon's skeleton to determine orientation
+    if rep_axons and len(rep_axons) > 0:
+        first_skel = rep_axons[0].get('skeleton_coords')
+        if first_skel is not None and len(first_skel) > 1:
+            first_skel = np.array(first_skel)
+            # Transform skeleton start and end points
+            start_rot = (first_skel[0] - centroid) @ R.T
+            end_rot = (first_skel[-1] - centroid) @ R.T
+            # If start has higher Z than end, flip Z
+            if start_rot[2] > end_rot[2]:
+                R = np.diag([1, 1, -1]) @ R  # Flip Z axis
+
+    # Apply rotation and plot each axon
+    all_rotated = []
+    for coords_um, point_colors, point_sizes in axon_data:
+        # Center, rotate, then shift back
+        rotated = (coords_um - centroid) @ R.T + centroid
+        all_rotated.append(rotated)
+
+        # Plot 3D scatter (x, y, z -> for vertical alignment, z is up)
+        # Point size varies with local radius for visible thickness variation
+        # rasterized=True ensures points are rendered as bitmap in SVG (not 60k vector elements)
+        ax.scatter(rotated[:, 0], rotated[:, 1], rotated[:, 2],
+                   c=point_colors, s=point_sizes, alpha=0.9, rasterized=True)
+
+    # Compute extent from rotated points
+    all_rotated = np.vstack(all_rotated)
+    rot_min = all_rotated.min(axis=0)
+    rot_max = all_rotated.max(axis=0)
+
+    # TODO: Arc length markers along skeleton (disabled for now)
+    # if rep_axons:
+    #     for axon, color in zip(rep_axons, colors):
+    #         skeleton_coords = axon.get('skeleton_coords')
+    #         ... (add back arc length annotation code)
+
+    # Compute extent from rotated bounding box
+    extent_um = rot_max - rot_min
+    logging.info(f"  3D view bounding box: {extent_um[0]:.1f} x {extent_um[1]:.1f} x {extent_um[2]:.1f} μm")
+
+    # Set tight axis limits with small padding
+    pad = 1.0  # μm
+    ax.set_xlim(rot_min[0] - pad, rot_max[0] + pad)
+    ax.set_ylim(rot_min[1] - pad, rot_max[1] + pad)
+    ax.set_zlim(rot_min[2] - pad, rot_max[2] + pad)
+
+    # Set box aspect based on actual data extent (preserves shape)
+    ax.set_box_aspect(extent_um + 2 * pad)
+
+    # Set viewing angle: slight rotation to show depth variation
+    ax.view_init(elev=5, azim=-85)
+    ax.invert_zaxis()  # Flip z-axis
+    ax.dist = 10  # Default
+
+    # Hide axes, grid, and panes for clean look
+    ax.set_axis_off()
 
 
 def plot_cv_vs_radius(
@@ -361,13 +511,15 @@ def plot_cv_vs_radius(
         g_ratio: Ratio of axon radius to fiber radius, default 0.6
         mat_files: List of mat files corresponding to each data tuple (for volume rendering)
     """
-    # Create figure with GridSpec: subplot (a) spans full height
+    # Create figure with GridSpec: subplot (a) spans full height, narrower column
     fig = plt.figure(figsize=(14, 8))
-    gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 1], height_ratios=[1, 1],
-                          wspace=0.32, hspace=0.28)
+    gs = fig.add_gridspec(2, 3, width_ratios=[0.6, 1, 1], height_ratios=[1, 1],
+                          wspace=0.25, hspace=0.28)
 
     # Subplot (a): 3D rendering - spans both rows
-    ax_vol = fig.add_subplot(gs[:, 0])
+    ax_vol = fig.add_subplot(gs[:, 0], projection='3d')
+    # Position: extend beyond bounds, crop left whitespace
+    ax_vol.set_position([-0.42, -0.5, 0.55, 2.0])
     # Subplots (b-e): 2x2 grid in columns 1-2
     ax_prof = fig.add_subplot(gs[0, 1])  # b
     ax_hist = fig.add_subplot(gs[0, 2])  # c
@@ -476,14 +628,14 @@ def plot_cv_vs_radius(
     # === (a): All 3 axons in one volume ===
     if vol is not None and rep_axons:
         # Get labels for all rep axons
-        labels = [ax['label'] for ax in rep_axons]
-        colors = cv_colors[:len(labels)]
+        axon_labels = [ax['label'] for ax in rep_axons]
+        colors = cv_colors[:len(axon_labels)]
 
-        render_multiple_axons(vol, labels, colors, voxel_size, ax_vol)
+        render_multiple_axons_3d(vol, axon_labels, colors, voxel_size, ax_vol,
+                                 rep_axons=rep_axons, arc_interval=10.0)
     else:
-        ax_vol.text(0.5, 0.5, 'Provide --mat-dir\nfor 3D rendering',
-                   ha='center', va='center', transform=ax_vol.transAxes, fontsize=12)
-    style_axis(ax_vol)
+        ax_vol.text2D(0.5, 0.5, 'Provide --mat-dir\nfor 3D rendering',
+                      ha='center', va='center', transform=ax_vol.transAxes, fontsize=12)
 
     # === (b): Straightened profiles ===
     if rep_axons:
@@ -491,8 +643,11 @@ def plot_cv_vs_radius(
             ax_prof.plot(axon['arc_lengths'], axon['radii'], color=cv_colors[i], linewidth=1.5,
                         label=f'{cv_labels[i]} (CV={axon["cv"]:.2f})')
 
-    style_axis(ax_prof, xlabel='Arc length (μm)', ylabel='Radius (μm)')
+    style_axis(ax_prof, xlabel='Arc length [μm]', ylabel='Axon radius [μm]')
     ax_prof.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    # Extend y-axis to make room for legend
+    ymin, ymax = ax_prof.get_ylim()
+    ax_prof.set_ylim(ymin, ymax * 1.15)
 
     # === (c): CV histogram ===
     ax_hist.hist(all_y, bins=hist_settings['bins'], color=main_color,
@@ -501,7 +656,7 @@ def plot_cv_vs_radius(
                     linewidth=line_settings['linewidth'], label=f'Mean = {np.mean(all_y):.3f}')
     ax_hist.axvline(np.median(all_y), color=settings.colors['median_line'], linestyle=':',
                     linewidth=line_settings['linewidth'], label=f'Median = {np.median(all_y):.3f}')
-    style_axis(ax_hist, xlabel='Coefficient of Variation (CV)', ylabel='Count')
+    style_axis(ax_hist, xlabel='CV', ylabel='Count')
     ax_hist.legend(loc='upper right', fontsize=font_settings['legend_size'])
 
     # === (d): CV vs radius ===
@@ -535,7 +690,7 @@ def plot_cv_vs_radius(
                markersize=line_settings['marker_size'], label='Median')
     ax_cv.fill_between(bin_centers[valid], bin_q25[valid], bin_q75[valid],
                        color=main_color, alpha=line_settings['fill_alpha'], label='IQR (25-75%)')
-    style_axis(ax_cv, xlabel='Along-axon mean radius (μm)', ylabel='Coefficient of Variation (CV)')
+    style_axis(ax_cv, xlabel=r'Along-axon $\bar{r}$ [μm]', ylabel='CV')
     ax_cv.legend(loc='upper right', fontsize=font_settings['legend_size'])
     ax_cv.set_xlim(0, x_max)
 
@@ -555,7 +710,7 @@ def plot_cv_vs_radius(
                 transform=ax_vel.transAxes, ha='right', va='top',
                 fontsize=font_settings['legend_size'],
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    style_axis(ax_vel, xlabel='Conduction Velocity (m/s)', ylabel='Count')
+    style_axis(ax_vel, xlabel='Conduction velocity [m/s]', ylabel='Count')
     ax_vel.legend(loc='upper right', fontsize=font_settings['legend_size'])
 
     # Set 1:1 aspect ratio for square subplots (not the tall 3D volume)
@@ -563,10 +718,27 @@ def plot_cv_vs_radius(
         ax.set_aspect('auto')
         ax.set_box_aspect(1)  # Square subplot
 
-    plt.tight_layout()
+    # Adjust layout for 2D subplots (start at ~12% from left)
+    fig.subplots_adjust(left=0.14, right=0.98, top=0.95, bottom=0.08, wspace=0.3, hspace=0.3)
+    # Restore 3D axes position
+    ax_vol.set_position([-0.42, -0.5, 0.55, 2.0])
 
-    # Add panel labels (a-e)
-    add_panel_labels(axes_list)
+    # Add panel labels (a-e) - handle 3D axis specially
+    panel_settings = settings.panel_labels
+    labels = ['a', 'b', 'c', 'd', 'e']
+    for ax, label in zip(axes_list, labels):
+        if hasattr(ax, 'text2D'):  # 3D axis
+            ax.text2D(panel_settings['position'][0], panel_settings['position'][1],
+                      label, transform=ax.transAxes,
+                      fontsize=panel_settings['fontsize'],
+                      fontweight=panel_settings['fontweight'],
+                      va=panel_settings['va'], ha=panel_settings['ha'])
+        else:
+            ax.text(panel_settings['position'][0], panel_settings['position'][1],
+                    label, transform=ax.transAxes,
+                    fontsize=panel_settings['fontsize'],
+                    fontweight=panel_settings['fontweight'],
+                    va=panel_settings['va'], ha=panel_settings['ha'])
 
     # Save figure
     output_file.parent.mkdir(parents=True, exist_ok=True)
