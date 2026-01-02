@@ -195,6 +195,10 @@ class AggregatedMetrics:
     empirical_r_eff_per_sample: np.ndarray = field(default_factory=lambda: np.array([]))
     # Distribution name to index mapping (for accessing all_r_arith/all_r_eff)
     dist_name_to_idx: Dict[str, int] = field(default_factory=dict)
+    # Per-sample AIC values: shape (n_distributions, n_samples)
+    all_aic: np.ndarray = field(default_factory=lambda: np.array([]))
+    # Win rate per distribution (fraction of samples where it has lowest AIC)
+    win_rate: Dict[str, float] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -444,17 +448,16 @@ CANDIDATE_DISTRIBUTIONS = [
     ('invgauss', stats.invgauss),        # Inverse gaussian
     ('fatiguelife', stats.fatiguelife),  # Birnbaum-Saunders
     ('lognorm', stats.lognorm),          # Log normal
-    ('fisk', stats.fisk),                # Log logistic
     ('gamma', stats.gamma),              # Gamma
 ]
 
 # Display names matching Sepehrband et al. (2016)
 DIST_DISPLAY_NAMES = {
-    'genextreme': 'Gen. Extreme Value',
+    'genextreme': 'Gen. Extreme\nValue',
     'lognorm': 'Log Normal',
-    'invgauss': 'Inverse Gaussian',
+    'invgauss': 'Inverse\nGaussian',
     'fisk': 'Log Logistic',
-    'fatiguelife': 'Birnbaum-Saunders',
+    'fatiguelife': 'Birnbaum-\nSaunders',
     'gamma': 'Gamma',
     'nakagami': 'Nakagami',
     'weibull_min': 'Weibull',
@@ -697,6 +700,17 @@ def fit_all_samples(
     summed_aic = np.nansum(all_aics, axis=1)
     n_successful_fits = np.sum(~np.isnan(all_aics), axis=1)
 
+    # Compute win rate: fraction of samples where each distribution has lowest AIC
+    win_counts = np.zeros(n_methods)
+    for sample_idx in range(n_samples):
+        sample_aics = all_aics[:, sample_idx]
+        if np.all(np.isnan(sample_aics)):
+            continue
+        winner_idx = np.nanargmin(sample_aics)
+        win_counts[winner_idx] += 1
+    n_valid_samples = np.sum(~np.all(np.isnan(all_aics), axis=0))
+    win_rate = win_counts / n_valid_samples if n_valid_samples > 0 else win_counts
+
     # Sort by summed AIC
     sort_idx = np.argsort(summed_aic)
     sorted_names = [all_method_names[i] for i in sort_idx]
@@ -722,6 +736,9 @@ def fit_all_samples(
     # Create dist_name_to_idx mapping (original order, not sorted)
     dist_name_to_idx = {name: idx for idx, (name, _) in enumerate(CANDIDATE_DISTRIBUTIONS)}
 
+    # Create win_rate dict
+    win_rate_dict = {all_method_names[i]: win_rate[i] for i in range(n_methods)}
+
     return AggregatedMetrics(
         distribution_names=sorted_names,
         summed_aic=summed_aic[sort_idx],
@@ -739,7 +756,9 @@ def fit_all_samples(
         all_r_eff=all_r_eff,
         empirical_r_arith_per_sample=empirical_r_arith,
         empirical_r_eff_per_sample=empirical_r_eff,
-        dist_name_to_idx=dist_name_to_idx
+        dist_name_to_idx=dist_name_to_idx,
+        all_aic=all_aics,
+        win_rate=win_rate_dict
     )
 
 
@@ -776,72 +795,463 @@ def create_combined_figure(
     rat_pooled: HistogramData,
     rat_largest: HistogramData,
     rat_metrics: AggregatedMetrics,
+    human_per_sample: PerSampleHistogramData,
+    rat_per_sample: PerSampleHistogramData,
     output_file: Path,
     top_n: int = 5
 ) -> None:
-    """Create 2x4 combined figure."""
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    """Create redesigned 4-panel figure.
 
-    # Fit distributions to largest samples for plotting
-    human_largest_fits = fit_all_distributions(human_largest)
-    rat_largest_fits = fit_all_distributions(rat_largest)
+    (a) Summed delta AIC: Total fit quality per distribution
+    (b) Win rate: Fraction of ROIs where each distribution wins
+    (c) r_arith bias: Both species on same axes
+    (d) r_eff bias: Both species on same axes
+    """
+    # Species colors (matching sample size figure)
+    HUMAN_COLOR = '#1f77b4'  # Blue
+    RAT_COLOR = '#d62728'    # Red
 
-    # Row 1: Human CC
-    _plot_histogram_with_fits(
-        axes[0, 0], human_largest, human_largest_fits,
-        title="Human Corpus Callosum",
-        subtitle=f"n={human_pooled.n_samples} ROIs",
-        top_n=top_n
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    ax_a, ax_b = axes[0]
+    ax_c, ax_d = axes[1]
+
+    # Set 1:1 aspect ratio for all panels
+    for ax in axes.flat:
+        ax.set_box_aspect(1)
+
+    # (a) Summed delta AIC
+    _plot_summed_delta_aic(
+        ax_a, human_metrics, rat_metrics,
+        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
     )
 
-    _plot_aic_comparison(
-        axes[0, 1], human_metrics,
-        title="Summed AIC"
+    # (b) Win rate
+    _plot_win_rate(
+        ax_b, human_metrics, rat_metrics,
+        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
     )
 
-    _plot_radius_comparison(
-        axes[0, 2], human_metrics, 'r_arith',
-        title=r"$r_{arith}$ (mean ± std)", xlim=20
+    # (c) r_arith bias - both species
+    _plot_radius_bias_both_species(
+        ax_c, human_metrics, rat_metrics,
+        radius_type='r_arith',
+        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
     )
 
-    _plot_radius_comparison(
-        axes[0, 3], human_metrics, 'r_eff',
-        title=r"$r_{eff}$ (mean ± std)", xlim=100
+    # (d) r_eff bias - both species
+    _plot_radius_bias_both_species(
+        ax_d, human_metrics, rat_metrics,
+        radius_type='r_eff',
+        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
     )
-
-    # Row 2: Rat WM
-    _plot_histogram_with_fits(
-        axes[1, 0], rat_largest, rat_largest_fits,
-        title="Rat White Matter",
-        subtitle=f"n={rat_pooled.n_samples} ROIs",
-        top_n=top_n
-    )
-
-    _plot_aic_comparison(
-        axes[1, 1], rat_metrics,
-        title="Summed AIC"
-    )
-
-    _plot_radius_comparison(
-        axes[1, 2], rat_metrics, 'r_arith',
-        title=r"$r_{arith}$ (mean ± std)", xlim=20
-    )
-
-    _plot_radius_comparison(
-        axes[1, 3], rat_metrics, 'r_eff',
-        title=r"$r_{eff}$ (mean ± std)", xlim=100
-    )
-
-    # Panel labels
-    labels = ['(a)', '(b)', '(c)', '(d)', '(e)', '(f)', '(g)', '(h)']
-    for ax, label in zip(axes.flat, labels):
-        ax.text(-0.08, 1.05, label, transform=ax.transAxes,
-                fontsize=settings.fonts['title_size'], fontweight='bold', va='top')
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
     plt.close()
     logger.info(f"Saved figure to {output_file}")
+
+
+def _plot_histogram_illustrative(
+    ax: plt.Axes,
+    hist_data: HistogramData,
+    fit_results: List[FitResult],
+    distributions: List[str] = ['genextreme', 'gamma', 'lognorm']
+) -> None:
+    """Plot histogram with selected fitted PDFs (illustrative panel)."""
+    bin_width = np.diff(hist_data.bin_edges).mean()
+    density = hist_data.counts / (hist_data.total_count * bin_width)
+
+    ax.bar(hist_data.bin_centers, density, width=bin_width * 0.9,
+           alpha=0.6, color='gray',
+           edgecolor='white', linewidth=0.5,
+           label='Data')
+
+    # Plot only specified distributions
+    for result in fit_results:
+        if result.distribution_name in distributions:
+            color = get_dist_color(result.distribution_name)
+            display_name = get_display_name(result.distribution_name)
+            ax.plot(hist_data.bin_centers, result.pdf_values, '-',
+                    color=color, linewidth=2, label=display_name)
+
+    ax.set_xlim(0, PLOT_XLIM_MAX)
+    ax.set_xlabel('Axon radius [μm]', fontsize=settings.fonts['label_size'])
+    ax.set_ylabel('Probability density', fontsize=settings.fonts['label_size'])
+    ax.legend(fontsize=settings.fonts['legend_size'], loc='upper right')
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
+
+
+def _plot_summed_delta_aic(
+    ax: plt.Axes,
+    human_metrics: AggregatedMetrics,
+    rat_metrics: AggregatedMetrics,
+    human_color: str,
+    rat_color: str
+) -> None:
+    """Plot summed delta AIC dot plot with both species on same axes."""
+    # Get distribution names (use human order - sorted by AIC)
+    names = human_metrics.distribution_names
+    display_names = [get_display_name(n) for n in names]
+
+    # Get summed AIC for each species and compute delta from minimum
+    human_aic = np.array([
+        human_metrics.summed_aic[human_metrics.distribution_names.index(n)]
+        if n in human_metrics.distribution_names else np.nan
+        for n in names
+    ])
+    rat_aic = np.array([
+        rat_metrics.summed_aic[rat_metrics.distribution_names.index(n)]
+        if n in rat_metrics.distribution_names else np.nan
+        for n in names
+    ])
+
+    # Delta AIC from minimum (in millions for readability)
+    human_delta = (human_aic - np.nanmin(human_aic)) / 1e6
+    rat_delta = (rat_aic - np.nanmin(rat_aic)) / 1e6
+
+    y_pos = np.arange(len(names))
+
+    # Plot dots (rat first so human is on top)
+    ax.scatter(rat_delta, y_pos, color=rat_color, s=80, marker='s',
+               label='Rat WM', zorder=3, edgecolor='white', linewidth=0.5)
+    ax.scatter(human_delta, y_pos, color=human_color, s=80, marker='o',
+               label='Human CC', zorder=4, edgecolor='white', linewidth=0.5)
+
+    # Connect dots with lines
+    for i in range(len(names)):
+        ax.plot([human_delta[i], rat_delta[i]], [y_pos[i], y_pos[i]],
+                color='gray', linewidth=1, alpha=0.5, zorder=1)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
+    ax.set_xlabel(r'$\Sigma\Delta$AIC [$\times 10^6$]', fontsize=settings.fonts['label_size'])
+    ax.set_xlim(-0.05, None)  # Start near 0
+    ax.invert_yaxis()
+    ax.legend(loc='upper right', fontsize=settings.fonts['legend_size'])
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
+
+
+def _plot_win_rate(
+    ax: plt.Axes,
+    human_metrics: AggregatedMetrics,
+    rat_metrics: AggregatedMetrics,
+    human_color: str,
+    rat_color: str
+) -> None:
+    """Plot win rate dot plot with both species on same axes."""
+    # Get distribution names (use human order)
+    names = human_metrics.distribution_names
+    display_names = [get_display_name(n) for n in names]
+
+    # Get win rates for each species
+    human_win = np.array([human_metrics.win_rate.get(n, 0) for n in names])
+    rat_win = np.array([rat_metrics.win_rate.get(n, 0) for n in names])
+
+    y_pos = np.arange(len(names))
+
+    # Plot dots (rat first so human is on top)
+    ax.scatter(rat_win, y_pos, color=rat_color, s=80, marker='s',
+               label='Rat WM', zorder=3, edgecolor='white', linewidth=0.5)
+    ax.scatter(human_win, y_pos, color=human_color, s=80, marker='o',
+               label='Human CC', zorder=4, edgecolor='white', linewidth=0.5)
+
+    # Connect dots with lines
+    for i in range(len(names)):
+        ax.plot([human_win[i], rat_win[i]], [y_pos[i], y_pos[i]],
+                color='gray', linewidth=1, alpha=0.5, zorder=1)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
+    ax.set_xlabel('Win rate', fontsize=settings.fonts['label_size'])
+    ax.set_xlim(-0.05, 1.05)
+    ax.invert_yaxis()
+    ax.legend(loc='lower right', fontsize=settings.fonts['legend_size'])
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
+
+
+def _compute_gev_quantiles(
+    per_sample_data: PerSampleHistogramData,
+    quantile_points: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute empirical and GEV-fitted quantiles for each sample.
+
+    Returns:
+        empirical_quantiles: (n_samples, n_quantiles)
+        gev_quantiles: (n_samples, n_quantiles)
+    """
+    n_samples = per_sample_data.n_samples
+    n_q = len(quantile_points)
+
+    empirical_q = np.full((n_samples, n_q), np.nan)
+    gev_q = np.full((n_samples, n_q), np.nan)
+
+    for i in range(n_samples):
+        counts = per_sample_data.counts_matrix[i]
+        total = counts.sum()
+        if total < 100:
+            continue
+
+        # Empirical quantiles
+        cdf = np.cumsum(counts) / total
+        empirical_q[i] = np.interp(quantile_points, cdf, per_sample_data.bin_centers)
+
+        # GEV fit
+        result = fit_distribution_mle(
+            'genextreme', stats.genextreme,
+            per_sample_data.bin_centers, per_sample_data.bin_edges, counts
+        )
+        if result is not None:
+            shape_params, loc, scale = _unpack_params(result.params)
+            gev_q[i] = stats.genextreme.ppf(quantile_points, *shape_params, loc=loc, scale=scale)
+
+    return empirical_q, gev_q
+
+
+def _plot_tail_deviation(
+    ax: plt.Axes,
+    human_per_sample: PerSampleHistogramData,
+    rat_per_sample: PerSampleHistogramData,
+    human_color: str,
+    rat_color: str
+) -> None:
+    """Plot tail deviation: (GEV fitted - empirical) quantiles vs empirical quantile."""
+    quantile_points = np.linspace(0.01, 0.99, 50)
+
+    # Compute quantiles for both species
+    human_emp, human_gev = _compute_gev_quantiles(human_per_sample, quantile_points)
+    rat_emp, rat_gev = _compute_gev_quantiles(rat_per_sample, quantile_points)
+
+    # Compute deviation: fitted - empirical
+    human_dev = human_gev - human_emp  # (n_samples, n_quantiles)
+    rat_dev = rat_gev - rat_emp
+
+    # Median empirical quantile across samples (x-axis)
+    human_emp_median = np.nanmedian(human_emp, axis=0)
+    rat_emp_median = np.nanmedian(rat_emp, axis=0)
+
+    # Median and IQR of deviation
+    human_dev_median = np.nanmedian(human_dev, axis=0)
+    human_dev_lo = np.nanpercentile(human_dev, 25, axis=0)
+    human_dev_hi = np.nanpercentile(human_dev, 75, axis=0)
+
+    rat_dev_median = np.nanmedian(rat_dev, axis=0)
+    rat_dev_lo = np.nanpercentile(rat_dev, 25, axis=0)
+    rat_dev_hi = np.nanpercentile(rat_dev, 75, axis=0)
+
+    # Plot
+    ax.fill_between(human_emp_median, human_dev_lo, human_dev_hi,
+                    alpha=0.2, color=human_color)
+    ax.plot(human_emp_median, human_dev_median, color=human_color,
+            linewidth=2, label='Human CC')
+
+    ax.fill_between(rat_emp_median, rat_dev_lo, rat_dev_hi,
+                    alpha=0.2, color=rat_color)
+    ax.plot(rat_emp_median, rat_dev_median, color=rat_color,
+            linewidth=2, label='Rat WM')
+
+    ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+    ax.set_xlabel('Empirical quantile [μm]', fontsize=settings.fonts['label_size'])
+    ax.set_ylabel('GEV − Empirical [μm]', fontsize=settings.fonts['label_size'])
+    ax.legend(loc='best', fontsize=settings.fonts['legend_size'])
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
+
+
+def _plot_dumbbell(
+    ax: plt.Axes,
+    metrics: AggregatedMetrics,
+    title: str,
+    color: str
+) -> None:
+    """Plot dumbbell chart showing r_arith and r_eff bias (%) per distribution."""
+    names = metrics.distribution_names
+    display_names = [get_display_name(n) for n in names]
+
+    y_pos = np.arange(len(names))
+
+    # Get r_arith and r_eff values
+    r_arith = np.array([metrics.r_arith_mean.get(n, np.nan) for n in names])
+    r_eff = np.array([metrics.r_eff_mean.get(n, np.nan) for n in names])
+
+    # Empirical values
+    emp_r_arith = metrics.empirical_r_arith_mean
+    emp_r_eff = metrics.empirical_r_eff_mean
+
+    # Convert to percentage bias: (fitted - empirical) / empirical * 100
+    r_arith_bias = (r_arith - emp_r_arith) / emp_r_arith * 100
+    r_eff_bias = (r_eff - emp_r_eff) / emp_r_eff * 100
+
+    # Clip extreme values for visualization
+    x_max = 150  # Cap at 150%
+    x_min = -50  # Allow negative bias
+    r_eff_bias_clipped = np.clip(r_eff_bias, x_min, x_max)
+
+    # Plot connecting lines (dumbbells)
+    for i in range(len(names)):
+        if not np.isnan(r_arith_bias[i]) and not np.isnan(r_eff_bias[i]):
+            ax.plot([r_arith_bias[i], r_eff_bias_clipped[i]], [y_pos[i], y_pos[i]],
+                    color=color, linewidth=2, alpha=0.6, zorder=1)
+
+    # Plot dots
+    ax.scatter(r_arith_bias, y_pos, color=color, s=60, marker='o',
+               label=r'$\bar{r}$', zorder=3, edgecolor='white', linewidth=0.5)
+    ax.scatter(r_eff_bias_clipped, y_pos, color=color, s=60, marker='s',
+               label=r'$r_{\mathrm{MRI}}$', zorder=3, edgecolor='white', linewidth=0.5)
+
+    # Add arrows for clipped values
+    for i in range(len(names)):
+        if r_eff_bias[i] > x_max:
+            ax.annotate('', xy=(x_max, y_pos[i]), xytext=(x_max - 10, y_pos[i]),
+                        arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
+
+    # Add zero reference line (empirical)
+    ax.axvline(0, color='gray', linestyle='-', linewidth=1.5, alpha=0.7)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
+    ax.set_xlabel('Bias [%]', fontsize=settings.fonts['label_size'])
+    ax.set_xlim(x_min, x_max)
+    ax.invert_yaxis()
+    ax.legend(loc='lower right', fontsize=settings.fonts['legend_size'] - 1)
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
+    ax.text(0.02, 0.98, title, transform=ax.transAxes,
+            fontsize=settings.fonts['label_size'], fontweight='bold',
+            va='top', ha='left')
+
+
+def _plot_radius_bias_both_species(
+    ax: plt.Axes,
+    human_metrics: AggregatedMetrics,
+    rat_metrics: AggregatedMetrics,
+    radius_type: str,
+    human_color: str,
+    rat_color: str
+) -> None:
+    """Plot radius bias for both species as violins showing spread.
+
+    Args:
+        ax: Matplotlib axes
+        human_metrics: Human CC aggregated metrics
+        rat_metrics: Rat WM aggregated metrics
+        radius_type: 'r_arith' or 'r_eff'
+        human_color: Color for human data points
+        rat_color: Color for rat data points
+    """
+    # Use human distribution order (sorted by AIC)
+    names = human_metrics.distribution_names
+    display_names = [get_display_name(n) for n in names]
+
+    y_pos = np.arange(len(names))
+
+    # Get per-sample values for each species
+    if radius_type == 'r_arith':
+        human_all = human_metrics.all_r_arith  # (n_dist, n_samples)
+        rat_all = rat_metrics.all_r_arith
+        human_emp_per_sample = human_metrics.empirical_r_arith_per_sample
+        rat_emp_per_sample = rat_metrics.empirical_r_arith_per_sample
+        xlabel = r'$\bar{r}$ bias [%]'
+        x_lim = 5  # ±5%
+    else:  # r_eff
+        human_all = human_metrics.all_r_eff
+        rat_all = rat_metrics.all_r_eff
+        human_emp_per_sample = human_metrics.empirical_r_eff_per_sample
+        rat_emp_per_sample = rat_metrics.empirical_r_eff_per_sample
+        xlabel = r'$r_{\mathrm{MRI}}$ bias [%]'
+        x_lim = 50  # ±50%
+
+    # Compute per-sample bias for each distribution
+    violin_width = 0.35
+    violin_data_human = []
+    violin_data_rat = []
+
+    for dist_name in names:
+        dist_idx = human_metrics.dist_name_to_idx[dist_name]
+
+        # Human: bias = (fitted - empirical) / empirical * 100 for each sample
+        human_fitted = human_all[dist_idx]
+        human_bias = (human_fitted - human_emp_per_sample) / human_emp_per_sample * 100
+        human_bias_valid = human_bias[~np.isnan(human_bias)]
+        violin_data_human.append(human_bias_valid)
+
+        # Rat
+        rat_dist_idx = rat_metrics.dist_name_to_idx.get(dist_name, -1)
+        if rat_dist_idx >= 0:
+            rat_fitted = rat_all[rat_dist_idx]
+            rat_bias = (rat_fitted - rat_emp_per_sample) / rat_emp_per_sample * 100
+            rat_bias_valid = rat_bias[~np.isnan(rat_bias)]
+            violin_data_rat.append(rat_bias_valid)
+        else:
+            violin_data_rat.append(np.array([]))
+
+    # Plot violins for human (offset down)
+    for i, data in enumerate(violin_data_human):
+        if len(data) > 1:
+            parts = ax.violinplot(data, positions=[y_pos[i] - violin_width/2],
+                                  vert=False, widths=violin_width, showmeans=True,
+                                  showextrema=False)
+            for pc in parts['bodies']:
+                pc.set_facecolor(human_color)
+                pc.set_alpha(0.6)
+            parts['cmeans'].set_color(human_color)
+            parts['cmeans'].set_linewidth(2)
+
+    # Plot violins for rat (offset up)
+    for i, data in enumerate(violin_data_rat):
+        if len(data) > 1:
+            parts = ax.violinplot(data, positions=[y_pos[i] + violin_width/2],
+                                  vert=False, widths=violin_width, showmeans=True,
+                                  showextrema=False)
+            for pc in parts['bodies']:
+                pc.set_facecolor(rat_color)
+                pc.set_alpha(0.6)
+            parts['cmeans'].set_color(rat_color)
+            parts['cmeans'].set_linewidth(2)
+
+    # Add zero reference line
+    ax.axvline(0, color='gray', linestyle='-', linewidth=1.5, alpha=0.7)
+
+    # Annotate out-of-bounds means with arrows and values
+    for i, (h_data, r_data) in enumerate(zip(violin_data_human, violin_data_rat)):
+        # Human
+        if len(h_data) > 0:
+            h_mean = np.mean(h_data)
+            if h_mean > x_lim:
+                ax.annotate(f'{h_mean:.0f}%', xy=(x_lim, y_pos[i] - violin_width/2),
+                            xytext=(x_lim - 5, y_pos[i] - violin_width/2),
+                            fontsize=8, color=human_color, ha='right', va='center',
+                            arrowprops=dict(arrowstyle='->', color=human_color, lw=1.2))
+            elif h_mean < -x_lim:
+                ax.annotate(f'{h_mean:.0f}%', xy=(-x_lim, y_pos[i] - violin_width/2),
+                            xytext=(-x_lim + 5, y_pos[i] - violin_width/2),
+                            fontsize=8, color=human_color, ha='left', va='center',
+                            arrowprops=dict(arrowstyle='->', color=human_color, lw=1.2))
+        # Rat
+        if len(r_data) > 0:
+            r_mean = np.mean(r_data)
+            if r_mean > x_lim:
+                ax.annotate(f'{r_mean:.0f}%', xy=(x_lim, y_pos[i] + violin_width/2),
+                            xytext=(x_lim - 5, y_pos[i] + violin_width/2),
+                            fontsize=8, color=rat_color, ha='right', va='center',
+                            arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.2))
+            elif r_mean < -x_lim:
+                ax.annotate(f'{r_mean:.0f}%', xy=(-x_lim, y_pos[i] + violin_width/2),
+                            xytext=(-x_lim + 5, y_pos[i] + violin_width/2),
+                            fontsize=8, color=rat_color, ha='left', va='center',
+                            arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.2))
+
+    # Add legend manually (violinplot doesn't support labels)
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=human_color, alpha=0.6, label='Human CC'),
+        Patch(facecolor=rat_color, alpha=0.6, label='Rat WM')
+    ]
+    ax.legend(handles=legend_elements, loc='lower right', fontsize=settings.fonts['legend_size'])
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
+    ax.set_xlabel(xlabel, fontsize=settings.fonts['label_size'])
+    ax.set_xlim(-x_lim, x_lim)
+    ax.invert_yaxis()
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
 def _plot_histogram_with_fits(
@@ -1221,6 +1631,131 @@ def _plot_radius_scatter(
     ax.grid(True, alpha=0.3)
 
 
+def create_pooled_histogram_figure(
+    human_pooled: HistogramData,
+    human_metrics: AggregatedMetrics,
+    rat_pooled: HistogramData,
+    rat_metrics: AggregatedMetrics,
+    output_file: Path
+) -> None:
+    """Create three-panel figure: (a) human tail, (b) rat tail, (c) full distribution."""
+    from matplotlib.patches import ConnectionPatch
+
+    HUMAN_COLOR = '#1f77b4'  # Blue
+    RAT_COLOR = '#d62728'    # Red
+
+    fig = plt.figure(figsize=(7, 9))
+    gs = fig.add_gridspec(2, 2, height_ratios=[2.5, 1], hspace=0.5, wspace=0.3)
+
+    ax_full = fig.add_subplot(gs[0, :])        # Top (spans both columns)
+    ax_human_tail = fig.add_subplot(gs[1, 0])  # Bottom left
+    ax_rat_tail = fig.add_subplot(gs[1, 1])    # Bottom right
+
+    # Set 1:1 aspect ratio for all panels
+    ax_human_tail.set_box_aspect(1)
+    ax_rat_tail.set_box_aspect(1)
+    ax_full.set_box_aspect(1)
+
+    # Compute densities
+    human_bin_width = np.diff(human_pooled.bin_edges).mean()
+    human_density = human_pooled.counts / (human_pooled.total_count * human_bin_width)
+    rat_bin_width = np.diff(rat_pooled.bin_edges).mean()
+    rat_density = rat_pooled.counts / (rat_pooled.total_count * rat_bin_width)
+
+    # Get best fits
+    best_fit_human = human_metrics.pooled_results[0] if human_metrics.pooled_results else None
+    best_fit_rat = rat_metrics.pooled_results[0] if rat_metrics.pooled_results else None
+
+    tail_xmin, tail_xmax = 1.0, 3.0
+
+    # --- Top left (a): Human tail ---
+    tail_mask_human = (human_pooled.bin_centers >= tail_xmin) & (human_pooled.bin_centers <= tail_xmax)
+    ax_human_tail.bar(human_pooled.bin_centers[tail_mask_human], human_density[tail_mask_human],
+                      width=human_bin_width * 0.9, alpha=0.5, color=HUMAN_COLOR,
+                      edgecolor='white', linewidth=0.5)
+    if best_fit_human:
+        ax_human_tail.plot(human_pooled.bin_centers[tail_mask_human],
+                           best_fit_human.pdf_values[tail_mask_human], '-',
+                           color=HUMAN_COLOR, linewidth=2)
+    ax_human_tail.set_xlim(tail_xmin, tail_xmax)
+    ax_human_tail.set_ylim(0, None)
+    ax_human_tail.set_ylabel('Prob. density', fontsize=settings.fonts['label_size'])
+    ax_human_tail.set_xlabel('Radius [μm]', fontsize=settings.fonts['label_size'])
+    ax_human_tail.tick_params(labelsize=settings.fonts['tick_size'])
+    ax_human_tail.set_title('Human CC', fontsize=settings.fonts['label_size'], color=HUMAN_COLOR)
+
+    # --- Top right (b): Rat tail ---
+    tail_mask_rat = (rat_pooled.bin_centers >= tail_xmin) & (rat_pooled.bin_centers <= tail_xmax)
+    ax_rat_tail.bar(rat_pooled.bin_centers[tail_mask_rat], rat_density[tail_mask_rat],
+                    width=rat_bin_width * 0.9, alpha=0.5, color=RAT_COLOR,
+                    edgecolor='white', linewidth=0.5)
+    if best_fit_rat:
+        ax_rat_tail.plot(rat_pooled.bin_centers[tail_mask_rat],
+                         best_fit_rat.pdf_values[tail_mask_rat], '-',
+                         color=RAT_COLOR, linewidth=2)
+    ax_rat_tail.set_xlim(tail_xmin, tail_xmax)
+    ax_rat_tail.set_ylim(0, None)
+    ax_rat_tail.set_xlabel('Radius [μm]', fontsize=settings.fonts['label_size'])
+    ax_rat_tail.tick_params(labelsize=settings.fonts['tick_size'])
+    ax_rat_tail.set_title('Rat WM', fontsize=settings.fonts['label_size'], color=RAT_COLOR)
+
+    # --- Bottom (c): Full distribution ---
+    ax_full.bar(human_pooled.bin_centers, human_density, width=human_bin_width * 0.9,
+                alpha=0.5, color=HUMAN_COLOR, edgecolor='white', linewidth=0.5,
+                label=f'Human CC (n={human_pooled.total_count:,})')
+    if best_fit_human:
+        ax_full.plot(human_pooled.bin_centers, best_fit_human.pdf_values, '-',
+                     color=HUMAN_COLOR, linewidth=2.5)
+
+    ax_full.bar(rat_pooled.bin_centers, rat_density, width=rat_bin_width * 0.9,
+                alpha=0.5, color=RAT_COLOR, edgecolor='white', linewidth=0.5,
+                label=f'Rat WM (n={rat_pooled.total_count:,})')
+    if best_fit_rat:
+        ax_full.plot(rat_pooled.bin_centers, best_fit_rat.pdf_values, '-',
+                     color=RAT_COLOR, linewidth=2.5)
+
+    ax_full.set_xlim(0, PLOT_XLIM_MAX)
+    ax_full.set_xlabel('Axon radius [μm]', fontsize=settings.fonts['label_size'])
+    ax_full.set_ylabel('Probability density', fontsize=settings.fonts['label_size'])
+    ax_full.legend(loc='upper right', fontsize=settings.fonts['legend_size'])
+    ax_full.tick_params(labelsize=settings.fonts['tick_size'])
+
+    # Connection lines from full plot (top) down to tail panels (bottom)
+    # Human: from full plot bottom to human tail top
+    con_human_left = ConnectionPatch(
+        xyA=(tail_xmin, 0), coordsA=ax_full.transData,
+        xyB=(tail_xmin, ax_human_tail.get_ylim()[1]), coordsB=ax_human_tail.transData,
+        color='0.5', linestyle='--', linewidth=0.8
+    )
+    fig.add_artist(con_human_left)
+
+    con_human_right = ConnectionPatch(
+        xyA=(tail_xmax, 0), coordsA=ax_full.transData,
+        xyB=(tail_xmax, ax_human_tail.get_ylim()[1]), coordsB=ax_human_tail.transData,
+        color='0.5', linestyle='--', linewidth=0.8
+    )
+    fig.add_artist(con_human_right)
+
+    # Rat: from full plot bottom to rat tail top
+    con_rat_left = ConnectionPatch(
+        xyA=(tail_xmin, 0), coordsA=ax_full.transData,
+        xyB=(tail_xmin, ax_rat_tail.get_ylim()[1]), coordsB=ax_rat_tail.transData,
+        color='0.5', linestyle='--', linewidth=0.8
+    )
+    fig.add_artist(con_rat_left)
+
+    con_rat_right = ConnectionPatch(
+        xyA=(tail_xmax, 0), coordsA=ax_full.transData,
+        xyB=(tail_xmax, ax_rat_tail.get_ylim()[1]), coordsB=ax_rat_tail.transData,
+        color='0.5', linestyle='--', linewidth=0.8
+    )
+    fig.add_artist(con_rat_right)
+
+    plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved pooled histogram figure to {output_file}")
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1318,13 +1853,23 @@ def main():
         delta = rat_metrics.summed_aic[i-1] - rat_metrics.summed_aic[0]
         logger.info(f"  {i}. {name}: Delta AIC = {delta:.0f}")
 
-    # Create main figure (2x4 summary)
+    # Create main figure (4-panel)
     logger.info("=" * 60)
     logger.info("Creating summary figure...")
     create_combined_figure(
         human_pooled, human_largest, human_metrics,
         rat_pooled, rat_largest, rat_metrics,
+        human_per_sample, rat_per_sample,
         args.output, args.top_n
+    )
+
+    # Create pooled histogram figure
+    pooled_hist_output = args.output.with_stem(args.output.stem + '_histograms')
+    logger.info("Creating pooled histogram figure...")
+    create_pooled_histogram_figure(
+        human_pooled, human_metrics,
+        rat_pooled, rat_metrics,
+        pooled_hist_output
     )
 
     # Subsampling analysis
