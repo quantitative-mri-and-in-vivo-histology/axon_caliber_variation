@@ -1,0 +1,44 @@
+{
+  "sample_sizes": [
+    100,
+    1000,
+    10000,
+    100000,
+    1000000
+  ],
+  "n_subsamples": 50,
+  "human_cc": {
+    "100": {
+      "n_valid_rois": 35
+    },
+    "1000": {
+      "n_valid_rois": 35
+    },
+    "10000": {
+      "n_valid_rois": 35
+    },
+    "100000": {
+      "n_valid_rois": 35
+    },
+    "1000000": {
+      "n_valid_rois": 23
+    }
+  },
+  "rat_wm": {
+    "100": {
+      "n_valid_rois": 20
+    },
+    "1000": {
+      "n_valid_rois": 20
+    },
+    "10000": {
+      "n_valid_rois": 19
+    },
+    "100000": {
+      "n_valid_rois": 18
+    },
+    "1000000": {
+      "n_valid_rois": 13
+    }
+  }
+}

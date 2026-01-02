@@ -47,20 +47,24 @@ settings = get_plot_settings()
 
 # Constants
 DEFAULT_BIN_WIDTH = 0.05  # μm
-SAMPLE_SIZES = [1_000, 10_000, 100_000, 1_000_000]  # 10³, 10⁴, 10⁵, 10⁶
+SAMPLE_SIZES = [100, 1_000, 10_000, 100_000, 1_000_000]  # 10², 10³, 10⁴, 10⁵, 10⁶
 N_SUBSAMPLES = 50
 N_QUANTILES = 50
 MIN_BIN_PROB = 1e-300
 
-# Colors for different sample sizes (light to dark)
+# Colors for different sample sizes (YlOrBr colormap for QQ plots)
+from matplotlib.cm import YlOrBr
+_ylorbr_colors = [YlOrBr(x) for x in [0.3, 0.65, 1.0]]
 SAMPLE_SIZE_COLORS = {
-    1_000: '#a6cee3',      # Light blue
-    10_000: '#1f78b4',     # Medium blue
-    100_000: '#b2df8a',    # Light green
-    1_000_000: '#33a02c',  # Dark green
+    100: _ylorbr_colors[0],        # Light yellow
+    1_000: '#a6cee3',              # Light blue (not used in QQ)
+    10_000: _ylorbr_colors[1],     # Orange
+    100_000: '#b2df8a',            # Light green (not used in QQ)
+    1_000_000: _ylorbr_colors[2],  # Dark brown
 }
 
 SAMPLE_SIZE_LABELS = {
+    100: r'$10^2$',
     1_000: r'$10^3$',
     10_000: r'$10^4$',
     100_000: r'$10^5$',
@@ -378,11 +382,15 @@ def run_subsampling_analysis(
 # Plotting Functions
 # =============================================================================
 
-def plot_qq_raw(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_label: str) -> None:
+def plot_qq_raw(ax: plt.Axes, dataset_results: DatasetSubsampleResults,
+                sample_sizes: List[int] = None) -> None:
     """Plot QQ-plot comparing raw subsample quantiles to whole section."""
     font_settings = settings.fonts
 
-    for sample_size in SAMPLE_SIZES:
+    if sample_sizes is None:
+        sample_sizes = SAMPLE_SIZES
+
+    for sample_size in sample_sizes:
         if sample_size not in dataset_results.results_by_size:
             continue
 
@@ -427,16 +435,14 @@ def plot_qq_raw(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_la
         ax.set_xlim(q_min, q_max)
         ax.set_ylim(q_min, q_max)
 
-    ax.set_xlabel('Reference Quantiles (μm)', fontsize=font_settings['label_size'])
-    ax.set_ylabel('Subsample Quantiles (μm)', fontsize=font_settings['label_size'])
-    ax.set_title(f'{panel_label} {dataset_results.name}: QQ (Raw)',
-                 fontsize=font_settings['label_size'], fontweight='bold')
+    ax.set_xlabel('Reference quantiles [μm]', fontsize=font_settings['label_size'])
+    ax.set_ylabel('Subsample quantiles [μm]', fontsize=font_settings['label_size'])
+    ax.tick_params(labelsize=font_settings['tick_size'])
     ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
     ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
 
 
-def plot_qq_gev(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_label: str) -> None:
+def plot_qq_gev(ax: plt.Axes, dataset_results: DatasetSubsampleResults) -> None:
     """Plot QQ-plot comparing GEV-fitted subsample quantiles to whole section."""
     font_settings = settings.fonts
 
@@ -470,13 +476,11 @@ def plot_qq_gev(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_la
         ax.set_xlim(q_min, q_max)
         ax.set_ylim(q_min, q_max)
 
-    ax.set_xlabel('Reference Quantiles (μm)', fontsize=font_settings['label_size'])
-    ax.set_ylabel('GEV-fitted Quantiles (μm)', fontsize=font_settings['label_size'])
-    ax.set_title(f'{panel_label} {dataset_results.name}: QQ (GEV)',
-                 fontsize=font_settings['label_size'], fontweight='bold')
+    ax.set_xlabel('Reference quantiles [μm]', fontsize=font_settings['label_size'])
+    ax.set_ylabel('GEV-fitted quantiles [μm]', fontsize=font_settings['label_size'])
+    ax.tick_params(labelsize=font_settings['tick_size'])
     ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
     ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
 
 
 def plot_bias(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_label: str) -> None:
@@ -613,27 +617,110 @@ def plot_cov(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_label
     ax.grid(True, alpha=0.3, axis='y')
 
 
+def plot_combined_bias(
+    ax: plt.Axes,
+    human_results: DatasetSubsampleResults,
+    rat_results: DatasetSubsampleResults,
+    metric: str,  # 'r_arith' or 'r_eff'
+    ylabel: str
+) -> None:
+    """Plot percentage error vs sample size for both datasets."""
+    font_settings = settings.fonts
+
+    # Colors for datasets
+    human_color = '#1f77b4'  # Blue
+    rat_color = '#d62728'    # Red
+
+    datasets = [
+        (rat_results, 'Rat WM', rat_color, 's'),      # Squares on bottom
+        (human_results, 'Human CC', human_color, 'o'),  # Circles on top
+    ]
+
+    for dataset_results, label, color, marker in datasets:
+        sample_sizes_present = [s for s in SAMPLE_SIZES if s in dataset_results.results_by_size]
+        if not sample_sizes_present:
+            continue
+
+        bias_median = []
+        bias_lo = []
+        bias_hi = []
+
+        for sample_size in sample_sizes_present:
+            results = dataset_results.results_by_size[sample_size]
+
+            if metric == 'r_arith':
+                ref = results.reference_r_arith[:, np.newaxis]
+                values = results.r_arith
+            else:  # r_eff
+                ref = results.reference_r_eff[:, np.newaxis]
+                values = results.r_eff
+
+            # Compute relative bias: (sub - ref) / ref * 100
+            bias = (values - ref) / ref * 100  # (n_rois, n_subs)
+
+            # Median bias per ROI across subsamples, then aggregate
+            roi_bias = np.nanmedian(bias, axis=1)  # (n_rois,)
+
+            bias_median.append(np.nanmedian(roi_bias))
+            bias_lo.append(np.nanpercentile(roi_bias, 25))
+            bias_hi.append(np.nanpercentile(roi_bias, 75))
+
+        bias_median = np.array(bias_median)
+        bias_lo = np.array(bias_lo)
+        bias_hi = np.array(bias_hi)
+
+        # Plot with error bands
+        ax.fill_between(sample_sizes_present, bias_lo, bias_hi, alpha=0.2, color=color)
+        ax.plot(sample_sizes_present, bias_median, color=color, marker=marker,
+                markersize=8, linewidth=2, label=label)
+
+    ax.axhline(0, color='black', linestyle='-', linewidth=1)
+    ax.set_xscale('log')
+    ax.set_xlabel('Sample size', fontsize=font_settings['label_size'])
+    ax.set_ylabel(ylabel, fontsize=font_settings['label_size'])
+    ax.legend(loc='best', fontsize=font_settings['legend_size'])
+    ax.tick_params(labelsize=font_settings['tick_size'])
+
+
 def create_figure(
     human_results: DatasetSubsampleResults,
     rat_results: DatasetSubsampleResults,
     output_file: Path
 ) -> None:
-    """Create the 2×4 figure."""
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    """Create the 2×2 figure."""
+    fig, axes = plt.subplots(2, 2, figsize=(7, 7))
 
-    # Row 1: Human CC
-    plot_qq_raw(axes[0, 0], human_results, '(a)')
-    plot_qq_gev(axes[0, 1], human_results, '(b)')
-    plot_bias(axes[0, 2], human_results, '(c)')
-    plot_cov(axes[0, 3], human_results, '(d)')
+    # Sample sizes for QQ plots (subset to avoid clutter)
+    qq_sample_sizes = [100, 10_000, 1_000_000]
 
-    # Row 2: Rat WM
-    plot_qq_raw(axes[1, 0], rat_results, '(e)')
-    plot_qq_gev(axes[1, 1], rat_results, '(f)')
-    plot_bias(axes[1, 2], rat_results, '(g)')
-    plot_cov(axes[1, 3], rat_results, '(h)')
+    # (a) Human CC: QQ (Raw)
+    plot_qq_raw(axes[0, 0], human_results, sample_sizes=qq_sample_sizes)
+
+    # (b) Rat WM: QQ (Raw)
+    plot_qq_raw(axes[0, 1], rat_results, sample_sizes=qq_sample_sizes)
+
+    # (c) Arithmetic mean radius: percentage error vs sample size (both datasets)
+    plot_combined_bias(axes[1, 0], human_results, rat_results,
+                       'r_arith', r'$\bar{r}$ error [%]')
+
+    # (d) Effective radius: percentage error vs sample size (both datasets)
+    plot_combined_bias(axes[1, 1], human_results, rat_results,
+                       'r_eff', r'$r_{\mathrm{MRI}}$ error [%]')
+
+    # Set same y-axis scale for (c) and (d)
+    ymin = min(axes[1, 0].get_ylim()[0], axes[1, 1].get_ylim()[0])
+    ymax = max(axes[1, 0].get_ylim()[1], axes[1, 1].get_ylim()[1])
+    # Make symmetric around 0
+    ylim_max = max(abs(ymin), abs(ymax))
+    axes[1, 0].set_ylim(-ylim_max, ylim_max)
+    axes[1, 1].set_ylim(-ylim_max, ylim_max)
+
+    # Set aspect ratio 1 for bottom panels
+    for ax in [axes[1, 0], axes[1, 1]]:
+        ax.set_box_aspect(1)
 
     plt.tight_layout()
+
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
     plt.close()
     logger.info(f"Saved figure to {output_file}")
