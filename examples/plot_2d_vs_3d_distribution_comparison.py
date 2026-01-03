@@ -379,97 +379,119 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     ax.set_box_aspect(1)  # Square subplot box
 
 
-def plot_qq_with_variability(ax, slice_file: Path, axon_file: Path,
-                             population_labels: Set[int],
-                             radius_type: str = 'circular',
-                             n_quantiles: int = 100) -> None:
+def plot_cdf_representative(ax, samples: List[Tuple[Path, Path, str, float]],
+                            data_dir: Path,
+                            radius_type: str = 'circular',
+                            x_max: float = 1.5) -> None:
     """
-    Plot QQ-plot comparing 2D vs 3D distributions with slice variability.
+    Plot CDF comparison for representative samples with slice variability.
+
+    For each sample, shows 3D CDF (solid) and 2D CDF with IQR across slices,
+    using the same colors as the PDF plot.
 
     Args:
         ax: Matplotlib axes
-        slice_file: Path to 2D slice profiles NPZ
-        axon_file: Path to 3D axon profiles NPZ
-        population_labels: Set of axon labels for filtering 3D data
+        samples: List of (slice_file, axon_file, sample_name, mean_radius) tuples
+        data_dir: Directory containing population JSON files
         radius_type: 'circular' or 'minor'
-        n_quantiles: Number of quantile points
+        x_max: Maximum x-axis value
     """
-    # Load 2D data
-    npz_2d = np.load(slice_file)
-    bin_centers = npz_2d['bin_centers']
-    histograms = npz_2d[f'histograms_{radius_type}']
+    # Same colors as PDF plot (small, medium, high mean radius)
+    colors = ['#2ecc71', '#3498db', '#e74c3c']  # green, blue, red
 
-    # Load 3D data (filtered by population)
-    npz_3d = np.load(axon_file, allow_pickle=True)
-    axon_labels = npz_3d['labels']
-    radii_profiles = npz_3d['radii_profiles_um']
+    # Common x-axis for CDF evaluation
+    x_eval = np.linspace(0.02, x_max, 200)
 
-    # Filter 3D radii by population
-    filtered_radii = []
-    for i, label in enumerate(axon_labels):
-        if int(label) in population_labels:
-            filtered_radii.append(radii_profiles[i])
-
-    if not filtered_radii:
-        logger.error("No axons matched population labels - cannot create QQ plot")
-        ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', transform=ax.transAxes)
-        return
-
-    all_radii_3d = np.concatenate(filtered_radii)
-    logger.info(f"3D radii: {len(all_radii_3d):,} measurements from {len(filtered_radii)} axons")
-
-    # Define quantile points
-    quantiles = np.linspace(0.01, 0.99, n_quantiles)
-
-    # Compute 3D quantiles (reference)
-    q_3d = np.percentile(all_radii_3d, quantiles * 100)
-
-    # Compute 2D quantiles per slice
-    n_slices = histograms.shape[0]
-    q_2d_all = []
-
-    for i in range(n_slices):
-        if histograms[i].sum() > MIN_AXON_COUNT:
-            q_2d = histogram_to_quantiles(histograms[i], bin_centers, quantiles)
-            q_2d_all.append(q_2d)
-
-    logger.info(f"Computed quantiles for {len(q_2d_all)} valid slices")
-
-    if len(q_2d_all) == 0:
-        logger.error("No valid slices found - cannot create QQ plot")
-        ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', transform=ax.transAxes)
-        return
-
-    q_2d_all = np.array(q_2d_all)  # (n_valid_slices, n_quantiles)
-
-    # Compute median and IQR across slices
-    q_2d_median = np.median(q_2d_all, axis=0)
-    q_2d_lo = np.percentile(q_2d_all, 25, axis=0)
-    q_2d_hi = np.percentile(q_2d_all, 75, axis=0)
-
-    # Plot
     font_settings = settings.fonts
     line_settings = settings.line
 
-    # Identity line
-    max_val = max(q_3d.max(), q_2d_hi.max()) * 1.05
-    min_val = min(q_3d.min(), q_2d_lo.min()) * 0.95
-    ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5,
-            linewidth=1.5, label='Identity', zorder=0)
+    for idx, (slice_file, axon_file, sample_name, mean_r) in enumerate(samples):
+        # Load 2D slice data
+        npz_2d = np.load(slice_file)
+        bin_centers = npz_2d['bin_centers']
+        histograms = npz_2d[f'histograms_{radius_type}']
 
-    # QQ envelope and median
-    ax.fill_between(q_3d, q_2d_lo, q_2d_hi, alpha=0.3, color='steelblue', label='IQR')
-    ax.plot(q_3d, q_2d_median, color='steelblue', linewidth=line_settings['linewidth'],
-            label='Median')
+        # Load 3D data and filter by population
+        population = sample_name.split('_')[-1].lower()
+        base_name = slice_file.stem.replace(f'_{population}_slice_profiles', '')
+        pop_labels = load_population_labels(data_dir, base_name, population)
 
-    ax.set_xlabel('3D axon radius quantile [μm]', fontsize=font_settings['label_size'],
+        npz_3d = np.load(axon_file, allow_pickle=True)
+        axon_labels = npz_3d['labels']
+        radii_profiles = npz_3d['radii_profiles_um']
+
+        # Collect 3D radii for this population
+        all_radii_3d = []
+        for i, label in enumerate(axon_labels):
+            if int(label) in pop_labels:
+                all_radii_3d.extend(radii_profiles[i])
+        all_radii_3d = np.array(all_radii_3d)
+
+        # Compute 3D CDF
+        sorted_3d = np.sort(all_radii_3d)
+        cdf_3d_y = np.arange(1, len(sorted_3d) + 1) / len(sorted_3d)
+        cdf_3d = np.interp(x_eval, sorted_3d, cdf_3d_y, left=0, right=1)
+
+        # Compute 2D CDF per slice
+        cdf_2d_per_slice = []
+        for i in range(histograms.shape[0]):
+            if histograms[i].sum() > MIN_AXON_COUNT:
+                cdf_2d_raw = np.cumsum(histograms[i]) / histograms[i].sum()
+                cdf_2d = np.interp(x_eval, bin_centers, cdf_2d_raw, left=0, right=1)
+                cdf_2d_per_slice.append(cdf_2d)
+
+        if len(cdf_2d_per_slice) == 0:
+            continue
+
+        cdf_2d_per_slice = np.array(cdf_2d_per_slice)
+
+        # Compute median and 95% CI across slices
+        cdf_2d_median = np.median(cdf_2d_per_slice, axis=0)
+        cdf_2d_lo = np.percentile(cdf_2d_per_slice, 2.5, axis=0)
+        cdf_2d_hi = np.percentile(cdf_2d_per_slice, 97.5, axis=0)
+
+        # Extract short name
+        parts = sample_name.split('_')
+        short_name = f"{parts[1]} {parts[2]} {parts[3]}"
+
+        color = colors[idx]
+
+        # Plot 3D CDF (solid)
+        ax.plot(x_eval, cdf_3d, color=color, linewidth=line_settings['linewidth'],
+                linestyle='-')
+        # Plot 2D CDF IQR (shaded only, no median line to reduce clutter)
+        ax.fill_between(x_eval, cdf_2d_lo, cdf_2d_hi, alpha=0.3, color=color)
+
+    # Build custom legend
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    handles = []
+    labels = []
+
+    # Style indicators
+    handles.append(Line2D([0], [0], color='gray', linewidth=line_settings['linewidth'], linestyle='-'))
+    labels.append('3D')
+    handles.append(Patch(facecolor='gray', alpha=0.3, edgecolor='none'))
+    labels.append('2D 95% CI')
+
+    # Sample indicators
+    for idx, (_, _, sample_name, mean_r) in enumerate(samples):
+        parts = sample_name.split('_')
+        short_name = f"{parts[1]} {parts[2]} {parts[3]}"
+        handles.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=colors[idx],
+                              markersize=8, markeredgecolor='none'))
+        labels.append(rf"{short_name} ($\bar{{r}}$ = {mean_r:.2f})")
+
+    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_ylabel('2D axon radius quantile [μm]', fontsize=font_settings['label_size'],
+    ax.set_ylabel('Cumulative probability', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
-    ax.set_box_aspect(1)  # Square subplot box
-    ax.set_xlim(min_val, max_val)
-    ax.set_ylim(min_val, max_val)
+    ax.legend(handles, labels, loc='lower right', fontsize=font_settings['legend_size'] - 1,
+              framealpha=0.9)
+    ax.set_box_aspect(1)
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(0, 1)
 
 
 def extract_group_info(sample_name: str) -> Tuple[str, str]:
@@ -702,9 +724,6 @@ def main():
     parser.add_argument('--radius-type', type=str, default='circular',
                         choices=['circular', 'minor'],
                         help='Radius type to use')
-    parser.add_argument('--population', type=str, default='cc',
-                        choices=['cc', 'cg'],
-                        help='Population for representative sample')
     parser.add_argument('--x-max', type=float, default=1.5,
                         help='Maximum x-axis value for PDF plot')
 
@@ -717,16 +736,7 @@ def main():
     # Find samples with small, medium, high mean radius for panel (a)
     pdf_samples = find_samples_by_mean_radius(args.data_dir)
 
-    # Find largest sample for panel (b) QQ-plot
-    slice_file, axon_file, sample_name = find_largest_sample(
-        args.data_dir, args.population)
-
-    # Load population labels for the QQ representative sample
-    base_name = slice_file.stem.replace(f'_{args.population}_slice_profiles', '')
-    pop_labels = load_population_labels(args.data_dir, base_name, args.population)
-    logger.info(f"Population '{args.population.upper()}' has {len(pop_labels)} axons")
-
-    # Find all pairs for panels (c) and (d)
+    # Find all pairs for panels (b), (c) and (d)
     all_pairs = find_matching_pairs(args.data_dir)
     logger.info(f"Found {len(all_pairs)} sample-population pairs for ensemble analysis")
 
@@ -744,10 +754,9 @@ def main():
     logger.info("\nPlotting panel (a): PDF stability (3 samples)...")
     plot_pdf_stability_multi(axes[0, 0], pdf_samples, args.data_dir, args.radius_type, args.x_max)
 
-    # Panel (b): QQ-plot (using largest sample)
-    logger.info("\nPlotting panel (b): QQ-plot...")
-    plot_qq_with_variability(axes[0, 1], slice_file, axon_file, pop_labels,
-                             args.radius_type)
+    # Panel (b): CDF for representative samples (same as panel a)
+    logger.info("\nPlotting panel (b): CDF for representative samples...")
+    plot_cdf_representative(axes[0, 1], pdf_samples, args.data_dir, args.radius_type, args.x_max)
 
     # Panel (c): Mean radius scatter
     logger.info("\nPlotting panel (c): Mean radius scatter...")
@@ -768,9 +777,8 @@ def main():
 
     # Save metadata
     metadata = {
-        'representative_sample': sample_name,
-        'n_population_axons': len(pop_labels),
         'n_ensemble_samples': len(all_metrics),
+        'n_qq_rois': len(all_pairs),
         'radius_type': args.radius_type,
         'x_max_pdf': args.x_max
     }

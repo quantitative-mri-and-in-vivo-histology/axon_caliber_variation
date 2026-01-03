@@ -2,19 +2,14 @@
 """
 Study the effect of sample size on radius estimation accuracy.
 
-Creates a 2×4 figure:
-Row 1 (Human CC):
-  (a) QQ-plot: raw subsample quantiles vs whole section (4 sample sizes)
-  (b) QQ-plot: GEV-fitted quantiles vs whole section
-  (c) Bias: relative bias in r_arith and r_eff vs sample size
-  (d) CoV: coefficient of variation in r_arith and r_eff vs sample size
+Creates a 2×2 figure:
+  (a) PDFs for Human CC and Rat WM pooled distributions
+  (b) CDFs for Human CC and Rat WM pooled distributions
+  (c) Arithmetic mean radius error vs sample size (both datasets)
+  (d) Effective MRI radius error vs sample size (both datasets)
 
-Row 2 (Rat WM):
-  (e-h) Same panels for rat data
-
-Sample sizes: 10³, 10⁴, 10⁵, 10⁶
-Subsamples per ROI: N=50 (configurable)
-Variability shown as median ± IQR across ROIs and subsamples.
+Sample sizes: 10², 10³, 10⁴, 10⁵, 10⁶
+Subsamples: N=50 (configurable)
 
 Usage:
     python examples/plot_sample_size_effect.py \
@@ -35,10 +30,11 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
+from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import OptimizeWarning
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from axonometry import get_plot_settings
+from axonometry import get_plot_settings, add_panel_labels
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -382,6 +378,150 @@ def run_subsampling_analysis(
 # Plotting Functions
 # =============================================================================
 
+def plot_pdf_combined(
+    ax: plt.Axes,
+    human_bin_centers: np.ndarray,
+    human_pooled_counts: np.ndarray,
+    rat_bin_centers: np.ndarray,
+    rat_pooled_counts: np.ndarray,
+    sample_sizes: List[int],
+    n_subsamples: int,
+    x_max: float = 2.0
+) -> None:
+    """Plot PDFs for both datasets with subsampling variability."""
+    font_settings = settings.fonts
+    line_settings = settings.line
+
+    # Colors for datasets
+    human_color = '#1f77b4'  # Blue
+    rat_color = '#d62728'    # Red
+
+    # Common x-axis for PDF evaluation
+    x_eval = np.linspace(0.02, x_max, 200)
+
+    datasets = [
+        (human_bin_centers, human_pooled_counts, human_color, 'Human CC'),
+        (rat_bin_centers, rat_pooled_counts, rat_color, 'Rat WM'),
+    ]
+
+    for bin_centers, pooled_counts, color, label in datasets:
+        total_count = pooled_counts.sum()
+        bin_width = bin_centers[1] - bin_centers[0]
+        probs = pooled_counts / total_count
+
+        # Reference PDF (full distribution)
+        pdf_ref = pooled_counts / (total_count * bin_width)
+        pdf_ref_interp = np.interp(x_eval, bin_centers, pdf_ref, left=0, right=0)
+
+        # Plot full distribution (thin line)
+        ax.plot(x_eval, pdf_ref_interp, color=color, linewidth=1.0,
+                label=f'{label}', zorder=10)
+
+        # Subsampling for multiple sample sizes, repeated many times for CI
+        n_repeats = 5000  # Repeat 5k times for good 95% CI
+        alphas = [0.35, 0.25, 0.15]  # Decreasing alpha for larger sample sizes
+
+        for idx, sample_size in enumerate(sample_sizes):
+            if sample_size > total_count:
+                continue
+
+            pdf_subsamples = []
+            for _ in range(n_repeats):
+                sampled_bins = np.random.choice(len(bin_centers), size=sample_size, p=probs)
+                sub_counts = np.bincount(sampled_bins, minlength=len(bin_centers)).astype(float)
+                pdf_sub = sub_counts / (sub_counts.sum() * bin_width)
+                pdf_sub_interp = np.interp(x_eval, bin_centers, pdf_sub, left=0, right=0)
+                pdf_subsamples.append(pdf_sub_interp)
+
+            pdf_subsamples = np.array(pdf_subsamples)
+            pdf_lo = np.percentile(pdf_subsamples, 2.5, axis=0)
+            pdf_hi = np.percentile(pdf_subsamples, 97.5, axis=0)
+
+            # Smooth only the CI bands (not the PDFs themselves)
+            sigma = max(1, 3 - idx)  # More smoothing for smaller samples
+            pdf_lo = gaussian_filter1d(pdf_lo, sigma=sigma)
+            pdf_hi = gaussian_filter1d(pdf_hi, sigma=sigma)
+
+            ax.fill_between(x_eval, pdf_lo, pdf_hi, alpha=alphas[idx], color=color)
+
+    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'])
+    ax.set_ylabel('Probability density [μm⁻¹]', fontsize=font_settings['label_size'])
+    ax.tick_params(labelsize=font_settings['tick_size'])
+    ax.legend(loc='upper right', fontsize=font_settings['legend_size'] - 1)
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(bottom=0)
+    ax.set_box_aspect(1)
+
+
+def plot_cdf_combined(
+    ax: plt.Axes,
+    human_bin_centers: np.ndarray,
+    human_pooled_counts: np.ndarray,
+    rat_bin_centers: np.ndarray,
+    rat_pooled_counts: np.ndarray,
+    sample_sizes: List[int],
+    n_subsamples: int,
+    x_max: float = 2.0
+) -> None:
+    """Plot CDFs for both datasets with subsampling variability."""
+    font_settings = settings.fonts
+    line_settings = settings.line
+
+    # Colors for datasets
+    human_color = '#1f77b4'  # Blue
+    rat_color = '#d62728'    # Red
+
+    # Common x-axis for CDF evaluation
+    x_eval = np.linspace(0.02, x_max, 200)
+
+    datasets = [
+        (human_bin_centers, human_pooled_counts, human_color, 'Human CC'),
+        (rat_bin_centers, rat_pooled_counts, rat_color, 'Rat WM'),
+    ]
+
+    for bin_centers, pooled_counts, color, label in datasets:
+        total_count = pooled_counts.sum()
+        probs = pooled_counts / total_count
+
+        # Reference CDF (full distribution)
+        cdf_ref_raw = np.cumsum(pooled_counts) / total_count
+        cdf_ref = np.interp(x_eval, bin_centers, cdf_ref_raw, left=0, right=1)
+
+        # Plot full distribution (thin line)
+        ax.plot(x_eval, cdf_ref, color=color, linewidth=1.0,
+                label=f'{label}', zorder=10)
+
+        # Subsampling for multiple sample sizes, repeated many times for CI
+        n_repeats = 5000  # Repeat 5k times for good 95% CI
+        alphas = [0.35, 0.25, 0.15]  # Decreasing alpha for larger sample sizes
+
+        for idx, sample_size in enumerate(sample_sizes):
+            if sample_size > total_count:
+                continue
+
+            cdf_subsamples = []
+            for _ in range(n_repeats):
+                sampled_bins = np.random.choice(len(bin_centers), size=sample_size, p=probs)
+                sub_counts = np.bincount(sampled_bins, minlength=len(bin_centers)).astype(float)
+                cdf_sub_raw = np.cumsum(sub_counts) / sub_counts.sum()
+                cdf_sub = np.interp(x_eval, bin_centers, cdf_sub_raw, left=0, right=1)
+                cdf_subsamples.append(cdf_sub)
+
+            cdf_subsamples = np.array(cdf_subsamples)
+            cdf_lo = np.percentile(cdf_subsamples, 2.5, axis=0)
+            cdf_hi = np.percentile(cdf_subsamples, 97.5, axis=0)
+
+            ax.fill_between(x_eval, cdf_lo, cdf_hi, alpha=alphas[idx], color=color)
+
+    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'])
+    ax.set_ylabel('Cumulative probability', fontsize=font_settings['label_size'])
+    ax.tick_params(labelsize=font_settings['tick_size'])
+    ax.legend(loc='lower right', fontsize=font_settings['legend_size'] - 1)
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(0, 1)
+    ax.set_box_aspect(1)
+
+
 def plot_qq_raw(ax: plt.Axes, dataset_results: DatasetSubsampleResults,
                 sample_sizes: List[int] = None) -> None:
     """Plot QQ-plot comparing raw subsample quantiles to whole section."""
@@ -685,19 +825,28 @@ def plot_combined_bias(
 def create_figure(
     human_results: DatasetSubsampleResults,
     rat_results: DatasetSubsampleResults,
-    output_file: Path
+    human_bin_centers: np.ndarray,
+    human_pooled_counts: np.ndarray,
+    rat_bin_centers: np.ndarray,
+    rat_pooled_counts: np.ndarray,
+    output_file: Path,
+    n_subsamples: int = N_SUBSAMPLES
 ) -> None:
     """Create the 2×2 figure."""
     fig, axes = plt.subplots(2, 2, figsize=(7, 7))
 
-    # Sample sizes for QQ plots (subset to avoid clutter)
-    qq_sample_sizes = [100, 10_000, 1_000_000]
+    # Sample sizes for subsampling visualization (10^2, 10^3, 10^4)
+    cdf_sample_sizes = [100, 1_000, 10_000]
 
-    # (a) Human CC: QQ (Raw)
-    plot_qq_raw(axes[0, 0], human_results, sample_sizes=qq_sample_sizes)
+    # (a) PDFs for both datasets with subsampling variability
+    plot_pdf_combined(axes[0, 0], human_bin_centers, human_pooled_counts,
+                      rat_bin_centers, rat_pooled_counts,
+                      cdf_sample_sizes, n_subsamples, x_max=2.0)
 
-    # (b) Rat WM: QQ (Raw)
-    plot_qq_raw(axes[0, 1], rat_results, sample_sizes=qq_sample_sizes)
+    # (b) CDFs for both datasets with subsampling variability
+    plot_cdf_combined(axes[0, 1], human_bin_centers, human_pooled_counts,
+                      rat_bin_centers, rat_pooled_counts,
+                      cdf_sample_sizes, n_subsamples, x_max=2.0)
 
     # (c) Arithmetic mean radius: percentage error vs sample size (both datasets)
     plot_combined_bias(axes[1, 0], human_results, rat_results,
@@ -720,10 +869,16 @@ def create_figure(
         ax.set_box_aspect(1)
 
     plt.tight_layout()
+    add_panel_labels(axes)
 
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
+
+    # Also save SVG version
+    svg_file = output_file.with_suffix('.svg')
+    plt.savefig(svg_file, bbox_inches='tight')
+    logger.info(f"Saved figure to {output_file} and {svg_file}")
+
     plt.close()
-    logger.info(f"Saved figure to {output_file}")
 
 
 # =============================================================================
@@ -775,10 +930,20 @@ def main():
         SAMPLE_SIZES, args.n_subsamples, quantile_points, "Rat WM"
     )
 
+    # Create pooled histograms
+    human_pooled_counts = human_counts.sum(axis=0)
+    rat_pooled_counts = rat_counts.sum(axis=0)
+
     # Create figure
     logger.info("=" * 60)
     logger.info("Creating figure...")
-    create_figure(human_results, rat_results, args.output)
+    create_figure(
+        human_results, rat_results,
+        human_centers, human_pooled_counts,
+        rat_centers, rat_pooled_counts,
+        args.output,
+        n_subsamples=args.n_subsamples
+    )
 
     # Save JSON metadata
     json_file = args.output.with_suffix('.json')
