@@ -179,6 +179,7 @@ models/
 
 # Output directories
 output/
+fig/
 .DS_Store
 node_modules/
 package-lock.json
