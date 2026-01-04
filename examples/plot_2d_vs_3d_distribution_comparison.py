@@ -239,8 +239,8 @@ def plot_pdf_stability(ax, slice_file: Path, radius_type: str = 'circular',
     font_settings = settings.fonts
     line_settings = settings.line
 
-    ax.fill_between(x, y_lo, y_hi, alpha=0.3, color='steelblue', label='IQR')
-    ax.plot(x, y_med, color='steelblue', linewidth=line_settings['linewidth'], label='Median')
+    ax.fill_between(x, y_lo, y_hi, alpha=0.3, color=settings.colors['category_a'], label='IQR')
+    ax.plot(x, y_med, color=settings.colors['category_a'], linewidth=line_settings['linewidth'], label='Median')
 
     ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
@@ -269,8 +269,10 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     font_settings = settings.fonts
     line_settings = settings.line
 
-    # Colors for small, medium, high
-    colors = ['#2ecc71', '#3498db', '#e74c3c']  # green, blue, red
+    # Representative example colors (green, orange, purple)
+    colors = [settings.colors['example_1'],
+              settings.colors['example_2'],
+              settings.colors['example_3']]
     sample_info = []  # Store (color, short_name, mean_r) for custom legend
 
     for idx, (slice_file, axon_file, sample_name, mean_r) in enumerate(samples):
@@ -500,11 +502,11 @@ def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, 
     parts = ax.violinplot([within_distances, between_distances], positions=[1, 2],
                            showmeans=False, showmedians=True, widths=0.7)
 
-    # Color the violins
-    colors = ['#3498db', '#e74c3c']  # blue for within, red for between
+    # Color the violins (high contrast for violin/box plots)
+    colors = [settings.colors['category_a_violin'], settings.colors['category_b_violin']]
     for i, pc in enumerate(parts['bodies']):
         pc.set_facecolor(colors[i])
-        pc.set_alpha(0.7)
+        pc.set_alpha(0.8)
 
     # Style median lines
     parts['cmedians'].set_color('black')
@@ -521,15 +523,15 @@ def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, 
     else:
         within_sample = within_distances
     jitter = np.random.uniform(-0.15, 0.15, len(within_sample))
-    ax.scatter(1 + jitter, within_sample, alpha=0.3, s=5, color=colors[0], zorder=0)
+    ax.scatter(1 + jitter, within_sample, alpha=0.4, s=5, color='#808080', zorder=0)
 
     # Add points for between
     jitter = np.random.uniform(-0.15, 0.15, len(between_distances))
-    ax.scatter(2 + jitter, between_distances, alpha=0.5, s=10, color=colors[1], zorder=0)
+    ax.scatter(2 + jitter, between_distances, alpha=0.5, s=10, color='#404040', zorder=0)
 
     ax.set_xticks([1, 2])
-    ax.set_xticklabels(['Intra-ROI\n(2D ↔ 3D)', 'Inter-ROI\n(3D)'],
-                        fontsize=font_settings['label_size'])
+    ax.set_xticklabels(['Sampling error\n(intra-ROI 2D ↔ 3D)', 'Biol. variability\n(inter-ROI 3D)'],
+                        fontsize=font_settings['tick_size'] - 1)
     ax.set_ylabel('Wasserstein distance [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
     ax.tick_params(axis='y', labelsize=font_settings['tick_size'])
@@ -611,8 +613,9 @@ def plot_discriminability_scatter(ax, all_pairs: List[Tuple[Path, Path, str, Set
     w_3d_pairs = np.array(w_3d_pairs)
     w_2d_pairs = np.array(w_2d_pairs)
 
-    # Scatter plot
-    ax.scatter(w_3d_pairs, w_2d_pairs, alpha=0.6, s=20, color='#3498db', edgecolor='black', linewidth=0.3)
+    # Scatter plot (single category - use single_line color)
+    ax.scatter(w_3d_pairs, w_2d_pairs, alpha=0.6, s=20, color=settings.colors['single_line'],
+               edgecolor='black', linewidth=0.3)
 
     # Identity line
     max_val = max(w_3d_pairs.max(), w_2d_pairs.max()) * 1.05
@@ -828,23 +831,32 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
     # Correlation
     r, p = stats.pearsonr(all_x, all_y)
 
-    # Identity line
+    # Compute axis limits
     all_vals = all_x + all_y
     min_val = min(all_vals) * 0.95
     max_val = max(all_vals) * 1.05
+
+    if metric == 'mean_radius':
+        xlabel = r'3D $\bar{r}$ [μm]'
+        ylabel = r'2D $\bar{r}$ [μm]'
+        # Set matching ticks with 0.05 step (within data range)
+        tick_step = 0.05
+        tick_start = np.ceil(min_val / tick_step) * tick_step
+        tick_end = np.floor(max_val / tick_step) * tick_step
+        ticks = np.arange(tick_start, tick_end + tick_step/2, tick_step)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+    else:
+        xlabel = r'3D $r_{\mathrm{MRI}}$ [μm]'
+        ylabel = r'2D $r_{\mathrm{MRI}}$ [μm]'
+
+    # Identity line (spans full axis range)
     ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5,
             linewidth=1.5, zorder=0)
 
     ax.set_xlim(min_val, max_val)
     ax.set_ylim(min_val, max_val)
     ax.set_box_aspect(1)  # Square subplot box
-
-    if metric == 'mean_radius':
-        xlabel = r'3D $\bar{r}$ [μm]'
-        ylabel = r'2D $\bar{r}$ [μm]'
-    else:
-        xlabel = r'3D $r_{\mathrm{MRI}}$ [μm]'
-        ylabel = r'2D $r_{\mathrm{MRI}}$ [μm]'
 
     ax.set_xlabel(xlabel, fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])

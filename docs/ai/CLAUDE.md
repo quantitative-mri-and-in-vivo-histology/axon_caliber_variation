@@ -331,6 +331,44 @@ Opens Neuroglancer viewer with multi-resolution support.
 
 All plot scripts in `examples/` must use centralized plot settings from `config/plot_settings.yaml` via the `axonometry` module. This ensures consistent styling across all figures.
 
+**IMPORTANT: Always respect the color scheme guidelines defined in `config/plot_settings.yaml`.**
+
+**Figure Color Scheme Guidelines:**
+
+*Global Distinctions (consistent across all figures):*
+- **Species** (when both shown):
+  - Human: Blue (`#4A90D9`)
+  - Rat: Red (`#D94A4A`)
+- **Condition** (rat data only) - both clearly in red family:
+  - Sham: Light brick red (`#E07070`)
+  - TBI: Dark maroon (`#802020`)
+- **Tract** (rat data only):
+  - CC (corpus callosum): Circles (●)
+  - CG (cingulum): Triangles (▲)
+- **Representative examples** (when showing 3 selected ROIs/axons):
+  - Example 1: Green (`#6B9E6B`)
+  - Example 2: Orange (`#D9864A`)
+  - Example 3: Purple (`#8B6BAE`)
+
+*Local Binary Comparisons (overlapping histograms):*
+Use filled vs step histogram:
+- **Category A (baseline)**: Filled histogram, light gray (`#B0B0B0`, alpha=0.7)
+- **Category B (comparison)**: Step histogram (unfilled), dark edge (`#303030`, linewidth=2)
+
+For violin/box plots (high contrast):
+- **Category A**: Light gray (`#D0D0D0`)
+- **Category B**: Dark gray (`#505050`)
+
+*Single lines/curves (no comparison):*
+- Use dark gray (`#505050`) for single median/mean lines with shaded IQR
+
+Examples: Ideal vs With slowdown, Intra-ROI vs Inter-ROI, CV vs radius (single line).
+
+*Encoding Priority:*
+1. Color for biological distinctions (species, condition)
+2. Shape for anatomical categories (tract)
+3. Grayscale for methodological comparisons
+
 **Figure conventions:**
 - **No suptitles**: Do not add figure-level titles (`fig.suptitle()`)
 - **No subplot titles**: Do not add individual panel titles (`ax.set_title()`)
@@ -344,11 +382,27 @@ from axonometry import get_plot_settings, add_panel_labels
 
 settings = get_plot_settings()
 
-# Colors
-color = settings.get_group_color('Sham')  # '#1f77b4' (blue)
-color = settings.get_group_color('TBI')   # '#d62728' (red)
+# Species colors
+human_color = settings.colors['human']  # '#4A90D9' (blue)
+rat_color = settings.colors['rat']      # '#D94A4A' (red)
 
-# Markers for populations
+# Condition colors (rat data) - both in red family
+sham_color = settings.colors['sham']    # '#E07070' (light brick red)
+tbi_color = settings.colors['tbi']      # '#802020' (dark maroon)
+
+# Binary comparison colors (filled vs step histogram)
+filled_gray = settings.colors['category_a']      # '#B0B0B0' (light gray, use alpha=0.7)
+step_edge = settings.colors['category_b_edge']   # '#303030' (dark edge, linewidth=2)
+# For violin/box plots:
+violin_light = settings.colors['category_a_violin']  # '#D0D0D0'
+violin_dark = settings.colors['category_b_violin']   # '#505050'
+
+# Representative example colors
+colors = [settings.colors['example_1'],  # Green
+          settings.colors['example_2'],  # Orange
+          settings.colors['example_3']]  # Purple
+
+# Markers for populations (tract)
 marker = settings.get_marker('CC')   # 'o' (circle)
 marker = settings.get_marker('CG')   # '^' (triangle)
 
@@ -389,7 +443,7 @@ plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
 ```
 
 **Settings file structure** (`config/plot_settings.yaml`):
-- `colors`: Group colors (sham, tbi), indicator lines (mean_line, median_line)
+- `colors`: Species (human, rat), condition (sham, tbi), examples (example_1/2/3), binary comparisons (category_a/b)
 - `markers`: Population markers (cc, cg, default)
 - `figure`: DPI, default figure size, suptitle/subplot_titles flags
 - `panel_labels`: Enabled, fontsize, fontweight, position, alignment

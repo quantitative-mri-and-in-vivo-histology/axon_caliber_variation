@@ -1,23 +1,60 @@
 # Plot settings for axon caliber variation figures
 # These settings ensure consistent styling across all plots
 
-# Color palettes
+# =============================================================================
+# Figure Color Scheme Guidelines
+# =============================================================================
+
+# Global Distinctions (consistent across all figures)
 colors:
-  sham: "#1f77b4"      # Blue
-  tbi: "#d62728"       # Red
-  unknown: "#7f7f7f"   # Gray
+  # Species (when both shown)
+  human: "#4A90D9"       # Blue
+  rat: "#D94A4A"         # Red
+
+  # Condition (rat data only) - both clearly in red family
+  sham: "#E07070"        # Light brick red
+  tbi: "#802020"         # Dark maroon
+
+  # Legacy aliases (for backward compatibility)
+  unknown: "#7f7f7f"     # Gray
 
   # For mean/median indicator lines in histograms
   mean_line: "red"
   median_line: "orange"
 
-# Marker styles for populations
+  # Representative examples (when showing 3 selected ROIs/axons)
+  example_1: "#6B9E6B"   # Green
+  example_2: "#D9864A"   # Orange
+  example_3: "#8B6BAE"   # Purple
+
+  # Local binary comparisons (overlapping histograms)
+  # Use filled vs step histogram:
+  # - Category A (baseline): Filled histogram, light gray
+  # - Category B (comparison): Step histogram (unfilled), dark edge
+  category_a: "#B0B0B0"        # Light gray (filled, alpha=0.7)
+  category_b_edge: "#303030"   # Dark edge for step histogram (linewidth=2)
+  # For violin/box plots (high contrast):
+  category_a_violin: "#D0D0D0" # Light gray
+  category_b_violin: "#505050" # Dark gray
+  # Single lines/curves (no comparison):
+  single_line: "#505050"       # Dark gray for single median/mean lines
+
+# Marker styles for populations (tract, rat data only)
 markers:
-  cc: "o"              # Circle
-  cg: "^"              # Triangle
+  cc: "o"              # Circle for corpus callosum
+  cg: "^"              # Triangle for cingulum
   default: "s"         # Square
 
+# =============================================================================
+# Encoding Priority
+# =============================================================================
+# 1. Color for strongest distinction (species, condition)
+# 2. Shape for secondary categorical (tract)
+# 3. Line style (solid/dashed) as tertiary option
+
+# =============================================================================
 # Figure settings
+# =============================================================================
 figure:
   dpi: 200
   format: "svg"            # Default output format (svg or png)

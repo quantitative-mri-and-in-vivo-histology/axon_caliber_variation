@@ -378,6 +378,10 @@ def run_subsampling_analysis(
 # Plotting Functions
 # =============================================================================
 
+# Font size reduction for this figure (smaller than default)
+FONT_REDUCTION = 2
+
+
 def plot_pdf_combined(
     ax: plt.Axes,
     human_bin_centers: np.ndarray,
@@ -391,10 +395,13 @@ def plot_pdf_combined(
     """Plot PDFs for both datasets with subsampling variability."""
     font_settings = settings.fonts
     line_settings = settings.line
+    label_size = font_settings['label_size'] - FONT_REDUCTION
+    tick_size = font_settings['tick_size'] - FONT_REDUCTION
+    legend_size = font_settings['legend_size'] - FONT_REDUCTION
 
-    # Colors for datasets
-    human_color = '#1f77b4'  # Blue
-    rat_color = '#d62728'    # Red
+    # Species colors
+    human_color = settings.colors['human']
+    rat_color = settings.colors['rat']
 
     # Common x-axis for PDF evaluation
     x_eval = np.linspace(0.02, x_max, 200)
@@ -444,10 +451,10 @@ def plot_pdf_combined(
 
             ax.fill_between(x_eval, pdf_lo, pdf_hi, alpha=alphas[idx], color=color)
 
-    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'])
-    ax.set_ylabel('Probability density [μm⁻¹]', fontsize=font_settings['label_size'])
-    ax.tick_params(labelsize=font_settings['tick_size'])
-    ax.legend(loc='upper right', fontsize=font_settings['legend_size'] - 1)
+    ax.set_xlabel('Axon radius [μm]', fontsize=label_size)
+    ax.set_ylabel('Probability density [μm⁻¹]', fontsize=label_size)
+    ax.tick_params(labelsize=tick_size)
+    ax.legend(loc='upper right', fontsize=legend_size - 1)
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
     ax.set_box_aspect(1)
@@ -476,18 +483,21 @@ def plot_within_vs_between_wasserstein(
     Reference: ROI↔ROI distances shown as horizontal band
     """
     font_settings = settings.fonts
+    label_size = font_settings['label_size'] - FONT_REDUCTION
+    tick_size = font_settings['tick_size'] - FONT_REDUCTION
+    legend_size = font_settings['legend_size'] - FONT_REDUCTION
 
-    # Colors
-    human_color = '#1f77b4'  # Blue
-    rat_color = '#d62728'    # Red
+    # Species colors
+    human_color = settings.colors['human']
+    rat_color = settings.colors['rat']
 
     datasets = [
         (human_bin_centers, human_counts_matrix, 'Human CC', human_color),
         (rat_bin_centers, rat_counts_matrix, 'Rat WM', rat_color),
     ]
 
-    # First compute between-ROI distances for reference
-    all_between = []
+    # Compute between-ROI distances per species
+    between_per_species = {}
     for bin_centers, counts_matrix, name, color in datasets:
         bin_width = bin_centers[1] - bin_centers[0]
         n_rois = counts_matrix.shape[0]
@@ -500,26 +510,19 @@ def plot_within_vs_between_wasserstein(
                 roi_cdf = np.cumsum(counts_matrix[i]) / roi_total
                 roi_cdfs.append(roi_cdf)
 
-        # Pairwise Wasserstein distances
+        # Pairwise Wasserstein distances within this species
+        species_between = []
         for i in range(len(roi_cdfs)):
             for j in range(i + 1, len(roi_cdfs)):
                 w_dist = compute_wasserstein_from_cdfs(roi_cdfs[i], roi_cdfs[j], bin_width)
-                all_between.append(w_dist)
-
-    all_between = np.array(all_between)
-    between_median = np.median(all_between)
-    between_lo = np.percentile(all_between, 25)
-    between_hi = np.percentile(all_between, 75)
-
-    # Plot between-ROI reference as horizontal band
-    ax.axhspan(between_lo, between_hi, alpha=0.15, color='gray', zorder=0)
-    ax.axhline(between_median, color='gray', linestyle='--', linewidth=1.5,
-               label=f'ROI↔ROI median', zorder=1)
+                species_between.append(w_dist)
+        between_per_species[name] = np.array(species_between)
 
     # Compute within-sample distances for each sample size and dataset
     np.random.seed(42)
     width = 0.3
-    x_positions = np.arange(len(sample_sizes))
+    n_sample_sizes = len(sample_sizes)
+    x_positions = np.arange(n_sample_sizes)
 
     # Collect all data for violin plots
     all_violin_data = []
@@ -550,6 +553,21 @@ def plot_within_vs_between_wasserstein(
             all_positions.append(size_idx + offset)
             all_colors.append(color)
 
+    # Add inter-ROI violins per species at the rightmost position
+    inter_roi_pos = n_sample_sizes + 0.5  # Add gap before inter-ROI
+    for dataset_idx, (_, _, name, color) in enumerate(datasets):
+        all_violin_data.append(between_per_species[name])
+        offset = -width/2 if dataset_idx == 0 else width/2
+        all_positions.append(inter_roi_pos + offset)
+        all_colors.append(color)
+
+    # Add gray background for inter-ROI section
+    divider_x = n_sample_sizes - 0.25  # Position of divider line
+    ax.axvspan(divider_x, inter_roi_pos + 0.6, color='#E0E0E0', zorder=0)
+    ax.axvline(divider_x, color='#808080', linestyle='--', linewidth=1.5, zorder=1)
+    # Set x-axis limits to reduce unused space
+    ax.set_xlim(-0.5, inter_roi_pos + 0.6)
+
     # Plot thin violins
     parts = ax.violinplot(all_violin_data, positions=all_positions,
                            showmeans=False, showmedians=True, widths=width * 0.8)
@@ -558,6 +576,7 @@ def plot_within_vs_between_wasserstein(
     for i, pc in enumerate(parts['bodies']):
         pc.set_facecolor(all_colors[i])
         pc.set_alpha(0.7)
+        pc.set_zorder(2)
 
     # Style median lines
     parts['cmedians'].set_color('black')
@@ -573,15 +592,29 @@ def plot_within_vs_between_wasserstein(
         Patch(facecolor=human_color, alpha=0.7, label='Human CC'),
         Patch(facecolor=rat_color, alpha=0.7, label='Rat WM'),
     ]
-    ax.legend(handles=handles, loc='upper right', fontsize=font_settings['legend_size'] - 1)
+    ax.legend(handles=handles, loc='upper right', fontsize=legend_size - 1)
 
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels([SAMPLE_SIZE_LABELS[s] for s in sample_sizes],
-                        fontsize=font_settings['tick_size'])
-    ax.set_xlabel('Sample size', fontsize=font_settings['label_size'])
-    ax.set_ylabel('Wasserstein distance [μm]', fontsize=font_settings['label_size'])
-    ax.tick_params(axis='y', labelsize=font_settings['tick_size'])
+    # X-axis: sample sizes + inter-ROI label
+    all_xticks = list(x_positions) + [inter_roi_pos]
+    all_xlabels = [SAMPLE_SIZE_LABELS[s] for s in sample_sizes] + ['Inter-\nROI']
+    ax.set_xticks(all_xticks)
+    ax.set_xticklabels(all_xlabels, fontsize=tick_size)
+
+    # Add curly brace below sample sizes with label
+    brace_y = -0.15  # Position below x-axis in axes coordinates
+    brace_center = (x_positions[0] + x_positions[-1]) / 2
+    ax.annotate('', xy=(x_positions[0] - 0.35, brace_y), xytext=(x_positions[-1] + 0.35, brace_y),
+                xycoords=('data', 'axes fraction'), textcoords=('data', 'axes fraction'),
+                arrowprops=dict(arrowstyle='-', color='black', lw=1,
+                               connectionstyle='bar,fraction=-0.2'))
+    ax.text(brace_center, brace_y - 0.06, 'Sample size', ha='center', va='top',
+            fontsize=tick_size, transform=ax.get_xaxis_transform())
+    ax.set_ylabel('Wasserstein distance [μm]', fontsize=label_size)
+    ax.tick_params(axis='y', labelsize=tick_size)
     ax.set_ylim(bottom=0)
+    # Set y-ticks in 0.05 steps
+    y_max = ax.get_ylim()[1]
+    ax.set_yticks(np.arange(0, y_max + 0.025, 0.05))
 
     ax.set_box_aspect(1)
 
@@ -734,16 +767,16 @@ def plot_bias(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_labe
     r_arith_bias_iqr = np.array(r_arith_bias_iqr).T
     r_eff_bias_iqr = np.array(r_eff_bias_iqr).T
 
-    # Plot bars
+    # Plot bars (binary comparison: teal vs coral)
     bars1 = ax.bar(x_positions - width/2, r_arith_bias_median, width,
                    yerr=r_arith_bias_iqr, label=r'$r_{arith}$',
-                   color='#1f77b4', alpha=0.8,
+                   color=settings.colors['category_a'], alpha=0.8,
                    capsize=err_settings['capsize'],
                    error_kw={'elinewidth': err_settings['linewidth']})
 
     bars2 = ax.bar(x_positions + width/2, r_eff_bias_median, width,
                    yerr=r_eff_bias_iqr, label=r'$r_{eff}$',
-                   color='#ff7f0e', alpha=0.8,
+                   color=settings.colors['category_b'], alpha=0.8,
                    capsize=err_settings['capsize'],
                    error_kw={'elinewidth': err_settings['linewidth']})
 
@@ -798,16 +831,16 @@ def plot_cov(ax: plt.Axes, dataset_results: DatasetSubsampleResults, panel_label
     r_arith_cov_iqr = np.array(r_arith_cov_iqr).T
     r_eff_cov_iqr = np.array(r_eff_cov_iqr).T
 
-    # Plot bars
+    # Plot bars (binary comparison: teal vs coral)
     bars1 = ax.bar(x_positions - width/2, r_arith_cov_median, width,
                    yerr=r_arith_cov_iqr, label=r'$r_{arith}$',
-                   color='#1f77b4', alpha=0.8,
+                   color=settings.colors['category_a'], alpha=0.8,
                    capsize=err_settings['capsize'],
                    error_kw={'elinewidth': err_settings['linewidth']})
 
     bars2 = ax.bar(x_positions + width/2, r_eff_cov_median, width,
                    yerr=r_eff_cov_iqr, label=r'$r_{eff}$',
-                   color='#ff7f0e', alpha=0.8,
+                   color=settings.colors['category_b'], alpha=0.8,
                    capsize=err_settings['capsize'],
                    error_kw={'elinewidth': err_settings['linewidth']})
 
@@ -830,10 +863,13 @@ def plot_combined_bias(
 ) -> None:
     """Plot percentage error vs sample size for both datasets."""
     font_settings = settings.fonts
+    label_size = font_settings['label_size'] - FONT_REDUCTION
+    tick_size = font_settings['tick_size'] - FONT_REDUCTION
+    legend_size = font_settings['legend_size'] - FONT_REDUCTION
 
-    # Colors for datasets
-    human_color = '#1f77b4'  # Blue
-    rat_color = '#d62728'    # Red
+    # Species colors
+    human_color = settings.colors['human']
+    rat_color = settings.colors['rat']
 
     datasets = [
         (rat_results, 'Rat WM', rat_color, 's'),      # Squares on bottom
@@ -880,10 +916,10 @@ def plot_combined_bias(
 
     ax.axhline(0, color='black', linestyle='-', linewidth=1)
     ax.set_xscale('log')
-    ax.set_xlabel('Sample size', fontsize=font_settings['label_size'])
-    ax.set_ylabel(ylabel, fontsize=font_settings['label_size'])
-    ax.legend(loc='best', fontsize=font_settings['legend_size'])
-    ax.tick_params(labelsize=font_settings['tick_size'])
+    ax.set_xlabel('Sample size', fontsize=label_size)
+    ax.set_ylabel(ylabel, fontsize=label_size)
+    ax.legend(loc='best', fontsize=legend_size)
+    ax.tick_params(labelsize=tick_size)
 
 
 def create_figure(
@@ -937,7 +973,6 @@ def create_figure(
         ax.set_box_aspect(1)
 
     plt.tight_layout()
-    add_panel_labels(axes)
 
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
 

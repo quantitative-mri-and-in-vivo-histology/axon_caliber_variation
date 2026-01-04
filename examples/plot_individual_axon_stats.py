@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
 
-from axonometry import add_panel_labels, get_plot_settings, style_axis
+from axonometry import get_plot_settings, style_axis
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -540,9 +540,12 @@ def plot_cv_vs_radius(
     hist_settings = settings.histogram
     font_settings = settings.fonts
     line_settings = settings.line
-    main_color = settings.get_group_color('sham')  # Use sham color as default blue
+    main_color = settings.colors['category_a']  # Teal for main distribution
 
-    cv_colors = ['#2ca02c', '#1f77b4', '#d62728']  # green (low), blue (mid), red (high)
+    # Representative example colors (green, orange, purple)
+    cv_colors = [settings.colors['example_1'],
+                 settings.colors['example_2'],
+                 settings.colors['example_3']]
     cv_labels = ['Low CV', 'Mid CV', 'High CV']
 
     # Select representative axons using skeleton coords (memory efficient - no volume needed)
@@ -685,11 +688,12 @@ def plot_cv_vs_radius(
     bin_q75 = np.array(bin_q75)
     valid = ~np.isnan(bin_medians)
 
-    ax_cv.plot(bin_centers[valid], bin_medians[valid], color=main_color, linestyle='-',
+    single_line_color = settings.colors['single_line']  # Dark gray for single lines
+    ax_cv.plot(bin_centers[valid], bin_medians[valid], color=single_line_color, linestyle='-',
                linewidth=line_settings['linewidth'], marker='o',
                markersize=line_settings['marker_size'], label='Median')
     ax_cv.fill_between(bin_centers[valid], bin_q25[valid], bin_q75[valid],
-                       color=main_color, alpha=line_settings['fill_alpha'], label='IQR (25-75%)')
+                       color=single_line_color, alpha=line_settings['fill_alpha'], label='IQR (25-75%)')
     style_axis(ax_cv, xlabel=r'Along-axon $\bar{r}$ [μm]', ylabel='CV')
     ax_cv.legend(loc='upper right', fontsize=font_settings['legend_size'])
     ax_cv.set_xlim(0, x_max)
@@ -700,10 +704,14 @@ def plot_cv_vs_radius(
     velocity_slow = velocity * all_slowdown  # m/s (with slowdown from caliber variation)
 
     bins = np.linspace(0, np.percentile(velocity, 99.5), hist_settings['bins'] + 1)
-    ax_vel.hist(velocity, bins=bins, color=main_color, edgecolor=hist_settings['edgecolor'],
-                alpha=0.5, label=f'Ideal: {np.mean(velocity):.1f} m/s')
-    ax_vel.hist(velocity_slow, bins=bins, color='#d62728', edgecolor=hist_settings['edgecolor'],
-                alpha=0.5, label=f'With slowdown: {np.mean(velocity_slow):.1f} m/s')
+    # Filled histogram for "Ideal" (baseline)
+    ax_vel.hist(velocity, bins=bins, color=settings.colors['category_a'],
+                edgecolor='white', linewidth=0.5,
+                alpha=0.7, label=f'Ideal: {np.mean(velocity):.1f} m/s')
+    # Step histogram for "With slowdown" (comparison)
+    ax_vel.hist(velocity_slow, bins=bins, histtype='step',
+                edgecolor=settings.colors['category_b_edge'], linewidth=2,
+                label=f'With slowdown: {np.mean(velocity_slow):.1f} m/s')
 
     mean_slowdown = np.mean(all_slowdown)
     ax_vel.text(0.95, 0.75, f'Mean slowdown:\n{mean_slowdown:.3f}',
@@ -722,23 +730,6 @@ def plot_cv_vs_radius(
     fig.subplots_adjust(left=0.14, right=0.98, top=0.95, bottom=0.08, wspace=0.3, hspace=0.3)
     # Restore 3D axes position
     ax_vol.set_position([-0.42, -0.5, 0.55, 2.0])
-
-    # Add panel labels (a-e) - handle 3D axis specially
-    panel_settings = settings.panel_labels
-    labels = ['a', 'b', 'c', 'd', 'e']
-    for ax, label in zip(axes_list, labels):
-        if hasattr(ax, 'text2D'):  # 3D axis
-            ax.text2D(panel_settings['position'][0], panel_settings['position'][1],
-                      label, transform=ax.transAxes,
-                      fontsize=panel_settings['fontsize'],
-                      fontweight=panel_settings['fontweight'],
-                      va=panel_settings['va'], ha=panel_settings['ha'])
-        else:
-            ax.text(panel_settings['position'][0], panel_settings['position'][1],
-                    label, transform=ax.transAxes,
-                    fontsize=panel_settings['fontsize'],
-                    fontweight=panel_settings['fontweight'],
-                    va=panel_settings['va'], ha=panel_settings['ha'])
 
     # Save figure
     output_file.parent.mkdir(parents=True, exist_ok=True)
