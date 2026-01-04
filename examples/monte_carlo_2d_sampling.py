@@ -92,6 +92,7 @@ def load_roi_data(npz_file: Path, radius_type: str = 'minor') -> Dict:
         Dictionary with:
         - histograms: Per-slice histograms (n_slices, n_bins)
         - bin_centers: Bin center values
+        - r_eff_per_slice: Pre-computed r_eff per slice (from raw radii)
         - r_eff_3d: 3D reference effective radius
         - r_arith_3d: 3D reference arithmetic mean radius
         - n_slices: Number of valid slices
@@ -102,19 +103,22 @@ def load_roi_data(npz_file: Path, radius_type: str = 'minor') -> Dict:
     # Select histogram type based on radius_type
     if radius_type == 'minor':
         histograms = data['histograms_minor']
+        r_eff_per_slice = data['r_eff_minor_per_slice']
         r_eff_3d = float(data['r_eff_minor_global'])
         r_arith_3d = float(data['mean_radius_minor'])
     else:
         histograms = data['histograms_circular']
+        r_eff_per_slice = data['r_eff_circular_per_slice']
         r_eff_3d = float(data['r_eff_circular_global'])
         r_arith_3d = float(data['mean_radius_circular'])
 
     bin_centers = data['bin_centers']
 
-    # Filter to valid slices (non-empty histograms)
+    # Filter to valid slices (non-empty histograms AND valid r_eff)
     slice_counts = histograms.sum(axis=1)
-    valid_mask = slice_counts > 0
+    valid_mask = (slice_counts > 0) & (r_eff_per_slice > 0)
     histograms = histograms[valid_mask]
+    r_eff_per_slice = r_eff_per_slice[valid_mask]
 
     # Extract ROI name from filename
     name = npz_file.stem.replace('_slice_profiles', '')
@@ -122,6 +126,7 @@ def load_roi_data(npz_file: Path, radius_type: str = 'minor') -> Dict:
     return {
         'histograms': histograms,
         'bin_centers': bin_centers,
+        'r_eff_per_slice': r_eff_per_slice,  # Pre-computed from raw radii
         'r_eff_3d': r_eff_3d,
         'r_arith_3d': r_arith_3d,
         'n_slices': len(histograms),
@@ -217,8 +222,10 @@ def run_monte_carlo(
             bin_centers = roi['bin_centers']
 
             # Compute 2D metrics from single slice
+            # r_arith: computed from histogram (sufficient accuracy for mean)
+            # r_eff: use pre-computed value from raw radii (critical for r^6 moment)
             r_arith_2d[j] = compute_r_arith_from_histogram(hist, bin_centers)
-            r_eff_2d[j] = compute_r_eff_from_histogram(hist, bin_centers)
+            r_eff_2d[j] = roi['r_eff_per_slice'][slice_idx]
 
         # Compute correlations and permutation p-values
         # Filter out any NaN values

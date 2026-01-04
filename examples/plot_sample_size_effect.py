@@ -453,72 +453,136 @@ def plot_pdf_combined(
     ax.set_box_aspect(1)
 
 
-def plot_cdf_combined(
+def compute_wasserstein_from_cdfs(cdf1: np.ndarray, cdf2: np.ndarray,
+                                   bin_width: float) -> float:
+    """Compute Wasserstein distance between two CDFs."""
+    return np.sum(np.abs(cdf1 - cdf2)) * bin_width
+
+
+def plot_within_vs_between_wasserstein(
     ax: plt.Axes,
     human_bin_centers: np.ndarray,
-    human_pooled_counts: np.ndarray,
+    human_counts_matrix: np.ndarray,
     rat_bin_centers: np.ndarray,
-    rat_pooled_counts: np.ndarray,
-    sample_sizes: List[int],
-    n_subsamples: int,
-    x_max: float = 2.0
+    rat_counts_matrix: np.ndarray,
+    sample_sizes: List[int] = [100, 1000, 10000],
+    n_subsamples: int = 500
 ) -> None:
-    """Plot CDFs for both datasets with subsampling variability."""
-    font_settings = settings.fonts
-    line_settings = settings.line
+    """
+    Plot within-sample vs between-ROI Wasserstein distances.
 
-    # Colors for datasets
+    X-axis: sample sizes
+    Grouped violins: Human (blue) and Rat (red) for each sample size
+    Reference: ROI↔ROI distances shown as horizontal band
+    """
+    font_settings = settings.fonts
+
+    # Colors
     human_color = '#1f77b4'  # Blue
     rat_color = '#d62728'    # Red
 
-    # Common x-axis for CDF evaluation
-    x_eval = np.linspace(0.02, x_max, 200)
-
     datasets = [
-        (human_bin_centers, human_pooled_counts, human_color, 'Human CC'),
-        (rat_bin_centers, rat_pooled_counts, rat_color, 'Rat WM'),
+        (human_bin_centers, human_counts_matrix, 'Human CC', human_color),
+        (rat_bin_centers, rat_counts_matrix, 'Rat WM', rat_color),
     ]
 
-    for bin_centers, pooled_counts, color, label in datasets:
-        total_count = pooled_counts.sum()
-        probs = pooled_counts / total_count
+    # First compute between-ROI distances for reference
+    all_between = []
+    for bin_centers, counts_matrix, name, color in datasets:
+        bin_width = bin_centers[1] - bin_centers[0]
+        n_rois = counts_matrix.shape[0]
 
-        # Reference CDF (full distribution)
-        cdf_ref_raw = np.cumsum(pooled_counts) / total_count
-        cdf_ref = np.interp(x_eval, bin_centers, cdf_ref_raw, left=0, right=1)
+        # Compute CDF for each ROI
+        roi_cdfs = []
+        for i in range(n_rois):
+            roi_total = counts_matrix[i].sum()
+            if roi_total > 0:
+                roi_cdf = np.cumsum(counts_matrix[i]) / roi_total
+                roi_cdfs.append(roi_cdf)
 
-        # Plot full distribution (thin line)
-        ax.plot(x_eval, cdf_ref, color=color, linewidth=1.0,
-                label=f'{label}', zorder=10)
+        # Pairwise Wasserstein distances
+        for i in range(len(roi_cdfs)):
+            for j in range(i + 1, len(roi_cdfs)):
+                w_dist = compute_wasserstein_from_cdfs(roi_cdfs[i], roi_cdfs[j], bin_width)
+                all_between.append(w_dist)
 
-        # Subsampling for multiple sample sizes, repeated many times for CI
-        n_repeats = 5000  # Repeat 5k times for good 95% CI
-        alphas = [0.35, 0.25, 0.15]  # Decreasing alpha for larger sample sizes
+    all_between = np.array(all_between)
+    between_median = np.median(all_between)
+    between_lo = np.percentile(all_between, 25)
+    between_hi = np.percentile(all_between, 75)
 
-        for idx, sample_size in enumerate(sample_sizes):
-            if sample_size > total_count:
-                continue
+    # Plot between-ROI reference as horizontal band
+    ax.axhspan(between_lo, between_hi, alpha=0.15, color='gray', zorder=0)
+    ax.axhline(between_median, color='gray', linestyle='--', linewidth=1.5,
+               label=f'ROI↔ROI median', zorder=1)
 
-            cdf_subsamples = []
-            for _ in range(n_repeats):
-                sampled_bins = np.random.choice(len(bin_centers), size=sample_size, p=probs)
+    # Compute within-sample distances for each sample size and dataset
+    np.random.seed(42)
+    width = 0.3
+    x_positions = np.arange(len(sample_sizes))
+
+    # Collect all data for violin plots
+    all_violin_data = []
+    all_positions = []
+    all_colors = []
+
+    for dataset_idx, (bin_centers, counts_matrix, name, color) in enumerate(datasets):
+        bin_width = bin_centers[1] - bin_centers[0]
+
+        # Compute pooled distribution
+        pooled_counts = counts_matrix.sum(axis=0)
+        pooled_total = pooled_counts.sum()
+        pooled_cdf = np.cumsum(pooled_counts) / pooled_total
+        pooled_probs = pooled_counts / pooled_total
+
+        for size_idx, sample_size in enumerate(sample_sizes):
+            within_distances = []
+            for _ in range(n_subsamples):
+                sampled_bins = np.random.choice(len(bin_centers), size=sample_size, p=pooled_probs)
                 sub_counts = np.bincount(sampled_bins, minlength=len(bin_centers)).astype(float)
-                cdf_sub_raw = np.cumsum(sub_counts) / sub_counts.sum()
-                cdf_sub = np.interp(x_eval, bin_centers, cdf_sub_raw, left=0, right=1)
-                cdf_subsamples.append(cdf_sub)
+                sub_cdf = np.cumsum(sub_counts) / sub_counts.sum()
+                w_dist = compute_wasserstein_from_cdfs(sub_cdf, pooled_cdf, bin_width)
+                within_distances.append(w_dist)
 
-            cdf_subsamples = np.array(cdf_subsamples)
-            cdf_lo = np.percentile(cdf_subsamples, 2.5, axis=0)
-            cdf_hi = np.percentile(cdf_subsamples, 97.5, axis=0)
+            all_violin_data.append(within_distances)
+            # Offset for grouped violins
+            offset = -width/2 if dataset_idx == 0 else width/2
+            all_positions.append(size_idx + offset)
+            all_colors.append(color)
 
-            ax.fill_between(x_eval, cdf_lo, cdf_hi, alpha=alphas[idx], color=color)
+    # Plot thin violins
+    parts = ax.violinplot(all_violin_data, positions=all_positions,
+                           showmeans=False, showmedians=True, widths=width * 0.8)
 
-    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'])
-    ax.set_ylabel('Cumulative probability', fontsize=font_settings['label_size'])
-    ax.tick_params(labelsize=font_settings['tick_size'])
-    ax.legend(loc='lower right', fontsize=font_settings['legend_size'] - 1)
-    ax.set_xlim(0, x_max)
-    ax.set_ylim(0, 1)
+    # Color each violin
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(all_colors[i])
+        pc.set_alpha(0.7)
+
+    # Style median lines
+    parts['cmedians'].set_color('black')
+    parts['cmedians'].set_linewidth(1.5)
+    parts['cbars'].set_color('gray')
+    parts['cbars'].set_linewidth(0.5)
+    parts['cmins'].set_color('gray')
+    parts['cmaxes'].set_color('gray')
+
+    # Add legend manually
+    from matplotlib.patches import Patch
+    handles = [
+        Patch(facecolor=human_color, alpha=0.7, label='Human CC'),
+        Patch(facecolor=rat_color, alpha=0.7, label='Rat WM'),
+    ]
+    ax.legend(handles=handles, loc='upper right', fontsize=font_settings['legend_size'] - 1)
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels([SAMPLE_SIZE_LABELS[s] for s in sample_sizes],
+                        fontsize=font_settings['tick_size'])
+    ax.set_xlabel('Sample size', fontsize=font_settings['label_size'])
+    ax.set_ylabel('Wasserstein distance [μm]', fontsize=font_settings['label_size'])
+    ax.tick_params(axis='y', labelsize=font_settings['tick_size'])
+    ax.set_ylim(bottom=0)
+
     ax.set_box_aspect(1)
 
 
@@ -826,9 +890,9 @@ def create_figure(
     human_results: DatasetSubsampleResults,
     rat_results: DatasetSubsampleResults,
     human_bin_centers: np.ndarray,
-    human_pooled_counts: np.ndarray,
+    human_counts_matrix: np.ndarray,
     rat_bin_centers: np.ndarray,
-    rat_pooled_counts: np.ndarray,
+    rat_counts_matrix: np.ndarray,
     output_file: Path,
     n_subsamples: int = N_SUBSAMPLES
 ) -> None:
@@ -836,17 +900,21 @@ def create_figure(
     fig, axes = plt.subplots(2, 2, figsize=(7, 7))
 
     # Sample sizes for subsampling visualization (10^2, 10^3, 10^4)
-    cdf_sample_sizes = [100, 1_000, 10_000]
+    pdf_sample_sizes = [100, 1_000, 10_000]
+
+    # Pooled counts for PDF plot
+    human_pooled_counts = human_counts_matrix.sum(axis=0)
+    rat_pooled_counts = rat_counts_matrix.sum(axis=0)
 
     # (a) PDFs for both datasets with subsampling variability
     plot_pdf_combined(axes[0, 0], human_bin_centers, human_pooled_counts,
                       rat_bin_centers, rat_pooled_counts,
-                      cdf_sample_sizes, n_subsamples, x_max=2.0)
+                      pdf_sample_sizes, n_subsamples, x_max=2.0)
 
-    # (b) CDFs for both datasets with subsampling variability
-    plot_cdf_combined(axes[0, 1], human_bin_centers, human_pooled_counts,
-                      rat_bin_centers, rat_pooled_counts,
-                      cdf_sample_sizes, n_subsamples, x_max=2.0)
+    # (b) Within-sample vs Between-ROI Wasserstein distances
+    plot_within_vs_between_wasserstein(axes[0, 1], human_bin_centers, human_counts_matrix,
+                                        rat_bin_centers, rat_counts_matrix,
+                                        sample_sizes=[100, 1000, 10000], n_subsamples=500)
 
     # (c) Arithmetic mean radius: percentage error vs sample size (both datasets)
     plot_combined_bias(axes[1, 0], human_results, rat_results,
@@ -930,17 +998,13 @@ def main():
         SAMPLE_SIZES, args.n_subsamples, quantile_points, "Rat WM"
     )
 
-    # Create pooled histograms
-    human_pooled_counts = human_counts.sum(axis=0)
-    rat_pooled_counts = rat_counts.sum(axis=0)
-
     # Create figure
     logger.info("=" * 60)
     logger.info("Creating figure...")
     create_figure(
         human_results, rat_results,
-        human_centers, human_pooled_counts,
-        rat_centers, rat_pooled_counts,
+        human_centers, human_counts,
+        rat_centers, rat_counts,
         args.output,
         n_subsamples=args.n_subsamples
     )

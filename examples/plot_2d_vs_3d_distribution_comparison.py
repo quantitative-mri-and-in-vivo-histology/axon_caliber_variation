@@ -379,119 +379,269 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     ax.set_box_aspect(1)  # Square subplot box
 
 
-def plot_cdf_representative(ax, samples: List[Tuple[Path, Path, str, float]],
-                            data_dir: Path,
-                            radius_type: str = 'circular',
-                            x_max: float = 1.5) -> None:
+def compute_ks_and_wasserstein_per_slice(slice_file: Path, axon_file: Path,
+                                          population_labels: Set[int],
+                                          radius_type: str = 'circular'
+                                          ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Plot CDF comparison for representative samples with slice variability.
+    Compute KS and Wasserstein distances between each 2D slice and 3D ground truth.
 
-    For each sample, shows 3D CDF (solid) and 2D CDF with IQR across slices,
-    using the same colors as the PDF plot.
+    Returns:
+        Tuple of (ks_values, wasserstein_values) arrays (one per valid slice)
+    """
+    # Load 2D slice data
+    npz_2d = np.load(slice_file)
+    bin_centers = npz_2d['bin_centers']
+    histograms = npz_2d[f'histograms_{radius_type}']
+    bin_width = bin_centers[1] - bin_centers[0]
+
+    # Load 3D data and filter by population
+    npz_3d = np.load(axon_file, allow_pickle=True)
+    axon_labels = npz_3d['labels']
+    radii_profiles = npz_3d['radii_profiles_um']
+
+    # Collect 3D radii for this population
+    all_radii_3d = []
+    for i, label in enumerate(axon_labels):
+        if int(label) in population_labels:
+            all_radii_3d.extend(radii_profiles[i])
+    all_radii_3d = np.array(all_radii_3d)
+
+    # Compute 3D CDF at bin centers
+    sorted_3d = np.sort(all_radii_3d)
+    cdf_3d_y = np.arange(1, len(sorted_3d) + 1) / len(sorted_3d)
+    cdf_3d = np.interp(bin_centers, sorted_3d, cdf_3d_y, left=0, right=1)
+
+    # Compute distances for each valid slice
+    ks_values = []
+    wasserstein_values = []
+
+    for i in range(histograms.shape[0]):
+        if histograms[i].sum() > MIN_AXON_COUNT:
+            # Compute 2D CDF
+            cdf_2d = np.cumsum(histograms[i]) / histograms[i].sum()
+
+            # KS statistic = max |CDF_2D - CDF_3D|
+            ks = np.max(np.abs(cdf_2d - cdf_3d))
+            ks_values.append(ks)
+
+            # Wasserstein distance = integral of |CDF_2D - CDF_3D|
+            # For discrete CDFs, this is sum of |CDF differences| * bin_width
+            wasserstein = np.sum(np.abs(cdf_2d - cdf_3d)) * bin_width
+            wasserstein_values.append(wasserstein)
+
+    return np.array(ks_values), np.array(wasserstein_values)
+
+
+def compute_3d_cdf(axon_file: Path, population_labels: Set[int],
+                    bin_centers: np.ndarray) -> np.ndarray:
+    """Compute 3D CDF at given bin centers for a population."""
+    npz_3d = np.load(axon_file, allow_pickle=True)
+    axon_labels = npz_3d['labels']
+    radii_profiles = npz_3d['radii_profiles_um']
+
+    all_radii = []
+    for i, label in enumerate(axon_labels):
+        if int(label) in population_labels:
+            all_radii.extend(radii_profiles[i])
+    all_radii = np.array(all_radii)
+
+    sorted_radii = np.sort(all_radii)
+    cdf_y = np.arange(1, len(sorted_radii) + 1) / len(sorted_radii)
+    return np.interp(bin_centers, sorted_radii, cdf_y, left=0, right=1)
+
+
+def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, Set[int]]],
+                                      radius_type: str = 'circular') -> None:
+    """
+    Plot within-ROI vs between-ROI Wasserstein distances.
+
+    Left: 2D slice vs 3D ground truth (within-ROI sampling variation)
+    Right: ROI vs ROI (between-ROI biological variation)
 
     Args:
         ax: Matplotlib axes
-        samples: List of (slice_file, axon_file, sample_name, mean_radius) tuples
-        data_dir: Directory containing population JSON files
+        all_pairs: List of (slice_file, axon_file, sample_name, population_labels) tuples
         radius_type: 'circular' or 'minor'
-        x_max: Maximum x-axis value
     """
-    # Same colors as PDF plot (small, medium, high mean radius)
-    colors = ['#2ecc71', '#3498db', '#e74c3c']  # green, blue, red
-
-    # Common x-axis for CDF evaluation
-    x_eval = np.linspace(0.02, x_max, 200)
-
     font_settings = settings.fonts
-    line_settings = settings.line
 
-    for idx, (slice_file, axon_file, sample_name, mean_r) in enumerate(samples):
-        # Load 2D slice data
-        npz_2d = np.load(slice_file)
-        bin_centers = npz_2d['bin_centers']
-        histograms = npz_2d[f'histograms_{radius_type}']
+    # Get common bin centers from first file
+    first_npz = np.load(all_pairs[0][0])
+    bin_centers = first_npz['bin_centers']
+    bin_width = bin_centers[1] - bin_centers[0]
 
-        # Load 3D data and filter by population
-        population = sample_name.split('_')[-1].lower()
-        base_name = slice_file.stem.replace(f'_{population}_slice_profiles', '')
-        pop_labels = load_population_labels(data_dir, base_name, population)
+    # Collect within-ROI distances (all 2D slices vs their 3D ground truth)
+    within_distances = []
+    roi_cdfs = []  # Store 3D CDFs for between-ROI comparison
 
-        npz_3d = np.load(axon_file, allow_pickle=True)
-        axon_labels = npz_3d['labels']
-        radii_profiles = npz_3d['radii_profiles_um']
+    for slice_file, axon_file, sample_name, pop_labels in all_pairs:
+        _, wasserstein_values = compute_ks_and_wasserstein_per_slice(
+            slice_file, axon_file, pop_labels, radius_type)
+        within_distances.extend(wasserstein_values)
 
-        # Collect 3D radii for this population
-        all_radii_3d = []
-        for i, label in enumerate(axon_labels):
-            if int(label) in pop_labels:
-                all_radii_3d.extend(radii_profiles[i])
-        all_radii_3d = np.array(all_radii_3d)
+        # Store 3D CDF for this ROI
+        cdf_3d = compute_3d_cdf(axon_file, pop_labels, bin_centers)
+        roi_cdfs.append(cdf_3d)
 
-        # Compute 3D CDF
-        sorted_3d = np.sort(all_radii_3d)
-        cdf_3d_y = np.arange(1, len(sorted_3d) + 1) / len(sorted_3d)
-        cdf_3d = np.interp(x_eval, sorted_3d, cdf_3d_y, left=0, right=1)
+    # Compute between-ROI distances (pairwise comparisons of 3D distributions)
+    between_distances = []
+    n_rois = len(roi_cdfs)
+    for i in range(n_rois):
+        for j in range(i + 1, n_rois):
+            # Wasserstein = integral of |CDF_i - CDF_j|
+            w_dist = np.sum(np.abs(roi_cdfs[i] - roi_cdfs[j])) * bin_width
+            between_distances.append(w_dist)
 
-        # Compute 2D CDF per slice
-        cdf_2d_per_slice = []
-        for i in range(histograms.shape[0]):
-            if histograms[i].sum() > MIN_AXON_COUNT:
-                cdf_2d_raw = np.cumsum(histograms[i]) / histograms[i].sum()
-                cdf_2d = np.interp(x_eval, bin_centers, cdf_2d_raw, left=0, right=1)
-                cdf_2d_per_slice.append(cdf_2d)
+    within_distances = np.array(within_distances)
+    between_distances = np.array(between_distances)
 
-        if len(cdf_2d_per_slice) == 0:
+    # Create violin plots
+    parts = ax.violinplot([within_distances, between_distances], positions=[1, 2],
+                           showmeans=False, showmedians=True, widths=0.7)
+
+    # Color the violins
+    colors = ['#3498db', '#e74c3c']  # blue for within, red for between
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(colors[i])
+        pc.set_alpha(0.7)
+
+    # Style median lines
+    parts['cmedians'].set_color('black')
+    parts['cmedians'].set_linewidth(2)
+    parts['cbars'].set_color('gray')
+    parts['cmins'].set_color('gray')
+    parts['cmaxes'].set_color('gray')
+
+    # Add individual points with jitter for within (subsample if too many)
+    np.random.seed(42)
+    if len(within_distances) > 500:
+        idx = np.random.choice(len(within_distances), 500, replace=False)
+        within_sample = within_distances[idx]
+    else:
+        within_sample = within_distances
+    jitter = np.random.uniform(-0.15, 0.15, len(within_sample))
+    ax.scatter(1 + jitter, within_sample, alpha=0.3, s=5, color=colors[0], zorder=0)
+
+    # Add points for between
+    jitter = np.random.uniform(-0.15, 0.15, len(between_distances))
+    ax.scatter(2 + jitter, between_distances, alpha=0.5, s=10, color=colors[1], zorder=0)
+
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels(['Intra-ROI\n(2D ↔ 3D)', 'Inter-ROI\n(3D)'],
+                        fontsize=font_settings['label_size'])
+    ax.set_ylabel('Wasserstein distance [μm]', fontsize=font_settings['label_size'],
+                  fontweight=font_settings['weight'])
+    ax.tick_params(axis='y', labelsize=font_settings['tick_size'])
+    ax.set_ylim(bottom=0)
+    ax.set_box_aspect(1)
+
+
+def compute_2d_pooled_cdf(slice_file: Path, bin_centers: np.ndarray,
+                           radius_type: str = 'circular') -> Optional[np.ndarray]:
+    """Compute pooled 2D CDF from all slices. Returns None if no valid slices."""
+    npz_2d = np.load(slice_file)
+    histograms = npz_2d[f'histograms_{radius_type}']
+
+    # Pool all valid slices
+    pooled_hist = np.zeros(len(bin_centers))
+    for i in range(histograms.shape[0]):
+        if histograms[i].sum() > MIN_AXON_COUNT:
+            pooled_hist += histograms[i]
+
+    if pooled_hist.sum() == 0:
+        return None  # No valid slices
+
+    return np.cumsum(pooled_hist) / pooled_hist.sum()
+
+
+def plot_discriminability_scatter(ax, all_pairs: List[Tuple[Path, Path, str, Set[int]]],
+                                   radius_type: str = 'circular') -> None:
+    """
+    Plot W_2D vs W_3D for all ROI pairs (discriminability test).
+
+    Shows whether 2D preserves the relative differences between ROIs.
+
+    Args:
+        ax: Matplotlib axes
+        all_pairs: List of (slice_file, axon_file, sample_name, population_labels) tuples
+        radius_type: 'circular' or 'minor'
+    """
+    font_settings = settings.fonts
+
+    # Get common bin centers from first file
+    first_npz = np.load(all_pairs[0][0])
+    bin_centers = first_npz['bin_centers']
+    bin_width = bin_centers[1] - bin_centers[0]
+
+    # Compute CDFs for all ROIs (both 2D and 3D)
+    roi_cdfs_3d = []
+    roi_cdfs_2d = []
+    roi_names = []
+
+    for slice_file, axon_file, sample_name, pop_labels in all_pairs:
+        # 2D pooled CDF (check first to skip invalid ROIs)
+        cdf_2d = compute_2d_pooled_cdf(slice_file, bin_centers, radius_type)
+        if cdf_2d is None:
+            logger.warning(f"Skipping {sample_name} - no valid 2D slices")
             continue
 
-        cdf_2d_per_slice = np.array(cdf_2d_per_slice)
+        # 3D CDF
+        cdf_3d = compute_3d_cdf(axon_file, pop_labels, bin_centers)
 
-        # Compute median and 95% CI across slices
-        cdf_2d_median = np.median(cdf_2d_per_slice, axis=0)
-        cdf_2d_lo = np.percentile(cdf_2d_per_slice, 2.5, axis=0)
-        cdf_2d_hi = np.percentile(cdf_2d_per_slice, 97.5, axis=0)
+        roi_cdfs_3d.append(cdf_3d)
+        roi_cdfs_2d.append(cdf_2d)
+        roi_names.append(sample_name)
 
-        # Extract short name
-        parts = sample_name.split('_')
-        short_name = f"{parts[1]} {parts[2]} {parts[3]}"
+    # Compute pairwise Wasserstein distances
+    w_3d_pairs = []
+    w_2d_pairs = []
 
-        color = colors[idx]
+    n_rois = len(roi_cdfs_3d)
+    for i in range(n_rois):
+        for j in range(i + 1, n_rois):
+            # 3D distance
+            w_3d = np.sum(np.abs(roi_cdfs_3d[i] - roi_cdfs_3d[j])) * bin_width
+            w_3d_pairs.append(w_3d)
 
-        # Plot 3D CDF (solid)
-        ax.plot(x_eval, cdf_3d, color=color, linewidth=line_settings['linewidth'],
-                linestyle='-')
-        # Plot 2D CDF IQR (shaded only, no median line to reduce clutter)
-        ax.fill_between(x_eval, cdf_2d_lo, cdf_2d_hi, alpha=0.3, color=color)
+            # 2D distance
+            w_2d = np.sum(np.abs(roi_cdfs_2d[i] - roi_cdfs_2d[j])) * bin_width
+            w_2d_pairs.append(w_2d)
 
-    # Build custom legend
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
+    w_3d_pairs = np.array(w_3d_pairs)
+    w_2d_pairs = np.array(w_2d_pairs)
 
-    handles = []
-    labels = []
+    # Scatter plot
+    ax.scatter(w_3d_pairs, w_2d_pairs, alpha=0.6, s=20, color='#3498db', edgecolor='black', linewidth=0.3)
 
-    # Style indicators
-    handles.append(Line2D([0], [0], color='gray', linewidth=line_settings['linewidth'], linestyle='-'))
-    labels.append('3D')
-    handles.append(Patch(facecolor='gray', alpha=0.3, edgecolor='none'))
-    labels.append('2D 95% CI')
+    # Identity line
+    max_val = max(w_3d_pairs.max(), w_2d_pairs.max()) * 1.05
+    ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, linewidth=1.5, zorder=0)
 
-    # Sample indicators
-    for idx, (_, _, sample_name, mean_r) in enumerate(samples):
-        parts = sample_name.split('_')
-        short_name = f"{parts[1]} {parts[2]} {parts[3]}"
-        handles.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=colors[idx],
-                              markersize=8, markeredgecolor='none'))
-        labels.append(rf"{short_name} ($\bar{{r}}$ = {mean_r:.2f})")
+    # Correlation
+    r, p = stats.pearsonr(w_3d_pairs, w_2d_pairs)
 
-    ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
+    # Linear regression for slope
+    slope, intercept = np.polyfit(w_3d_pairs, w_2d_pairs, 1)
+
+    ax.set_xlabel('3D Wasserstein distance [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_ylabel('Cumulative probability', fontsize=font_settings['label_size'],
+    ax.set_ylabel('2D Wasserstein distance [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.legend(handles, labels, loc='lower right', fontsize=font_settings['legend_size'] - 1,
-              framealpha=0.9)
+    ax.tick_params(labelsize=font_settings['tick_size'])
+    ax.set_xlim(0, max_val)
+    ax.set_ylim(0, max_val)
     ax.set_box_aspect(1)
-    ax.set_xlim(0, x_max)
-    ax.set_ylim(0, 1)
+
+    # Stats annotation
+    if p < 0.001:
+        p_str = 'p < 0.001'
+    else:
+        p_str = f'p = {p:.3f}'
+    stats_text = f'R = {r:.3f}, {p_str}\nSlope = {slope:.2f}'
+    ax.text(0.05, 0.95, stats_text, transform=ax.transAxes,
+            fontsize=font_settings['legend_size'], ha='left', va='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
 
 def extract_group_info(sample_name: str) -> Tuple[str, str]:
@@ -754,9 +904,9 @@ def main():
     logger.info("\nPlotting panel (a): PDF stability (3 samples)...")
     plot_pdf_stability_multi(axes[0, 0], pdf_samples, args.data_dir, args.radius_type, args.x_max)
 
-    # Panel (b): CDF for representative samples (same as panel a)
-    logger.info("\nPlotting panel (b): CDF for representative samples...")
-    plot_cdf_representative(axes[0, 1], pdf_samples, args.data_dir, args.radius_type, args.x_max)
+    # Panel (b): Within-ROI vs Between-ROI Wasserstein distances
+    logger.info("\nPlotting panel (b): Within vs Between ROI distances...")
+    plot_within_vs_between_distances(axes[0, 1], all_pairs, args.radius_type)
 
     # Panel (c): Mean radius scatter
     logger.info("\nPlotting panel (c): Mean radius scatter...")
@@ -771,9 +921,14 @@ def main():
     # Save
     args.output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.output, dpi=settings.figure['dpi'], bbox_inches='tight')
+
+    # Also save SVG version
+    svg_file = args.output.with_suffix('.svg')
+    plt.savefig(svg_file, bbox_inches='tight')
+
     plt.close()
 
-    logger.info(f"\nSaved figure to {args.output}")
+    logger.info(f"\nSaved figure to {args.output} and {svg_file}")
 
     # Save metadata
     metadata = {
