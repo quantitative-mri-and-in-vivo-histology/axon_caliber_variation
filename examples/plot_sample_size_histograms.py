@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Plot three axon radius distributions side by side with different sample sizes.
+Plot axon radius distributions comparing full LM data vs subsample.
 
-Creates a 1×3 figure showing histograms from 10², 10⁴, and 10⁶ axons
-sampled from a single human corpus callosum section.
+Creates a 1×2 figure showing:
+- Left: Full histogram from ROI with most axons
+- Right: Subsample of 10³ axons from the same ROI
 
 Usage:
     python examples/plot_sample_size_histograms.py \
@@ -24,12 +25,11 @@ from axonometry import get_plot_settings, style_axis
 
 settings = get_plot_settings()
 
-# Sample sizes: 10², 10⁴, 10⁶
-SAMPLE_SIZES = [100, 10_000, 1_000_000]
-SAMPLE_SIZE_LABELS = [r'$n = 10^2$', r'$n = 10^4$', r'$n = 10^6$']
+# Subsample size
+SUBSAMPLE_SIZE = 1000
 
 
-def load_human_cc_histograms(data_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_human_cc_histograms(data_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
     """Load human corpus callosum histogram data."""
     bin_edges_file = data_dir / 'desc-binEdges_radii.tsv'
     counts_file = data_dir / 'desc-countsCircularEq_radii.tsv'
@@ -73,8 +73,6 @@ def main():
                         help='Output PNG/SVG file path')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
-    parser.add_argument('--roi', type=int, default=None,
-                        help='ROI index (0-based). If not specified, picks one randomly.')
 
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -83,71 +81,91 @@ def main():
 
     # Load data
     bin_edges, counts_matrix = load_human_cc_histograms(args.human_data)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_width = bin_edges[1] - bin_edges[0]
 
-    # Find ROIs with >= 10^6 axons
+    # Find ROI with most axons
     roi_totals = counts_matrix.sum(axis=1)
-    valid_rois = np.where(roi_totals >= max(SAMPLE_SIZES))[0]
-
-    if len(valid_rois) == 0:
-        raise ValueError(f"No ROIs have >= {max(SAMPLE_SIZES):,} axons")
-
-    # Select ROI
-    if args.roi is not None:
-        roi_idx = args.roi
-        if roi_idx not in valid_rois:
-            raise ValueError(f"ROI {roi_idx} has only {int(roi_totals[roi_idx]):,} axons")
-    else:
-        roi_idx = rng.choice(valid_rois)
-
+    roi_idx = np.argmax(roi_totals)
     counts = counts_matrix[roi_idx]
-    print(f"Using ROI {roi_idx + 1} with {int(roi_totals[roi_idx]):,} total axons")
+    total_axons = int(roi_totals[roi_idx])
 
-    # Sample radii for each sample size
-    samples = []
-    for n in SAMPLE_SIZES:
-        sampled_radii = sample_radii_from_histogram(bin_edges, counts, n, rng)
-        samples.append(sampled_radii)
-        print(f"  n={n:,}: mean={sampled_radii.mean():.3f} μm, std={sampled_radii.std():.3f} μm")
+    print(f"Using ROI {roi_idx + 1} with {total_axons:,} total axons")
 
-    # Create figure (width:height ratio per subplot is 1:1.2)
-    fig, axes = plt.subplots(1, 3, figsize=(7, 3), sharex=True, sharey=True,
-                             gridspec_kw={'wspace': 0})
+    # Sample 10³ radii from histogram
+    sampled_radii = sample_radii_from_histogram(bin_edges, counts, SUBSAMPLE_SIZE, rng)
+    print(f"  Subsample n={SUBSAMPLE_SIZE:,}: mean={sampled_radii.mean():.3f} μm")
 
-    # Common histogram settings
-    hist_bins = np.arange(0, 5.05, 0.1)  # 0 to 5 μm in 0.1 μm bins
-    from matplotlib.cm import YlOrBr
-    colors = [YlOrBr(x) for x in [0.3, 0.65, 1.0]]
+    # Create 1×2 figure
+    fig, axes = plt.subplots(1, 2, figsize=(5, 2.5))
 
-    for ax, radii, label, color in zip(axes, samples, SAMPLE_SIZE_LABELS, colors):
-        ax.hist(radii, bins=hist_bins, color=color, alpha=0.7, edgecolor='white',
-                linewidth=0.5, density=True)
+    # Colors: peach for full, rust for subsample
+    color_full = '#F8B878'
+    color_subsample = '#B84820'
 
-        style_axis(ax, xlabel='Axon radius [μm]', ylabel='Probability density')
-        ax.set_xlim(0, 3.5)
-        ax.set_title(label, fontsize=settings.fonts['label_size'])
+    # Use 0.1 μm binning for both panels
+    common_bin_edges = np.arange(0, 5.05, 0.1)
+    common_bin_centers = (common_bin_edges[:-1] + common_bin_edges[1:]) / 2
+    common_bin_width = 0.1
 
-        # Add inset for tail region
-        inset = ax.inset_axes([0.4, 0.4, 0.55, 0.55])  # [x, y, width, height] in axes coords
-        inset.hist(radii, bins=hist_bins, color=color, alpha=0.7, edgecolor='white',
-                   linewidth=0.3, density=True)
-        inset.set_xlim(1, 3.5)
-        inset.set_ylim(0, 0.15)
-        inset.set_yticks([0, 0.05, 0.10, 0.15])
-        inset.tick_params(labelsize=8)
-        inset.set_xlabel('')
-        inset.set_ylabel('')
+    # Rebin full data to 0.1 μm bins (aggregate from finer original bins)
+    full_counts_rebinned, _ = np.histogram(
+        bin_centers, bins=common_bin_edges, weights=counts
+    )
+    pdf_full = full_counts_rebinned / (full_counts_rebinned.sum() * common_bin_width)
 
-    # Only show y-label on first panel, x-label on middle panel
-    axes[1].set_ylabel('')
-    axes[2].set_ylabel('')
-    axes[0].set_xlabel('')
-    axes[2].set_xlabel('')
+    # Bin subsample using same 0.1 μm bins
+    subsample_counts, _ = np.histogram(sampled_radii, bins=common_bin_edges)
+    pdf_subsample = subsample_counts / (subsample_counts.sum() * common_bin_width)
 
-    fig.subplots_adjust(wspace=0, left=0.08, right=0.98, bottom=0.15, top=0.9)
+    # Inset range for tail
+    inset_xmin, inset_xmax = 1.5, 4.0
+
+    # Left panel: Full LM histogram
+    ax = axes[0]
+    ax.bar(common_bin_centers, pdf_full, width=common_bin_width * 0.9, color=color_full,
+           edgecolor='white', linewidth=0.3)
+    style_axis(ax, xlabel='Axon radius [μm]', ylabel='Prob. density [μm⁻¹]')
+    ax.set_xlim(0, 2.5)
+
+    # Add tail inset for full data
+    inset_left = ax.inset_axes([0.42, 0.42, 0.55, 0.55])
+    mask = (common_bin_centers >= inset_xmin) & (common_bin_centers <= inset_xmax)
+    inset_left.bar(common_bin_centers[mask], pdf_full[mask], width=common_bin_width * 0.9,
+                   color=color_full, edgecolor='white', linewidth=0.3)
+    inset_left.set_xlim(inset_xmin, inset_xmax)
+    inset_left.set_ylim(0, pdf_full[mask].max() * 1.1)
+    inset_left.tick_params(labelsize=settings.fonts['tick_size'] - 3)
+    inset_left.set_xlabel('')
+    inset_left.set_ylabel('')
+
+    # Right panel: Subsample histogram
+    ax = axes[1]
+    ax.bar(common_bin_centers, pdf_subsample, width=common_bin_width * 0.9, color=color_subsample,
+           edgecolor='white', linewidth=0.3)
+    style_axis(ax, xlabel='Axon radius [μm]', ylabel='Prob. density [μm⁻¹]')
+    ax.set_xlim(0, 2.5)
+
+    # Add tail inset for subsample
+    inset_right = ax.inset_axes([0.42, 0.42, 0.55, 0.55])
+    inset_right.bar(common_bin_centers[mask], pdf_subsample[mask], width=common_bin_width * 0.9,
+                    color=color_subsample, edgecolor='white', linewidth=0.3)
+    inset_right.set_xlim(inset_xmin, inset_xmax)
+    inset_right.set_ylim(0, pdf_full[mask].max() * 1.1)  # Same y-scale as left inset
+    inset_right.tick_params(labelsize=settings.fonts['tick_size'] - 3)
+    inset_right.set_xlabel('')
+    inset_right.set_ylabel('')
+
+    plt.tight_layout()
 
     plt.savefig(args.output, dpi=settings.figure['dpi'], bbox_inches='tight')
+
+    # Also save SVG
+    svg_output = args.output.with_suffix('.svg')
+    plt.savefig(svg_output, bbox_inches='tight')
+
     plt.close()
-    print(f"Saved figure to {args.output}")
+    print(f"Saved figure to {args.output} and {svg_output}")
 
 
 if __name__ == '__main__':
