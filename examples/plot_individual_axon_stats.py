@@ -276,7 +276,7 @@ def select_representative_axons(
 def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List[str],
                              voxel_size: float, ax, rep_axons: List[dict] = None,
                              arc_interval: float = 10.0, subsample: int = 4,
-                             padding_um: float = 2.0):
+                             padding_um: float = 2.0, volume_offset: np.ndarray = None):
     """
     Render multiple axons in 3D with local radius shown as color intensity.
 
@@ -293,7 +293,10 @@ def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List
         arc_interval: Interval in μm for arc length markers (default 10)
         subsample: Subsampling factor for surface points (default 4)
         padding_um: Padding around bounding box in μm (default 2.0)
+        volume_offset: Offset of volume origin in voxels (for cropped volumes)
     """
+    if volume_offset is None:
+        volume_offset = np.array([0, 0, 0])
     from matplotlib.colors import to_rgb
     from scipy import ndimage
 
@@ -326,7 +329,28 @@ def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List
     all_surface_points = []
     axon_data = []  # Store (coords_um, point_colors, point_sizes) for each axon
 
-    for label, color in zip(labels, colors):
+    # Build lookup from label to rep_axon data (skeleton coords + radii)
+    from scipy.spatial import cKDTree
+    label_to_axon = {}
+    if rep_axons:
+        for axon in rep_axons:
+            label_to_axon[axon['label']] = axon
+
+    # Get global radius range for consistent color scaling across all axons
+    # Use 5th and 95th percentiles for robustness to outliers
+    all_radii = []
+    for axon in (rep_axons or []):
+        all_radii.extend(axon['radii'])
+    if all_radii:
+        global_r_min = np.percentile(all_radii, 5)
+        global_r_max = np.percentile(all_radii, 95)
+    else:
+        global_r_min, global_r_max = 0, 1
+
+    # Per-axon trim offsets: extra trim for green (High CV, index 2) to match lengths
+    axon_trim_offsets = {2: 15.0}  # Index 2 (High CV/green) gets 15 μm extra trim
+
+    for axon_idx, (label, color) in enumerate(zip(labels, colors)):
         mask = sub_volume == label
         if not mask.any():
             continue
@@ -340,6 +364,36 @@ def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List
         if len(surface_coords) == 0:
             continue
 
+        # Convert to physical coordinates (μm) - account for both volume_offset and subvolume offset
+        coords_um = (surface_coords + min_coords + volume_offset) * voxel_size
+
+        # Per-axon trim offset
+        base_trim = 2.0  # Base trim for all axons
+        extra_trim = axon_trim_offsets.get(axon_idx, 0.0)
+        trim_start_um = base_trim + extra_trim
+
+        # Use skeleton for arc-length based trimming
+        axon_data_dict = label_to_axon.get(label)
+        if axon_data_dict is not None and axon_data_dict.get('skeleton_coords') is not None:
+            skeleton_coords = np.array(axon_data_dict['skeleton_coords'])
+
+            # Compute arc length along skeleton
+            skel_diffs = np.diff(skeleton_coords, axis=0)
+            skel_dists = np.linalg.norm(skel_diffs, axis=1)
+            arc_lengths = np.concatenate([[0], np.cumsum(skel_dists)])
+
+            # Build KDTree for fast nearest-neighbor lookup
+            tree = cKDTree(skeleton_coords)
+            distances, nearest_idx = tree.query(coords_um, k=1)
+            point_arc_lengths = arc_lengths[nearest_idx]
+
+            # Filter by arc length (start trim) and distance from skeleton
+            max_distance = 3.0  # μm
+            keep_mask = (point_arc_lengths >= trim_start_um) & (distances < max_distance)
+
+            coords_um = coords_um[keep_mask]
+            surface_coords = surface_coords[keep_mask]
+
         # Subsample for performance (keep more points for denser appearance)
         n_original = len(surface_coords)
         if len(surface_coords) > 20000:
@@ -347,39 +401,57 @@ def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List
                                        size=min(len(surface_coords) // 2, 20000),
                                        replace=False)
             surface_coords = surface_coords[indices]
+            coords_um = coords_um[indices]
+            # Also subsample the nearest_idx if we have skeleton data
+            if 'nearest_idx' in dir():
+                nearest_idx = nearest_idx[indices]
 
         # Log extent in Z (after rotation this will be the vertical extent)
-        z_extent = (surface_coords[:, 0].max() - surface_coords[:, 0].min()) * voxel_size
+        z_extent = (coords_um[:, 0].max() - coords_um[:, 0].min()) if len(coords_um) > 0 else 0
         logging.info(f"  Axon {label}: {n_original} surface pts -> {len(surface_coords)} rendered, Z-extent: {z_extent:.1f} μm")
 
-        # Convert to physical coordinates (μm) - account for subvolume offset
-        coords_um = (surface_coords + min_coords) * voxel_size
+        # Use skeleton-based radius for color coding
+        axon_data_dict = label_to_axon.get(label)
+        if axon_data_dict is not None and axon_data_dict.get('skeleton_coords') is not None:
+            skeleton_coords = np.array(axon_data_dict['skeleton_coords'])
+            skeleton_radii = np.array(axon_data_dict['radii'])
 
-        # Use distance transform for smooth local radius estimation
-        dist = ndimage.distance_transform_edt(mask)
-        from scipy.ndimage import maximum_filter
-        filter_size = 21  # Captures radius up to ~0.5 μm at 0.05 μm voxels
-        dist_local_max = maximum_filter(dist, size=filter_size)
-        dist_values = dist_local_max[surface_coords[:, 0], surface_coords[:, 1], surface_coords[:, 2]]
+            # Build KDTree for radius lookup
+            tree = cKDTree(skeleton_coords)
+            _, nearest_idx = tree.query(coords_um, k=1)
+            local_radii = skeleton_radii[nearest_idx]
 
-        # Convert to physical units (μm)
-        dist_values_um = dist_values * voxel_size
-
-        # Normalize to [0.15, 1.0] for intensity
-        dist_max_um = dist.max() * voxel_size
-        if dist_max_um > 0:
-            intensities = 0.15 + 0.85 * (dist_values_um / dist_max_um)
-            point_sizes = 1 + 7 * (dist_values_um / dist_max_um)
+            # Normalize using global radius range for consistent coloring
+            if global_r_max > global_r_min:
+                norm = np.clip((local_radii - global_r_min) / (global_r_max - global_r_min), 0, 1)
+                intensities = 0.25 + 0.75 * norm  # More contrast: darker min, brighter max
+                point_sizes = 2 + 8 * norm
+            else:
+                intensities = np.ones(len(coords_um)) * 0.5
+                point_sizes = np.ones(len(coords_um)) * 3
         else:
-            intensities = np.ones(len(surface_coords)) * 0.5
-            point_sizes = np.ones(len(surface_coords)) * 3
+            # Fallback to distance transform if skeleton not available
+            dist = ndimage.distance_transform_edt(mask)
+            from scipy.ndimage import maximum_filter
+            filter_size = 21
+            dist_local_max = maximum_filter(dist, size=filter_size)
+            dist_values = dist_local_max[surface_coords[:, 0], surface_coords[:, 1], surface_coords[:, 2]]
+            dist_values_um = dist_values * voxel_size
+
+            if global_r_max > global_r_min:
+                norm = np.clip((dist_values_um - global_r_min) / (global_r_max - global_r_min), 0, 1)
+                intensities = 0.25 + 0.75 * norm  # More contrast: darker min, brighter max
+                point_sizes = 2 + 8 * norm
+            else:
+                intensities = np.ones(len(surface_coords)) * 0.5
+                point_sizes = np.ones(len(surface_coords)) * 3
 
         # Create colors with varying intensity
         base_color = np.array(to_rgb(color))
         point_colors = np.outer(intensities, base_color)
 
         all_surface_points.append(coords_um)
-        axon_data.append((coords_um, point_colors, point_sizes))
+        axon_data.append((coords_um, point_colors, point_sizes, trim_start_um))
 
     if not all_surface_points:
         return
@@ -429,30 +501,82 @@ def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List
     # Combined rotation
     R = R2 @ R1
 
-    # Check if we need to flip Z so that arc length 0 is at the bottom
-    # Use the first axon's skeleton to determine orientation
-    if rep_axons and len(rep_axons) > 0:
-        first_skel = rep_axons[0].get('skeleton_coords')
-        if first_skel is not None and len(first_skel) > 1:
-            first_skel = np.array(first_skel)
-            # Transform skeleton start and end points
-            start_rot = (first_skel[0] - centroid) @ R.T
-            end_rot = (first_skel[-1] - centroid) @ R.T
-            # If start has higher Z than end, flip Z
-            if start_rot[2] > end_rot[2]:
-                R = np.diag([1, 1, -1]) @ R  # Flip Z axis
-
-    # Apply rotation and plot each axon
-    all_rotated = []
-    for coords_um, point_colors, point_sizes in axon_data:
+    # Apply rotation and flip each axon individually so arc length 0 is at bottom
+    rotated_axon_data = []
+    for i, (coords_um, point_colors, point_sizes, trim_start_um) in enumerate(axon_data):
         # Center, rotate, then shift back
         rotated = (coords_um - centroid) @ R.T + centroid
-        all_rotated.append(rotated)
+        cv = rep_axons[i]['cv'] if rep_axons and i < len(rep_axons) else 0
+        z_flip = False
+        z_flip_center = None
+
+        # Check this axon's skeleton orientation and flip Z if needed
+        if rep_axons and i < len(rep_axons):
+            skel = rep_axons[i].get('skeleton_coords')
+            if skel is not None and len(skel) > 1:
+                skel = np.array(skel)
+                # Transform full skeleton to rotated coords
+                skel_rot = (skel - centroid) @ R.T + centroid
+
+                # If start has higher Z than end, flip this axon's Z around its center
+                if skel_rot[0, 2] > skel_rot[-1, 2]:
+                    z_flip_center = rotated[:, 2].mean()
+                    rotated[:, 2] = 2 * z_flip_center - rotated[:, 2]
+                    # Also flip skeleton for Z extent calculation
+                    skel_rot[:, 2] = 2 * z_flip_center - skel_rot[:, 2]
+                    z_flip = True
+
+        # Compute actual Z extent after rotation for marker scaling
+        surface_z_extent = rotated[:, 2].max() - rotated[:, 2].min() if len(rotated) > 0 else 0
+
+        # Store axon index, z_flip_center, surface Z extent, and trim offset for marker placement
+        rotated_axon_data.append((rotated, point_colors, point_sizes, cv, i, z_flip, z_flip_center, surface_z_extent, trim_start_um))
+
+    # Sort by CV (low to high)
+    rotated_axon_data.sort(key=lambda x: x[3])
+
+    # Compute X spacing based on axon widths
+    x_spacing = 8.0  # μm between axon centers
+
+    all_rotated = []
+    axon_plot_info = []  # Store info for arc length markers
+    # Per-axon vertical offsets to stagger axons visually
+    z_offsets = {1: -2.5}  # Middle axon (orange) shifted down 2.5 μm
+
+    for rank, (rotated, point_colors, point_sizes, cv, orig_idx, z_flip, z_flip_center, surface_z_extent, trim_start_um) in enumerate(rotated_axon_data):
+        # Shift X position so axons are arranged left-to-right by CV rank
+        # Center the group around 0
+        n_axons = len(rotated_axon_data)
+        x_offset = (rank - (n_axons - 1) / 2) * x_spacing
+        x_center = rotated[:, 0].mean()
+        rotated_shifted = rotated.copy()
+        rotated_shifted[:, 0] = rotated[:, 0] - x_center + x_offset
+
+        # Apply vertical offset if specified
+        z_offset = z_offsets.get(rank, 0.0)
+        rotated_shifted[:, 2] = rotated_shifted[:, 2] + z_offset
+
+        all_rotated.append(rotated_shifted)
+        axon_plot_info.append({
+            'orig_idx': orig_idx,
+            'x_offset': x_offset,
+            'x_center': x_center,
+            'z_flip': z_flip,
+            'z_flip_center': z_flip_center,  # Store surface's flip center for skeleton alignment
+            'z_center': rotated[:, 2].mean(),
+            'z_offset': z_offset,  # Store vertical offset
+            'surface_z_extent': surface_z_extent,  # Actual rendered Z extent
+            'surface_z_min': rotated_shifted[:, 2].min() if len(rotated_shifted) > 0 else 0,
+            'surface_z_max': rotated_shifted[:, 2].max() if len(rotated_shifted) > 0 else 0,
+            'surface_y_mean': rotated_shifted[:, 1].mean() if len(rotated_shifted) > 0 else 0,
+            'trim_start_um': trim_start_um,  # Per-axon trim offset
+            'color': colors[rank] if rank < len(colors) else 'gray'
+        })
 
         # Plot 3D scatter (x, y, z -> for vertical alignment, z is up)
         # Point size varies with local radius for visible thickness variation
         # rasterized=True ensures points are rendered as bitmap in SVG (not 60k vector elements)
-        ax.scatter(rotated[:, 0], rotated[:, 1], rotated[:, 2],
+        ax.scatter(rotated_shifted[:, 0], rotated_shifted[:, 1], rotated_shifted[:, 2],
                    c=point_colors, s=point_sizes, alpha=0.9, rasterized=True)
 
     # Compute extent from rotated points
@@ -460,28 +584,139 @@ def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List
     rot_min = all_rotated.min(axis=0)
     rot_max = all_rotated.max(axis=0)
 
-    # TODO: Arc length markers along skeleton (disabled for now)
-    # if rep_axons:
-    #     for axon, color in zip(rep_axons, colors):
-    #         skeleton_coords = axon.get('skeleton_coords')
-    #         ... (add back arc length annotation code)
+    # Add arc length markers (10, 20, 30, ... μm) along each axon
+    # Use surface Z positions directly (skeleton coords are in different frame)
+    if rep_axons:
+        # First pass: compute Z positions for each arc label for each axon
+        arc_label_positions = {}  # {arc_label: [(x, y, z, rank), ...]}
+
+        for rank, info in enumerate(axon_plot_info):
+            axon = rep_axons[info['orig_idx']]
+            stored_length = axon.get('length', 60)
+            trim_start_um = info['trim_start_um']  # Per-axon trim offset
+
+            # The surface Z range represents arc from trim_start to stored_length
+            z_min = info['surface_z_min']
+            z_max = info['surface_z_max']
+            z_range = z_max - z_min
+            if z_range <= 0:
+                continue
+            visible_arc = stored_length - trim_start_um  # Profile visible length
+
+            # Compute positions for arc lengths 10, 20, 30, ...
+            for arc_label in range(10, int(visible_arc) + 1, 10):
+                # Map relative arc length to Z position
+                z_pos = z_min + (arc_label / visible_arc) * z_range
+                x_pos = info['x_offset']
+                y_pos = info['surface_y_mean']
+
+                if arc_label not in arc_label_positions:
+                    arc_label_positions[arc_label] = []
+                arc_label_positions[arc_label].append((x_pos, y_pos, z_pos, rank))
+
+        # Second pass: draw tick marks and connecting lines between adjacent axons
+        n_axons = len(axon_plot_info)
+        tick_len = 1.5  # μm
+
+        for arc_label, positions in sorted(arc_label_positions.items()):
+            # Sort positions by rank (left to right)
+            positions = sorted(positions, key=lambda p: p[3])
+
+            # Draw tick marks at each axon position
+            for x_pos, y_pos, z_pos, rank in positions:
+                ax.plot([x_pos - tick_len, x_pos + tick_len],
+                       [y_pos, y_pos], [z_pos, z_pos],
+                       color='black', linewidth=1.0, zorder=10)
+
+            # Connect tick ends between adjacent axons
+            for i in range(len(positions) - 1):
+                x1, y1, z1, _ = positions[i]
+                x2, y2, z2, _ = positions[i + 1]
+                # Connect right end of left tick to left end of right tick
+                ax.plot([x1 + tick_len, x2 - tick_len],
+                       [y1, y2], [z1, z2],
+                       color='black', linewidth=0.8, zorder=9)
+
+            # Add label on the left side of leftmost axon (no μm unit - shown on arrow)
+            x_pos, y_pos, z_pos, _ = positions[0]
+            ax.text(x_pos - tick_len - 1.5, y_pos, z_pos,
+                   f'{arc_label}', fontsize=11, ha='right', va='center',
+                   color='black', zorder=10)
+
+        # Add vertical arrow with "Arc length [μm]" label on far left
+        # Get z range from surface positions (start from bottom)
+        all_surface_z_min = min(info['surface_z_min'] for info in axon_plot_info)
+        all_surface_z_max = max(info['surface_z_max'] for info in axon_plot_info)
+
+        # Collect all Z positions from arc labels
+        all_z_positions = []
+        for positions in arc_label_positions.values():
+            for _, _, z_pos, _ in positions:
+                all_z_positions.append(z_pos)
+
+        # Arrow starts from bottom of axons, extends to top of tick marks
+        z_min_arrow = all_surface_z_min + 1
+        z_max_arrow = max(all_z_positions) + 3 if all_z_positions else all_surface_z_max
+
+        # Position arrow to the left of all axons and labels
+        leftmost_x = min(info['x_offset'] for info in axon_plot_info) - tick_len - 6
+        y_pos_arrow = axon_plot_info[0]['surface_y_mean']
+
+        # Draw arrow line (from bottom to top)
+        ax.plot([leftmost_x, leftmost_x], [y_pos_arrow, y_pos_arrow],
+               [z_min_arrow, z_max_arrow], color='black', linewidth=1.5, zorder=10)
+        # Arrow head at top
+        arrow_head_size = 2.0
+        ax.plot([leftmost_x, leftmost_x], [y_pos_arrow, y_pos_arrow],
+               [z_max_arrow - arrow_head_size, z_max_arrow],
+               color='black', linewidth=2.5, zorder=10)
+        # Add arrowhead lines
+        ax.plot([leftmost_x - 0.5, leftmost_x, leftmost_x + 0.5],
+               [y_pos_arrow, y_pos_arrow, y_pos_arrow],
+               [z_max_arrow - arrow_head_size, z_max_arrow, z_max_arrow - arrow_head_size],
+               color='black', linewidth=1.5, zorder=10)
+
+        # Add rotated label "Arc length [μm]" alongside arrow (like y-axis label)
+        # Use text2D for proper 2D rotation that doesn't depend on 3D view
+        z_mid = (z_min_arrow + z_max_arrow) / 2
+        ax.text2D(0.265, 0.5, 'Arc length [μm]', fontsize=14,
+                 ha='center', va='center', color='black',
+                 transform=ax.transAxes, rotation=90)
+
+        # Add CV labels on top of each axon - same Z, but shift X for spacing
+        cv_label_z = all_surface_z_max + 2  # Fixed Z for vertical alignment (slightly lower)
+        n_axons = len(axon_plot_info)
+        x_shifts = {0: -2.0, 1: 0.0, 2: 2.0}  # Shift left/middle/right
+        for rank, info in enumerate(axon_plot_info):
+            axon = rep_axons[info['orig_idx']]
+            cv_val = axon['cv']
+            x_pos = info['x_offset'] + x_shifts.get(rank, 0.0)
+            y_pos = info['surface_y_mean']
+            color = info['color']
+
+            ax.text(x_pos, y_pos, cv_label_z,
+                   f'CV = {cv_val:.2f}', fontsize=10, ha='center', va='bottom',
+                   color=color, fontweight='bold', zorder=10)
 
     # Compute extent from rotated bounding box
     extent_um = rot_max - rot_min
     logging.info(f"  3D view bounding box: {extent_um[0]:.1f} x {extent_um[1]:.1f} x {extent_um[2]:.1f} μm")
 
-    # Set tight axis limits with small padding
+    # Set tight axis limits with padding for labels
     pad = 1.0  # μm
+    pad_top = 8.0  # Extra padding at top for CV labels
     ax.set_xlim(rot_min[0] - pad, rot_max[0] + pad)
     ax.set_ylim(rot_min[1] - pad, rot_max[1] + pad)
-    ax.set_zlim(rot_min[2] - pad, rot_max[2] + pad)
+    ax.set_zlim(rot_min[2] - pad, rot_max[2] + pad_top)
 
     # Set box aspect based on actual data extent (preserves shape)
-    ax.set_box_aspect(extent_um + 2 * pad)
+    extent_with_pad = extent_um.copy()
+    extent_with_pad[2] += pad_top - pad  # Account for extra top padding
+    ax.set_box_aspect(extent_with_pad + 2 * pad)
 
     # Set viewing angle: slight rotation to show depth variation
     ax.view_init(elev=5, azim=-85)
-    ax.invert_zaxis()  # Flip z-axis
+    # Bottom = start (arc length 0), Top = end
     ax.dist = 10  # Default
 
     # Hide axes, grid, and panes for clean look
@@ -491,8 +726,6 @@ def render_multiple_axons_3d(volume: np.ndarray, labels: List[int], colors: List
 def plot_cv_vs_radius(
     all_data: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, dict]],
     output_file: Path,
-    k_velocity: float = 5.5,
-    g_ratio: float = 0.6,
     mat_files: List[Path] = None
 ) -> None:
     """
@@ -502,13 +735,11 @@ def plot_cv_vs_radius(
     - (0,2): CV histogram
     - (1,0): CV vs radius
     - (1,1): Std vs radius
-    - (1,2): Velocity with slowdown
+    - (1,2): Slowdown factor vs axon size (bar plot)
 
     Args:
         all_data: List of (mean_radii, cv_values, std_values, slowdown, sample_name, profiles_dict) tuples
         output_file: Output PNG file path
-        k_velocity: Conduction velocity constant (m/s per μm of fiber diameter), default 5.5
-        g_ratio: Ratio of axon radius to fiber radius, default 0.6
         mat_files: List of mat files corresponding to each data tuple (for volume rendering)
     """
     # Create figure with GridSpec: subplot (a) spans full height, narrower column
@@ -542,10 +773,10 @@ def plot_cv_vs_radius(
     line_settings = settings.line
     main_color = settings.colors['category_a']  # Teal for main distribution
 
-    # Representative example colors (green, orange, purple)
-    cv_colors = [settings.colors['example_1'],
-                 settings.colors['example_2'],
-                 settings.colors['example_3']]
+    # Representative example colors (purple, orange, green) - darker base for higher CV
+    cv_colors = [settings.colors['example_3'],  # Purple for low CV
+                 settings.colors['example_2'],  # Orange for mid CV
+                 settings.colors['example_1']]  # Green for high CV
     cv_labels = ['Low CV', 'Mid CV', 'High CV']
 
     # Select representative axons using skeleton coords (memory efficient - no volume needed)
@@ -553,6 +784,7 @@ def plot_cv_vs_radius(
 
     # Load cropped volume region for rendering (if mat files provided)
     vol = None
+    vol_offset = None
     voxel_size = None
     if mat_files and rep_axons:
         import h5py
@@ -611,7 +843,8 @@ def plot_cv_vs_radius(
                         max_coords = [min(full_volume.shape[i], int(c) + padding)
                                      for i, c in enumerate(max_coords)]
 
-                        # Crop to bounding box
+                        # Crop to bounding box and store offset for coordinate conversion
+                        vol_offset = np.array(min_coords)
                         vol = full_volume[
                             min_coords[0]:max_coords[0],
                             min_coords[1]:max_coords[1],
@@ -627,6 +860,7 @@ def plot_cv_vs_radius(
             except Exception as e:
                 logger.warning(f"Failed to load volume: {e}")
                 vol = None
+                vol_offset = None
 
     # === (a): All 3 axons in one volume ===
     if vol is not None and rep_axons:
@@ -635,19 +869,36 @@ def plot_cv_vs_radius(
         colors = cv_colors[:len(axon_labels)]
 
         render_multiple_axons_3d(vol, axon_labels, colors, voxel_size, ax_vol,
-                                 rep_axons=rep_axons, arc_interval=10.0)
+                                 rep_axons=rep_axons, arc_interval=10.0,
+                                 volume_offset=vol_offset)
     else:
         ax_vol.text2D(0.5, 0.5, 'Provide --mat-dir\nfor 3D rendering',
                       ha='center', va='center', transform=ax_vol.transAxes, fontsize=12)
 
     # === (b): Straightened profiles ===
+    # Per-axon trim offsets (same as 3D rendering)
+    profile_trim_offsets = {2: 15.0}  # Index 2 (High CV/green) gets 15 μm extra trim
+    base_trim = 2.0
+    max_visible_arc = 0
     if rep_axons:
         for i, axon in enumerate(rep_axons):
-            ax_prof.plot(axon['arc_lengths'], axon['radii'], color=cv_colors[i], linewidth=1.5,
-                        label=f'{cv_labels[i]} (CV={axon["cv"]:.2f})')
+            arc = axon['arc_lengths']
+            radii = axon['radii']
+            extra_trim = profile_trim_offsets.get(i, 0.0)
+            trim_start_um = base_trim + extra_trim
+            mask = arc >= trim_start_um
+            visible_arc = arc[mask] - trim_start_um
+            max_visible_arc = max(max_visible_arc, visible_arc.max())
+            # Plot with x-axis starting from 0 (relative arc length)
+            ax_prof.plot(visible_arc, radii[mask], color=cv_colors[i], linewidth=1.5,
+                        label=f'CV = {axon["cv"]:.2f}')
 
     style_axis(ax_prof, xlabel='Arc length [μm]', ylabel='Axon radius [μm]')
-    ax_prof.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    ax_prof.legend(loc='upper right', fontsize=font_settings['legend_size'], ncol=2)
+    # Set x-ticks and xlim to match data (round up to nearest 10)
+    x_max = int(np.ceil(max_visible_arc / 10) * 10) if max_visible_arc > 0 else 70
+    ax_prof.set_xticks(range(0, x_max + 1, 10))
+    ax_prof.set_xlim(0, x_max)
     # Extend y-axis to make room for legend
     ymin, ymax = ax_prof.get_ylim()
     ax_prof.set_ylim(ymin, ymax * 1.15)
@@ -661,6 +912,9 @@ def plot_cv_vs_radius(
                     linewidth=line_settings['linewidth'], label=f'Median = {np.median(all_y):.3f}')
     style_axis(ax_hist, xlabel='CV', ylabel='Count')
     ax_hist.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    # Use scientific notation for y-axis (×10^4 at top)
+    ax_hist.ticklabel_format(axis='y', style='sci', scilimits=(4, 4), useMathText=True)
+    ax_hist.yaxis.get_offset_text().set_fontsize(font_settings['tick_size'])
 
     # === (d): CV vs radius ===
     x_max = np.percentile(all_x, 99.5)
@@ -694,32 +948,96 @@ def plot_cv_vs_radius(
                markersize=line_settings['marker_size'], label='Median')
     ax_cv.fill_between(bin_centers[valid], bin_q25[valid], bin_q75[valid],
                        color=single_line_color, alpha=line_settings['fill_alpha'], label='IQR (25-75%)')
-    style_axis(ax_cv, xlabel=r'Along-axon $\bar{r}$ [μm]', ylabel='CV')
-    ax_cv.legend(loc='upper right', fontsize=font_settings['legend_size'])
-    ax_cv.set_xlim(0, x_max)
+    style_axis(ax_cv, xlabel='Along-axon mean radius [μm]', ylabel='CV')
+    # Set x-axis to exact data range
+    x_min_data = bin_centers[valid].min()
+    x_max_data = bin_centers[valid].max()
+    ax_cv.set_xlim(x_min_data, x_max_data)
 
-    # === (1,2): Velocity with slowdown ===
-    fiber_diameter = 2 * all_x / g_ratio  # μm
-    velocity = k_velocity * fiber_diameter  # m/s (ideal, uniform axon)
-    velocity_slow = velocity * all_slowdown  # m/s (with slowdown from caliber variation)
+    # === (1,2): Slowdown factor vs axon size (continuous median + IQR) ===
+    # Bin axons by mean radius and compute slowdown stats per bin
+    # Two slowdown metrics:
+    #   1. Conduction velocity: harmonic_mean(r) / arithmetic_mean(r) - depends on radius
+    #   2. Axial diffusion: 1/(1+4*CV²) - depends on area (r²), so stronger effect
+    n_size_bins = 30  # More bins for smoother curves
+    size_bin_edges = np.linspace(0, x_max, n_size_bins + 1)
+    size_bin_centers = (size_bin_edges[:-1] + size_bin_edges[1:]) / 2
 
-    bins = np.linspace(0, np.percentile(velocity, 99.5), hist_settings['bins'] + 1)
-    # Filled histogram for "Ideal" (baseline)
-    ax_vel.hist(velocity, bins=bins, color=settings.colors['category_a'],
-                edgecolor='white', linewidth=0.5,
-                alpha=0.7, label=f'Ideal: {np.mean(velocity):.1f} m/s')
-    # Step histogram for "With slowdown" (comparison)
-    ax_vel.hist(velocity_slow, bins=bins, histtype='step',
-                edgecolor=settings.colors['category_b_edge'], linewidth=2,
-                label=f'With slowdown: {np.mean(velocity_slow):.1f} m/s')
+    slowdown_medians = []
+    slowdown_q25 = []
+    slowdown_q75 = []
+    diffusion_slowdown_medians = []
+    diffusion_slowdown_q25 = []
+    diffusion_slowdown_q75 = []
 
-    mean_slowdown = np.mean(all_slowdown)
-    ax_vel.text(0.95, 0.75, f'Mean slowdown:\n{mean_slowdown:.3f}',
-                transform=ax_vel.transAxes, ha='right', va='top',
-                fontsize=font_settings['legend_size'],
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    style_axis(ax_vel, xlabel='Conduction velocity [m/s]', ylabel='Count')
+    for i in range(n_size_bins):
+        mask = (all_x >= size_bin_edges[i]) & (all_x < size_bin_edges[i + 1])
+        count = np.sum(mask)
+        if count >= 100:  # Same threshold as panel (d)
+            slowdown_medians.append(np.median(all_slowdown[mask]))
+            slowdown_q25.append(np.percentile(all_slowdown[mask], 25))
+            slowdown_q75.append(np.percentile(all_slowdown[mask], 75))
+            # Axial diffusion slowdown: 1/(1+4*CV²) per axon
+            cv_bin = all_y[mask]
+            diffusion_slow = 1.0 / (1.0 + 4.0 * cv_bin**2)
+            diffusion_slowdown_medians.append(np.median(diffusion_slow))
+            diffusion_slowdown_q25.append(np.percentile(diffusion_slow, 25))
+            diffusion_slowdown_q75.append(np.percentile(diffusion_slow, 75))
+        else:
+            slowdown_medians.append(np.nan)
+            slowdown_q25.append(np.nan)
+            slowdown_q75.append(np.nan)
+            diffusion_slowdown_medians.append(np.nan)
+            diffusion_slowdown_q25.append(np.nan)
+            diffusion_slowdown_q75.append(np.nan)
+
+    slowdown_medians = np.array(slowdown_medians)
+    slowdown_q25 = np.array(slowdown_q25)
+    slowdown_q75 = np.array(slowdown_q75)
+    diffusion_slowdown_medians = np.array(diffusion_slowdown_medians)
+    diffusion_slowdown_q25 = np.array(diffusion_slowdown_q25)
+    diffusion_slowdown_q75 = np.array(diffusion_slowdown_q75)
+    valid_bins = ~np.isnan(slowdown_medians)
+
+    # Convert efficiency to reduction percentage: (1 - efficiency) * 100
+    cond_reduction_medians = (1 - slowdown_medians) * 100
+    cond_reduction_q25 = (1 - slowdown_q75) * 100  # Note: q75 becomes lower bound
+    cond_reduction_q75 = (1 - slowdown_q25) * 100  # Note: q25 becomes upper bound
+    diff_reduction_medians = (1 - diffusion_slowdown_medians) * 100
+    diff_reduction_q25 = (1 - diffusion_slowdown_q75) * 100
+    diff_reduction_q75 = (1 - diffusion_slowdown_q25) * 100
+
+    # Continuous line + IQR shaded area (like panel d)
+    cond_color = '#C4A77D'  # Muted sand/tan - warm neutral
+    diff_color = '#7BA3A8'  # Dusty teal - cool neutral
+
+    # Conduction velocity reduction - line with IQR
+    ax_vel.plot(size_bin_centers[valid_bins], cond_reduction_medians[valid_bins],
+               color=cond_color, linestyle='-', linewidth=line_settings['linewidth'],
+               marker='o', markersize=line_settings['marker_size'], label='Conduction velocity')
+    ax_vel.fill_between(size_bin_centers[valid_bins], cond_reduction_q25[valid_bins],
+                       cond_reduction_q75[valid_bins],
+                       color=cond_color, alpha=line_settings['fill_alpha'])
+
+    # Axial diffusion reduction - line with IQR
+    ax_vel.plot(size_bin_centers[valid_bins], diff_reduction_medians[valid_bins],
+               color=diff_color, linestyle='-', linewidth=line_settings['linewidth'],
+               marker='s', markersize=line_settings['marker_size'], label='Diffusion (along-axon)')
+    ax_vel.fill_between(size_bin_centers[valid_bins], diff_reduction_q25[valid_bins],
+                       diff_reduction_q75[valid_bins],
+                       color=diff_color, alpha=line_settings['fill_alpha'])
+
     ax_vel.legend(loc='upper right', fontsize=font_settings['legend_size'])
+    style_axis(ax_vel, xlabel='Along-axon mean radius [μm]', ylabel='Reduction [%]')
+    # Set x-axis to exact data range
+    x_min_vel = size_bin_centers[valid_bins].min()
+    x_max_vel = size_bin_centers[valid_bins].max()
+    ax_vel.set_xlim(x_min_vel, x_max_vel)
+
+    # Set y-axis to show relevant range
+    y_max = max(np.nanmax(cond_reduction_q75[valid_bins]),
+                np.nanmax(diff_reduction_q75[valid_bins]))
+    ax_vel.set_ylim(0, y_max * 1.1)
 
     # Set 1:1 aspect ratio for square subplots (not the tall 3D volume)
     for ax in [ax_prof, ax_hist, ax_cv, ax_vel]:
