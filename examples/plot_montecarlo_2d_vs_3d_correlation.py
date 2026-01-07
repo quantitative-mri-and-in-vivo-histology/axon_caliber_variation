@@ -162,13 +162,15 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str, Set[int]]
     return pairs
 
 
-def load_actual_2d_data(slice_file: Path, radius_type: str = 'circular'
-                        ) -> Dict[str, np.ndarray]:
+def load_actual_2d_data(slice_file: Path, radius_type: str = 'circular',
+                        min_mean_axons_per_slice: int = 1000) -> Dict[str, np.ndarray]:
     """
     Load actual 2D slice data for Monte Carlo sampling.
 
     Returns per-slice metrics arrays that can be randomly sampled,
     plus pooled 2D radii for i.i.d. sampling.
+
+    Filters out ROIs with mean axons per slice < min_mean_axons_per_slice.
     """
     data = np.load(slice_file)
     bin_centers = data['bin_centers']
@@ -177,7 +179,20 @@ def load_actual_2d_data(slice_file: Path, radius_type: str = 'circular'
     r_eff_per_slice = data[f'r_eff_{radius_type}_per_slice']
     n_axons_per_slice = data['n_axons_per_slice']
 
-    # Compute per-slice arithmetic mean and pool 2D radii
+    # First pass: compute mean axon count
+    all_counts = [h.sum() for h in histograms if h.sum() > 0]
+    if not all_counts:
+        return {'n_slices': 0, 'mean_axons_per_slice': 0}
+
+    mean_axon_count = np.mean(all_counts)
+
+    # Skip ROIs with insufficient mean axons per slice
+    if mean_axon_count < min_mean_axons_per_slice:
+        return {'n_slices': 0, 'mean_axons_per_slice': mean_axon_count}
+
+    min_axon_count = mean_axon_count / 2  # Filter slices below half the mean
+
+    # Second pass: filter slices and compute metrics
     mean_radius_per_slice = []
     valid_slice_indices = []
     axon_counts = []
@@ -186,7 +201,7 @@ def load_actual_2d_data(slice_file: Path, radius_type: str = 'circular'
 
     for i, hist_slice in enumerate(histograms):
         counts = hist_slice.sum()
-        if counts > 0 and r_eff_per_slice[i] > 0:
+        if counts >= min_axon_count and r_eff_per_slice[i] > 0:
             mean_r = np.sum(bin_centers * hist_slice) / counts
             mean_radius_per_slice.append(mean_r)
             valid_slice_indices.append(i)
@@ -200,7 +215,7 @@ def load_actual_2d_data(slice_file: Path, radius_type: str = 'circular'
 
     mean_radius_per_slice = np.array(mean_radius_per_slice)
     valid_r_eff = r_eff_per_slice[valid_slice_indices]
-    mean_axons_per_slice = int(np.mean(axon_counts)) if axon_counts else 0
+    mean_axons_per_slice_filtered = int(np.mean(axon_counts)) if axon_counts else 0
     pooled_2d_radii = np.array(pooled_2d_radii)
     valid_histograms = np.array(valid_histograms)
 
@@ -208,11 +223,12 @@ def load_actual_2d_data(slice_file: Path, radius_type: str = 'circular'
         'mean_radius_per_slice': mean_radius_per_slice,
         'r_eff_per_slice': valid_r_eff,
         'n_slices': len(mean_radius_per_slice),
-        'mean_axons_per_slice': mean_axons_per_slice,
+        'mean_axons_per_slice': mean_axons_per_slice_filtered,
         'pooled_2d_radii': pooled_2d_radii,
         'histograms': valid_histograms,
         'bin_centers': bin_centers,
-        'bin_width': bin_width
+        'bin_width': bin_width,
+        'mean_axon_count_raw': mean_axon_count
     }
 
 
@@ -284,7 +300,9 @@ def run_monte_carlo(roi_slice_data: List[Dict], roi_3d_cdfs: List[np.ndarray],
 
 def plot_scatter_comparison(ax, x_3d: np.ndarray, actual_results: np.ndarray,
                              fake_results: np.ndarray, metric: str,
-                             shared_lim: Optional[Tuple[float, float]] = None) -> Tuple[float, float]:
+                             shared_lim: Optional[Tuple[float, float]] = None,
+                             p_actual: Optional[float] = None,
+                             p_fake: Optional[float] = None) -> Tuple[float, float, float, float]:
     """
     Plot 2D vs 3D scatter comparing slice sampling and i.i.d. sampling.
 
@@ -295,9 +313,11 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray, actual_results: np.ndarray,
         fake_results: Fake 2D results (n_rois, n_iterations)
         metric: 'mean_radius' or 'r_eff'
         shared_lim: Optional tuple (min_val, max_val) for shared axis limits
+        p_actual: Permutation p-value for slice sampling
+        p_fake: Permutation p-value for i.i.d. sampling
 
     Returns:
-        Tuple of (r_actual, r_fake) mean correlation coefficients across iterations
+        Tuple of (r_actual, r_fake, r_actual_std, r_fake_std)
     """
     font_settings = settings.fonts
     err_settings = settings.error_bars
@@ -374,13 +394,26 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray, actual_results: np.ndarray,
     style_axis(ax, xlabel=xlabel, ylabel=ylabel)
     ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
 
-    # Correlation annotation (mean ± std across MC iterations)
-    ax.text(0.95, 0.15, f'R (slice) = {r_actual_mean:.3f}±{r_actual_std:.3f}',
-            transform=ax.transAxes, fontsize=font_settings['legend_size'],
-            ha='right', va='bottom', color=color_actual)
-    ax.text(0.95, 0.05, f'R (i.i.d.) = {r_fake_mean:.3f}±{r_fake_std:.3f}',
-            transform=ax.transAxes, fontsize=font_settings['legend_size'],
-            ha='right', va='bottom', color=color_fake)
+    # Correlation annotation (mean ± std across MC iterations, with p-value)
+    if p_actual is not None:
+        p_str_actual = 'p < 0.001' if p_actual < 0.001 else f'p = {p_actual:.3f}'
+        ax.text(0.95, 0.15, f'R = {r_actual_mean:.2f}±{r_actual_std:.2f}, {p_str_actual}',
+                transform=ax.transAxes, fontsize=font_settings['legend_size'],
+                ha='right', va='bottom', color=color_actual)
+    else:
+        ax.text(0.95, 0.15, f'R = {r_actual_mean:.2f}±{r_actual_std:.2f}',
+                transform=ax.transAxes, fontsize=font_settings['legend_size'],
+                ha='right', va='bottom', color=color_actual)
+
+    if p_fake is not None:
+        p_str_fake = 'p < 0.001' if p_fake < 0.001 else f'p = {p_fake:.3f}'
+        ax.text(0.95, 0.05, f'R = {r_fake_mean:.2f}±{r_fake_std:.2f}, {p_str_fake}',
+                transform=ax.transAxes, fontsize=font_settings['legend_size'],
+                ha='right', va='bottom', color=color_fake)
+    else:
+        ax.text(0.95, 0.05, f'R = {r_fake_mean:.2f}±{r_fake_std:.2f}',
+                transform=ax.transAxes, fontsize=font_settings['legend_size'],
+                ha='right', va='bottom', color=color_fake)
 
     ax.set_box_aspect(1)
 
@@ -435,23 +468,11 @@ def plot_wasserstein_violin(ax, slice_wass: np.ndarray, iid_wass: np.ndarray) ->
     ax.scatter(2 + jitter_iid, iid_pooled[idx_iid], alpha=0.3, s=3,
                color=color_iid, zorder=0)
 
-    # Stats annotation
-    slice_median = np.median(slice_pooled)
-    iid_median = np.median(iid_pooled)
-    slice_iqr = np.percentile(slice_pooled, 75) - np.percentile(slice_pooled, 25)
-    iid_iqr = np.percentile(iid_pooled, 75) - np.percentile(iid_pooled, 25)
-
     ax.set_xticks([1, 2])
     ax.set_xticklabels(['2D slice\nsampling', 'i.i.d.\nsampling'],
                         fontsize=font_settings['tick_size'])
     style_axis(ax, ylabel='Wasserstein distance [μm]')
     ax.set_ylim(bottom=0)
-
-    # Add median ± IQR text
-    ax.text(0.05, 0.95, f'Median (IQR):\nSlice: {slice_median:.3f} ({slice_iqr:.3f})\n'
-            f'i.i.d.: {iid_median:.3f} ({iid_iqr:.3f})',
-            transform=ax.transAxes, fontsize=font_settings['legend_size'] - 1,
-            ha='left', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     ax.set_box_aspect(1)
 
@@ -462,6 +483,61 @@ def compute_3d_cdf(profiles: List[np.ndarray], bin_centers: np.ndarray) -> np.nd
     sorted_radii = np.sort(all_radii)
     cdf_y = np.arange(1, len(sorted_radii) + 1) / len(sorted_radii)
     return np.interp(bin_centers, sorted_radii, cdf_y, left=0, right=1)
+
+
+def compute_permutation_pvalue(x_3d: np.ndarray, roi_slice_data: List[Dict],
+                                metric: str, n_perm: int = 10000,
+                                seed: int = 42) -> float:
+    """
+    Compute permutation p-value for correlation.
+
+    Matches main figure approach: shuffle 3D labels AND pick new random slices
+    for each permutation.
+
+    Args:
+        x_3d: 3D metric values (n_rois,)
+        roi_slice_data: List of dicts with per-slice metrics
+        metric: 'mean_radius' or 'r_eff' - which metric to use
+        n_perm: Number of permutations
+        seed: Random seed
+
+    Returns:
+        p-value (fraction of permuted R >= observed R)
+    """
+    n_rois = len(x_3d)
+    rng = np.random.default_rng(seed)
+
+    # Key for per-slice data
+    slice_key = 'mean_radius_per_slice' if metric == 'mean_radius' else 'r_eff_per_slice'
+
+    # Compute observed R (mean across many random slice picks)
+    n_obs_iter = 1000
+    r_obs_per_iter = []
+    for _ in range(n_obs_iter):
+        y_2d = np.zeros(n_rois)
+        for j, roi in enumerate(roi_slice_data):
+            slice_idx = rng.integers(0, roi['n_slices'])
+            y_2d[j] = roi[slice_key][slice_idx]
+        r, _ = stats.pearsonr(x_3d, y_2d)
+        r_obs_per_iter.append(r)
+    r_observed = np.mean(r_obs_per_iter)
+
+    # Permutation test: shuffle 3D AND pick new random slices
+    r_perm = np.zeros(n_perm)
+    for i in range(n_perm):
+        perm_idx = rng.permutation(n_rois)
+        x_3d_perm = x_3d[perm_idx]
+
+        y_2d = np.zeros(n_rois)
+        for j, roi in enumerate(roi_slice_data):
+            slice_idx = rng.integers(0, roi['n_slices'])
+            y_2d[j] = roi[slice_key][slice_idx]
+
+        r_perm[i], _ = stats.pearsonr(x_3d_perm, y_2d)
+
+    p_value = np.mean(r_perm >= r_observed)
+
+    return p_value
 
 
 def main():
@@ -543,6 +619,37 @@ def main():
     actual_results, fake_results = run_monte_carlo(roi_slice_data, roi_3d_cdfs,
                                                     args.n_iterations, seed=args.seed)
 
+    # Compute permutation p-values (slice sampling only - matches main figure approach)
+    # For i.i.d. sampling, use simpler approach since there's no slice structure
+    logger.info("\nComputing permutation p-values (10k permutations)...")
+    p_mean_slice = compute_permutation_pvalue(x_3d_mean, roi_slice_data,
+                                               metric='mean_radius',
+                                               n_perm=10000, seed=args.seed + 100)
+    p_reff_slice = compute_permutation_pvalue(x_3d_reff, roi_slice_data,
+                                               metric='r_eff',
+                                               n_perm=10000, seed=args.seed + 102)
+
+    # For i.i.d. sampling: use mean 2D values (no slice structure to resample)
+    y_iid_mean = np.mean(fake_results['mean_radius'], axis=1)
+    y_iid_reff = np.mean(fake_results['r_eff'], axis=1)
+    rng_perm = np.random.default_rng(args.seed + 200)
+
+    r_iid_mean_obs, _ = stats.pearsonr(x_3d_mean, y_iid_mean)
+    r_iid_reff_obs, _ = stats.pearsonr(x_3d_reff, y_iid_reff)
+
+    r_iid_mean_perm = np.zeros(10000)
+    r_iid_reff_perm = np.zeros(10000)
+    for i in range(10000):
+        perm_idx = rng_perm.permutation(n_rois)
+        r_iid_mean_perm[i], _ = stats.pearsonr(x_3d_mean[perm_idx], y_iid_mean)
+        r_iid_reff_perm[i], _ = stats.pearsonr(x_3d_reff[perm_idx], y_iid_reff)
+
+    p_mean_iid = np.mean(r_iid_mean_perm >= r_iid_mean_obs)
+    p_reff_iid = np.mean(r_iid_reff_perm >= r_iid_reff_obs)
+
+    logger.info(f"  Mean radius p-values: slice={p_mean_slice:.4f}, i.i.d.={p_mean_iid:.4f}")
+    logger.info(f"  Effective radius p-values: slice={p_reff_slice:.4f}, i.i.d.={p_reff_iid:.4f}")
+
     # Create 1x3 figure
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
@@ -551,33 +658,19 @@ def main():
     plot_wasserstein_violin(axes[0], actual_results['wasserstein'],
                             fake_results['wasserstein'])
 
-    # Compute shared axis limits for both scatter plots
-    all_mean_vals = np.concatenate([
-        x_3d_mean,
-        np.mean(actual_results['mean_radius'], axis=1),
-        np.mean(fake_results['mean_radius'], axis=1)
-    ])
-    all_reff_vals = np.concatenate([
-        x_3d_reff,
-        np.mean(actual_results['r_eff'], axis=1),
-        np.mean(fake_results['r_eff'], axis=1)
-    ])
-    all_scatter_vals = np.concatenate([all_mean_vals, all_reff_vals])
-    shared_min = np.nanmin(all_scatter_vals) * 0.95
-    shared_max = np.nanmax(all_scatter_vals) * 1.05
-    shared_lim = (shared_min, shared_max)
-
-    # Panel (b): Mean radius
+    # Panel (b): Mean radius (auto axis limits)
     logger.info("Plotting panel (b): Mean radius comparison...")
     r_mean_slice, r_mean_iid, r_mean_slice_std, r_mean_iid_std = plot_scatter_comparison(
         axes[1], x_3d_mean, actual_results['mean_radius'],
-        fake_results['mean_radius'], 'mean_radius', shared_lim=shared_lim)
+        fake_results['mean_radius'], 'mean_radius',
+        p_actual=p_mean_slice, p_fake=p_mean_iid)
 
-    # Panel (c): Effective radius
+    # Panel (c): Effective radius (auto axis limits)
     logger.info("Plotting panel (c): Effective radius comparison...")
     r_reff_slice, r_reff_iid, r_reff_slice_std, r_reff_iid_std = plot_scatter_comparison(
         axes[2], x_3d_reff, actual_results['r_eff'],
-        fake_results['r_eff'], 'r_eff', shared_lim=shared_lim)
+        fake_results['r_eff'], 'r_eff',
+        p_actual=p_reff_slice, p_fake=p_reff_iid)
 
     plt.tight_layout()
 
@@ -597,6 +690,10 @@ def main():
     wass_slice_iqr = np.percentile(wass_slice, 75) - np.percentile(wass_slice, 25)
     wass_iid_iqr = np.percentile(wass_iid, 75) - np.percentile(wass_iid, 25)
 
+    # Format p-values for logging
+    def fmt_p(p):
+        return 'p < 0.001' if p < 0.001 else f'p = {p:.3f}'
+
     # Summary
     logger.info("\n" + "=" * 70)
     logger.info("RESULTS")
@@ -606,11 +703,11 @@ def main():
     logger.info(f"  i.i.d. sampling:   {wass_iid_median:.4f} ({wass_iid_iqr:.4f})")
     logger.info(f"Correlation with 3D (mean ± std across MC iterations):")
     logger.info(f"  Mean radius:")
-    logger.info(f"    2D slice sampling: R = {r_mean_slice:.3f} ± {r_mean_slice_std:.3f}")
-    logger.info(f"    i.i.d. sampling:   R = {r_mean_iid:.3f} ± {r_mean_iid_std:.3f}")
+    logger.info(f"    2D slice sampling: R = {r_mean_slice:.2f} ± {r_mean_slice_std:.2f}, {fmt_p(p_mean_slice)}")
+    logger.info(f"    i.i.d. sampling:   R = {r_mean_iid:.2f} ± {r_mean_iid_std:.2f}, {fmt_p(p_mean_iid)}")
     logger.info(f"  Effective radius:")
-    logger.info(f"    2D slice sampling: R = {r_reff_slice:.3f} ± {r_reff_slice_std:.3f}")
-    logger.info(f"    i.i.d. sampling:   R = {r_reff_iid:.3f} ± {r_reff_iid_std:.3f}")
+    logger.info(f"    2D slice sampling: R = {r_reff_slice:.2f} ± {r_reff_slice_std:.2f}, {fmt_p(p_reff_slice)}")
+    logger.info(f"    i.i.d. sampling:   R = {r_reff_iid:.2f} ± {r_reff_iid_std:.2f}, {fmt_p(p_reff_iid)}")
 
     # Save metadata
     metadata = {
@@ -618,6 +715,7 @@ def main():
         'n_rois': n_rois,
         'radius_type': args.radius_type,
         'seed': args.seed,
+        'min_mean_axons_per_slice': 1000,
         'wasserstein': {
             'slice_sampling_median': float(wass_slice_median),
             'slice_sampling_iqr': float(wass_slice_iqr),
@@ -627,14 +725,18 @@ def main():
         'mean_radius': {
             'r_slice_sampling': float(r_mean_slice),
             'r_slice_sampling_std': float(r_mean_slice_std),
+            'p_slice_sampling': float(p_mean_slice),
             'r_iid_sampling': float(r_mean_iid),
             'r_iid_sampling_std': float(r_mean_iid_std),
+            'p_iid_sampling': float(p_mean_iid),
         },
         'r_eff': {
             'r_slice_sampling': float(r_reff_slice),
             'r_slice_sampling_std': float(r_reff_slice_std),
+            'p_slice_sampling': float(p_reff_slice),
             'r_iid_sampling': float(r_reff_iid),
             'r_iid_sampling_std': float(r_reff_iid_std),
+            'p_iid_sampling': float(p_reff_iid),
         }
     }
 

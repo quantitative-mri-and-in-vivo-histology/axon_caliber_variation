@@ -122,11 +122,19 @@ def find_samples_by_mean_radius(data_dir: Path, min_axons: int = 1_000_000
     if len(results) < 3:
         raise ValueError(f"Need at least 3 samples, found {len(results)}")
 
-    # Pick small (near start), medium (middle), high (near end)
+    # Pick small, medium, high - evenly spaced across the range
     n = len(results)
     small_idx = 1  # avoid very smallest
-    med_idx = n // 2
     high_idx = n - 2  # avoid very largest
+
+    # Find medium closest to midpoint of small and high mean radii
+    small_mean_r = results[small_idx][3]
+    high_mean_r = results[high_idx][3]
+    target_mid = (small_mean_r + high_mean_r) / 2
+
+    # Find index with mean_r closest to target
+    med_idx = min(range(small_idx + 1, high_idx),
+                  key=lambda i: abs(results[i][3] - target_mid))
 
     selected = [results[small_idx], results[med_idx], results[high_idx]]
 
@@ -244,7 +252,7 @@ def plot_pdf_stability(ax, slice_file: Path, radius_type: str = 'circular',
 
     ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_ylabel('Probability density', fontsize=font_settings['label_size'],
+    ax.set_ylabel('Probability density [μm⁻¹]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
     ax.legend(loc='upper right', fontsize=font_settings['legend_size'])
     ax.set_xlim(0, x_max)
@@ -358,11 +366,11 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     handles = []
     labels = []
 
-    # Style indicators (first row)
+    # Style indicators
     handles.append(Line2D([0], [0], color='gray', linewidth=line_settings['linewidth'], linestyle='-'))
-    labels.append('3D')
+    labels.append('3D reference')
     handles.append(Patch(facecolor='gray', alpha=0.3, edgecolor='none'))
-    labels.append('2D IQR')
+    labels.append('2D slice IQR')
 
     # Sample indicators with colors
     for color, short_name, mean_r in sample_info:
@@ -372,7 +380,7 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
 
     ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.set_ylabel('Probability density', fontsize=font_settings['label_size'],
+    ax.set_ylabel('Probability density [μm⁻¹]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
     ax.legend(handles, labels, loc='upper right', fontsize=font_settings['legend_size'] - 1,
               framealpha=0.9)
@@ -502,8 +510,8 @@ def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, 
     parts = ax.violinplot([within_distances, between_distances], positions=[1, 2],
                            showmeans=False, showmedians=True, widths=0.7)
 
-    # Color the violins (high contrast for violin/box plots)
-    colors = [settings.colors['category_a_violin'], settings.colors['category_b_violin']]
+    # Color the violins (binary comparison colors)
+    colors = [settings.colors['binary_a'], settings.colors['binary_b']]
     for i, pc in enumerate(parts['bodies']):
         pc.set_facecolor(colors[i])
         pc.set_alpha(0.8)
@@ -530,7 +538,7 @@ def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, 
     ax.scatter(2 + jitter, between_distances, alpha=0.5, s=10, color='#404040', zorder=0)
 
     ax.set_xticks([1, 2])
-    ax.set_xticklabels(['Sampling error\n(intra-ROI 2D ↔ 3D)', 'Biol. variability\n(inter-ROI 3D)'],
+    ax.set_xticklabels(['Sampling error\n(intra-ROI 2D ↔ 3D)', 'Anat. variability\n(inter-ROI 3D)'],
                         fontsize=font_settings['tick_size'] - 1)
     ax.set_ylabel('Wasserstein distance [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
@@ -706,6 +714,196 @@ def load_2d_metrics(npz_file: Path, radius_type: str = 'circular') -> Dict[str, 
     }
 
 
+def load_2d_slice_data(npz_file: Path, radius_type: str = 'circular',
+                       min_mean_axons_per_slice: int = 1000) -> Dict[str, np.ndarray]:
+    """
+    Load per-slice 2D metrics for Monte Carlo sampling.
+
+    Returns dict with arrays of per-slice values (only valid slices).
+    Filters out edge slices with < half the mean axon count.
+    Returns empty if mean axons per slice < min_mean_axons_per_slice.
+    """
+    data = np.load(npz_file)
+    bin_centers = data['bin_centers']
+    histograms = data[f'histograms_{radius_type}']
+    r_eff_per_slice = data[f'r_eff_{radius_type}_per_slice']
+
+    # First pass: compute mean axon count per slice
+    all_counts = []
+    for hist_slice in histograms:
+        counts = hist_slice.sum()
+        if counts > 0:
+            all_counts.append(counts)
+
+    mean_axon_count = np.mean(all_counts) if all_counts else 0
+
+    # Skip ROIs with insufficient mean axons per slice
+    if mean_axon_count < min_mean_axons_per_slice:
+        return {
+            'mean_radius_per_slice': np.array([]),
+            'r_eff_per_slice': np.array([]),
+            'n_valid_slices': 0,
+            'mean_axons_per_slice': mean_axon_count
+        }
+
+    min_axon_count = mean_axon_count / 2  # Filter slices below half the mean
+
+    # Second pass: filter slices and compute metrics
+    mean_radius_per_slice = []
+    valid_r_eff = []
+    valid_indices = []
+
+    for i, hist_slice in enumerate(histograms):
+        counts = hist_slice.sum()
+        if counts >= min_axon_count and r_eff_per_slice[i] > 0:
+            mean_r = np.sum(bin_centers * hist_slice) / counts
+            mean_radius_per_slice.append(mean_r)
+            valid_r_eff.append(r_eff_per_slice[i])
+            valid_indices.append(i)
+
+    return {
+        'mean_radius_per_slice': np.array(mean_radius_per_slice),
+        'r_eff_per_slice': np.array(valid_r_eff),
+        'n_valid_slices': len(valid_indices),
+        'mean_axons_per_slice': mean_axon_count
+    }
+
+
+def run_monte_carlo_correlation(
+    all_pairs: List[Tuple[Path, Path, str, Set[int]]],
+    radius_type: str = 'circular',
+    n_iterations: int = 10000,
+    seed: int = 42
+) -> Dict[str, Dict[str, float]]:
+    """
+    Run Monte Carlo simulation to compute correlation between 2D and 3D metrics.
+
+    For each iteration:
+    - Randomly pick one slice per ROI
+    - Compute correlation R between 2D sample and 3D ground truth
+
+    Args:
+        all_pairs: List of (slice_file, axon_file, sample_name, population_labels) tuples
+        radius_type: 'circular' or 'minor'
+        n_iterations: Number of MC iterations
+        seed: Random seed for reproducibility
+
+    Returns:
+        Dict with mean and std of R for mean_radius and r_eff
+    """
+    rng = np.random.default_rng(seed)
+
+    # Load all data
+    roi_slice_data = []
+    x_3d_mean = []
+    x_3d_reff = []
+
+    for slice_file, axon_file, sample_name, pop_labels in all_pairs:
+        # Load 2D slice data (filters ROIs with < 1000 mean axons per slice)
+        slice_data = load_2d_slice_data(slice_file, radius_type, min_mean_axons_per_slice=1000)
+        if slice_data['n_valid_slices'] < 1:
+            mean_axons = slice_data.get('mean_axons_per_slice', 0)
+            logger.warning(f"Skipping {sample_name} - mean axons/slice too low ({mean_axons:.0f})")
+            continue
+
+        # Load 3D metrics
+        m3d = load_3d_metrics(axon_file, pop_labels)
+        if np.isnan(m3d['mean_radius']):
+            continue
+
+        roi_slice_data.append(slice_data)
+        x_3d_mean.append(m3d['mean_radius'])
+        x_3d_reff.append(m3d['r_eff'])
+
+    x_3d_mean = np.array(x_3d_mean)
+    x_3d_reff = np.array(x_3d_reff)
+    n_rois = len(roi_slice_data)
+
+    logger.info(f"Running Monte Carlo with {n_rois} ROIs, {n_iterations} iterations...")
+
+    # Run MC iterations
+    r_mean_per_iter = []
+    r_reff_per_iter = []
+
+    for _ in range(n_iterations):
+        y_2d_mean = np.zeros(n_rois)
+        y_2d_reff = np.zeros(n_rois)
+
+        for j, roi in enumerate(roi_slice_data):
+            # Randomly pick one slice
+            slice_idx = rng.integers(0, roi['n_valid_slices'])
+            y_2d_mean[j] = roi['mean_radius_per_slice'][slice_idx]
+            y_2d_reff[j] = roi['r_eff_per_slice'][slice_idx]
+
+        # Compute correlations
+        r_mean, _ = stats.pearsonr(x_3d_mean, y_2d_mean)
+        r_reff, _ = stats.pearsonr(x_3d_reff, y_2d_reff)
+
+        r_mean_per_iter.append(r_mean)
+        r_reff_per_iter.append(r_reff)
+
+    r_mean_per_iter = np.array(r_mean_per_iter)
+    r_reff_per_iter = np.array(r_reff_per_iter)
+
+    # Compute observed R (mean across iterations)
+    r_mean_observed = np.mean(r_mean_per_iter)
+    r_reff_observed = np.mean(r_reff_per_iter)
+
+    # Permutation test for p-value
+    # Null hypothesis: no correlation between 2D and 3D
+    # Shuffle 3D values and compute R, count fraction >= observed
+    n_perm = n_iterations
+    rng_perm = np.random.default_rng(seed + 100)
+
+    r_mean_perm = []
+    r_reff_perm = []
+
+    for _ in range(n_perm):
+        # Shuffle 3D values
+        perm_idx = rng_perm.permutation(n_rois)
+        x_3d_mean_perm = x_3d_mean[perm_idx]
+        x_3d_reff_perm = x_3d_reff[perm_idx]
+
+        # Pick random slices (same as observed)
+        y_2d_mean = np.zeros(n_rois)
+        y_2d_reff = np.zeros(n_rois)
+        for j, roi in enumerate(roi_slice_data):
+            slice_idx = rng_perm.integers(0, roi['n_valid_slices'])
+            y_2d_mean[j] = roi['mean_radius_per_slice'][slice_idx]
+            y_2d_reff[j] = roi['r_eff_per_slice'][slice_idx]
+
+        r_perm, _ = stats.pearsonr(x_3d_mean_perm, y_2d_mean)
+        r_mean_perm.append(r_perm)
+
+        r_perm, _ = stats.pearsonr(x_3d_reff_perm, y_2d_reff)
+        r_reff_perm.append(r_perm)
+
+    r_mean_perm = np.array(r_mean_perm)
+    r_reff_perm = np.array(r_reff_perm)
+
+    # p-value: fraction of permuted R >= observed R
+    p_mean = np.mean(r_mean_perm >= r_mean_observed)
+    p_reff = np.mean(r_reff_perm >= r_reff_observed)
+
+    logger.info(f"  Permutation p-values: mean_radius p={p_mean:.4f}, r_eff p={p_reff:.4f}")
+
+    return {
+        'mean_radius': {
+            'r_mean': r_mean_observed,
+            'r_std': np.std(r_mean_per_iter),
+            'p_value': p_mean
+        },
+        'r_eff': {
+            'r_mean': r_reff_observed,
+            'r_std': np.std(r_reff_per_iter),
+            'p_value': p_reff
+        },
+        'n_iterations': n_iterations,
+        'n_rois': n_rois,
+        'seed': seed
+    }
+
+
 def load_3d_metrics(npz_file: Path, population_labels: Optional[Set[int]] = None) -> Dict[str, float]:
     """Load 3D axon-based metrics from NPZ file."""
     data = np.load(npz_file, allow_pickle=True)
@@ -770,7 +968,8 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str, Set[int]]
 
 
 def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
-                          metric: str, panel_label: str) -> None:
+                          metric: str, panel_label: str,
+                          mc_results: Optional[Dict] = None) -> None:
     """
     Plot 2D vs 3D scatter for ensemble metrics.
 
@@ -779,48 +978,32 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
         all_metrics: List of (metrics_2d, metrics_3d, sample_name) tuples
         metric: 'mean_radius' or 'r_eff'
         panel_label: '(c)' or '(d)'
+        mc_results: Optional Monte Carlo results dict with r_mean and r_std
     """
     font_settings = settings.fonts
     err_settings = settings.error_bars
 
-    # Organize by group and population
-    data_by_category = {}
+    # Collect all data (no differentiation by group/population)
+    all_x, all_y, all_yerr_lo, all_yerr_hi = [], [], [], []
 
     for metrics_2d, metrics_3d, sample_name in all_metrics:
-        group, population = extract_group_info(sample_name)
-        category = (group, population)
+        all_x.append(metrics_3d[metric])
+        all_y.append(metrics_2d[metric])
+        all_yerr_lo.append(metrics_2d[metric] - metrics_2d[f'{metric}_lo'])
+        all_yerr_hi.append(metrics_2d[f'{metric}_hi'] - metrics_2d[metric])
 
-        if category not in data_by_category:
-            data_by_category[category] = {'x': [], 'y': [], 'yerr_lo': [], 'yerr_hi': []}
+    # Use single default color
+    color = settings.colors['single_line']
 
-        data_by_category[category]['x'].append(metrics_3d[metric])
-        data_by_category[category]['y'].append(metrics_2d[metric])
-        data_by_category[category]['yerr_lo'].append(
-            metrics_2d[metric] - metrics_2d[f'{metric}_lo'])
-        data_by_category[category]['yerr_hi'].append(
-            metrics_2d[f'{metric}_hi'] - metrics_2d[metric])
-
-    # Collect all values for axis limits
-    all_x, all_y = [], []
-
-    # Plot each category
-    for (group, population), data in sorted(data_by_category.items()):
-        color = settings.get_group_color(group)
-        marker = settings.get_marker(population)
-
-        label = f"{group} - {population}" if population else group
-
-        yerr = [data['yerr_lo'], data['yerr_hi']]
-        ax.errorbar(
-            data['x'], data['y'], yerr=yerr,
-            fmt=marker, color=color, markersize=7,
-            capsize=err_settings['capsize'], capthick=err_settings['capthick'],
-            elinewidth=err_settings['linewidth'],
-            markeredgecolor='black', markeredgewidth=0.5,
-            alpha=err_settings['alpha'], label=label
-        )
-        all_x.extend(data['x'])
-        all_y.extend(data['y'])
+    yerr = [all_yerr_lo, all_yerr_hi]
+    ax.errorbar(
+        all_x, all_y, yerr=yerr,
+        fmt='o', color=color, markersize=7,
+        capsize=err_settings['capsize'], capthick=err_settings['capthick'],
+        elinewidth=err_settings['linewidth'],
+        markeredgecolor='black', markeredgewidth=0.5,
+        alpha=err_settings['alpha']
+    )
 
     # Check for sufficient data
     if len(all_x) < 2:
@@ -828,17 +1011,14 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
         ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax.transAxes)
         return
 
-    # Correlation
-    r, p = stats.pearsonr(all_x, all_y)
-
     # Compute axis limits
     all_vals = all_x + all_y
     min_val = min(all_vals) * 0.95
     max_val = max(all_vals) * 1.05
 
     if metric == 'mean_radius':
-        xlabel = r'3D $\bar{r}$ [μm]'
-        ylabel = r'2D $\bar{r}$ [μm]'
+        xlabel = r'$\bar{r}$ (3D) [μm]'
+        ylabel = r'$\bar{r}$ (2D) [μm]'
         # Set matching ticks with 0.05 step (within data range)
         tick_step = 0.05
         tick_start = np.ceil(min_val / tick_step) * tick_step
@@ -847,8 +1027,8 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
         ax.set_xticks(ticks)
         ax.set_yticks(ticks)
     else:
-        xlabel = r'3D $r_{\mathrm{MRI}}$ [μm]'
-        ylabel = r'2D $r_{\mathrm{MRI}}$ [μm]'
+        xlabel = r'$r_{\mathrm{MRI}}$ (3D) [μm]'
+        ylabel = r'$r_{\mathrm{MRI}}$ (2D) [μm]'
 
     # Identity line (spans full axis range)
     ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5,
@@ -862,15 +1042,34 @@ def plot_ensemble_scatter(ax, all_metrics: List[Tuple[Dict, Dict, str]],
                   fontweight=font_settings['weight'])
     ax.set_ylabel(ylabel, fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
-    ax.legend(loc='upper left', fontsize=font_settings['legend_size'] - 1, framealpha=0.9)
 
-    # Add correlation as text annotation
-    if p < 0.001:
-        p_str = f'p < 0.001'
+    # Add Monte Carlo correlation as text annotation
+    if mc_results is not None and metric in mc_results:
+        r_mean = mc_results[metric]['r_mean']
+        r_std = mc_results[metric]['r_std']
+        p_val = mc_results[metric].get('p_value', None)
+        if p_val is not None:
+            if p_val < 0.001:
+                p_str = 'p < 0.001'
+            elif p_val == 0:
+                p_str = f'p < {1/mc_results["n_iterations"]:.0e}'
+            else:
+                p_str = f'p = {p_val:.3f}'
+            ax.text(0.95, 0.05, f'$R$ = {r_mean:.2f} ± {r_std:.2f}\n{p_str}',
+                    transform=ax.transAxes, fontsize=font_settings['legend_size'],
+                    ha='right', va='bottom')
+        else:
+            ax.text(0.95, 0.05, f'$R$ = {r_mean:.2f} ± {r_std:.2f}', transform=ax.transAxes,
+                    fontsize=font_settings['legend_size'], ha='right', va='bottom')
     else:
-        p_str = f'p = {p:.3f}'
-    ax.text(0.95, 0.05, f'$R$ = {r:.3f}, {p_str}', transform=ax.transAxes,
-            fontsize=font_settings['legend_size'], ha='right', va='bottom')
+        # Fallback to single correlation from median values
+        r, p = stats.pearsonr(all_x, all_y)
+        if p < 0.001:
+            p_str = f'p < 0.001'
+        else:
+            p_str = f'p = {p:.3f}'
+        ax.text(0.95, 0.05, f'$R$ = {r:.2f}, {p_str}', transform=ax.transAxes,
+                fontsize=font_settings['legend_size'], ha='right', va='bottom')
 
 
 def main():
@@ -888,6 +1087,10 @@ def main():
                         help='Radius type to use')
     parser.add_argument('--x-max', type=float, default=1.5,
                         help='Maximum x-axis value for PDF plot')
+    parser.add_argument('--n-iterations', type=int, default=10000,
+                        help='Number of Monte Carlo iterations for R estimation')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for Monte Carlo (sync with supplementary)')
 
     args = parser.parse_args()
 
@@ -909,6 +1112,16 @@ def main():
         m3d = load_3d_metrics(af, labels)
         all_metrics.append((m2d, m3d, sn))
 
+    # Run Monte Carlo to compute R with uncertainty
+    logger.info(f"\nRunning Monte Carlo ({args.n_iterations} iterations, seed={args.seed})...")
+    mc_results = run_monte_carlo_correlation(
+        all_pairs, args.radius_type, args.n_iterations, args.seed)
+
+    logger.info(f"  Mean radius: R = {mc_results['mean_radius']['r_mean']:.3f} ± "
+                f"{mc_results['mean_radius']['r_std']:.3f}")
+    logger.info(f"  Effective radius: R = {mc_results['r_eff']['r_mean']:.3f} ± "
+                f"{mc_results['r_eff']['r_std']:.3f}")
+
     # Create figure (2x2 layout)
     fig, axes = plt.subplots(2, 2, figsize=(10, 9))
 
@@ -922,11 +1135,11 @@ def main():
 
     # Panel (c): Mean radius scatter
     logger.info("\nPlotting panel (c): Mean radius scatter...")
-    plot_ensemble_scatter(axes[1, 0], all_metrics, 'mean_radius', '(c)')
+    plot_ensemble_scatter(axes[1, 0], all_metrics, 'mean_radius', '(c)', mc_results)
 
     # Panel (d): Effective radius scatter
     logger.info("\nPlotting panel (d): Effective radius scatter...")
-    plot_ensemble_scatter(axes[1, 1], all_metrics, 'r_eff', '(d)')
+    plot_ensemble_scatter(axes[1, 1], all_metrics, 'r_eff', '(d)', mc_results)
 
     plt.subplots_adjust(wspace=0.25, hspace=0.25)
 
@@ -947,7 +1160,14 @@ def main():
         'n_ensemble_samples': len(all_metrics),
         'n_qq_rois': len(all_pairs),
         'radius_type': args.radius_type,
-        'x_max_pdf': args.x_max
+        'x_max_pdf': args.x_max,
+        'monte_carlo': {
+            'n_iterations': mc_results['n_iterations'],
+            'n_rois': mc_results['n_rois'],
+            'seed': mc_results['seed'],
+            'mean_radius': mc_results['mean_radius'],
+            'r_eff': mc_results['r_eff']
+        }
     }
     json_output = args.output.with_suffix('.json')
     with open(json_output, 'w') as f:
