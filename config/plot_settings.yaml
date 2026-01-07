@@ -39,6 +39,11 @@ colors:
   # Single lines/curves (no comparison):
   single_line: "#505050"       # Dark gray for single median/mean lines
 
+  # Colored binary comparisons (when grayscale insufficient)
+  # Use for scatter plots, error bars, or when colors aid interpretation
+  binary_a: "#C4A77D"          # Sand/tan - warm neutral
+  binary_b: "#7BA3A8"          # Dusty teal - cool neutral
+
 # Marker styles for populations (tract, rat data only)
 markers:
   cc: "o"              # Circle for corpus callosum

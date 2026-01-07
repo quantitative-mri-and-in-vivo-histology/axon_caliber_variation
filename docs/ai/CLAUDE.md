@@ -359,6 +359,10 @@ For violin/box plots (high contrast):
 - **Category A**: Light gray (`#D0D0D0`)
 - **Category B**: Dark gray (`#505050`)
 
+For colored binary comparisons (scatter plots, error bars):
+- **Binary A**: Sand/tan (`#C4A77D`) - warm neutral
+- **Binary B**: Dusty teal (`#7BA3A8`) - cool neutral
+
 *Single lines/curves (no comparison):*
 - Use dark gray (`#505050`) for single median/mean lines with shaded IQR
 
@@ -396,6 +400,9 @@ step_edge = settings.colors['category_b_edge']   # '#303030' (dark edge, linewid
 # For violin/box plots:
 violin_light = settings.colors['category_a_violin']  # '#D0D0D0'
 violin_dark = settings.colors['category_b_violin']   # '#505050'
+# For colored binary comparisons (scatter plots, error bars):
+binary_a = settings.colors['binary_a']           # '#C4A77D' (sand/tan)
+binary_b = settings.colors['binary_b']           # '#7BA3A8' (dusty teal)
 
 # Representative example colors
 colors = [settings.colors['example_1'],  # Green

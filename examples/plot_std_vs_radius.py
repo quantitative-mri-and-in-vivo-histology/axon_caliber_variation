@@ -14,7 +14,7 @@ from typing import List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-from axonometry import get_plot_settings, add_panel_labels, style_axis
+from axonometry import get_plot_settings
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -61,16 +61,21 @@ def plot_std_vs_radius(
         all_data: List of (mean_radii, std_radii, sample_name) tuples
         output_file: Output PNG file path
     """
-    fig, ax = plt.subplots(figsize=(6, 6))
+    # 62 mm width, square aspect ratio
+    width_mm = 62
+    width_in = width_mm / 25.4
+    fig, ax = plt.subplots(figsize=(width_in, width_in))
 
     # Pool all data
     all_x = np.concatenate([r for r, _, _ in all_data])
     all_std = np.concatenate([s for _, s, _ in all_data])
 
-    # Get settings
-    font_settings = settings.fonts
-    line_settings = settings.line
-    main_color = settings.get_group_color('sham')
+    # Font sizes scaled for small figure
+    label_size = 8
+    tick_size = 7
+    linewidth = 1.2
+    marker_size = 3
+    main_color = settings.colors['single_line']  # Single curve, no comparison
 
     # Compute binned statistics
     x_max = np.percentile(all_x, 99.5)
@@ -101,14 +106,13 @@ def plot_std_vs_radius(
 
     # Plot
     ax.plot(bin_centers[valid], bin_medians[valid], color=main_color, linestyle='-',
-            linewidth=line_settings['linewidth'], marker='o',
-            markersize=line_settings['marker_size'], label='Median')
+            linewidth=linewidth, marker='o', markersize=marker_size)
     ax.fill_between(bin_centers[valid], bin_q25[valid], bin_q75[valid],
-                    color=main_color, alpha=line_settings['fill_alpha'], label='IQR (25-75%)')
+                    color=main_color, alpha=0.2)
 
-    style_axis(ax, xlabel='Along-axon mean radius (μm)', ylabel='Std of Radius (μm)')
-    ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
-    ax.set_xlim(0, x_max)
+    ax.set_xlabel('Mean (along-axon radius) [μm]', fontsize=label_size)
+    ax.set_ylabel('Std (along-axon radius) [μm]', fontsize=label_size)
+    ax.tick_params(labelsize=tick_size)
     ax.set_box_aspect(1)  # Square subplot
 
     plt.tight_layout()
@@ -116,9 +120,11 @@ def plot_std_vs_radius(
     # Save figure
     output_file.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
+    svg_output = output_file.with_suffix('.svg')
+    plt.savefig(svg_output, bbox_inches='tight')
     plt.close()
 
-    logger.info(f"Saved plot to {output_file}")
+    logger.info(f"Saved plot to {output_file} and {svg_output}")
 
     # Print summary statistics
     logger.info("")

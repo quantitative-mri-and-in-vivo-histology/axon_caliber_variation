@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-Monte Carlo null test: compare actual 2D slices vs "fake" 2D slices.
+Monte Carlo comparison: 2D slice sampling vs i.i.d. sampling.
 
-This tests whether the 2D-3D correlation is a statistical property of sampling
-along-axon variation, or if physical slices have additional structure.
+Compares two approaches for estimating 3D population statistics from 2D samples:
+1. 2D slice sampling: Randomly pick one physical 2D slice per ROI
+2. i.i.d. sampling: Sample mean_axons_per_slice radii from the pooled 2D distribution
 
-Two approaches compared:
-1. ACTUAL 2D: Randomly pick one physical 2D slice per ROI
-2. FAKE 2D: For each axon, randomly sample one radius from its 3D profile,
-   combine all samples into a "fake" slice
+Both methods use the same underlying 2D radii (with minor axis bias from
+ellipse fitting), ensuring a fair comparison of sampling strategies.
 
-If fake 2D correlates with 3D as well as actual 2D, then the correlation
-is just a statistical property of the data.
+Creates a 1x2 figure showing 2D vs 3D scatter plots:
+(a) Mean radius: 3D vs 2D (slice sampling vs i.i.d. sampling)
+(b) Effective radius: 3D vs 2D (slice sampling vs i.i.d. sampling)
 
-Creates a 1×2 figure:
-(a) Mean radius: 3D vs 2D (actual=filled, fake=open markers)
-(b) Effective radius: 3D vs 2D (actual=filled, fake=open markers)
+Median and IQR are computed over Monte Carlo iterations.
 
 Usage:
     python examples/plot_montecarlo_2d_vs_3d_correlation.py \
         --data-dir data/processed/LM \
         --output fig/montecarlo_2d_vs_3d_correlation.png \
-        --n-iterations 1000
+        --n-iterations 100
 """
 
 import argparse
@@ -31,10 +29,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
 import numpy as np
 from scipy import stats
 
-from axonometry import get_plot_settings, add_panel_labels
+from axonometry import get_plot_settings, style_axis
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -56,6 +55,32 @@ def compute_r_eff(radii: np.ndarray) -> float:
     return (r6_mean / r2_mean) ** 0.25
 
 
+def compute_wasserstein(radii_2d: np.ndarray, cdf_3d: np.ndarray,
+                        bin_centers: np.ndarray, bin_width: float) -> float:
+    """
+    Compute Wasserstein distance between 2D sample and 3D ground truth CDF.
+
+    Wasserstein distance = integral of |CDF_2D - CDF_3D|
+    For discrete CDFs: sum of |CDF differences| * bin_width
+
+    Args:
+        radii_2d: Array of 2D radius samples
+        cdf_3d: Pre-computed 3D CDF at bin_centers
+        bin_centers: Histogram bin centers
+        bin_width: Width of histogram bins
+
+    Returns:
+        Wasserstein distance in μm
+    """
+    # Compute 2D histogram and CDF
+    hist_2d, _ = np.histogram(radii_2d, bins=np.append(bin_centers - bin_width/2,
+                                                        bin_centers[-1] + bin_width/2))
+    if hist_2d.sum() == 0:
+        return np.nan
+    cdf_2d = np.cumsum(hist_2d) / hist_2d.sum()
+
+    # Wasserstein = integral of |CDF_2D - CDF_3D|
+    return np.sum(np.abs(cdf_2d - cdf_3d)) * bin_width
 
 
 def load_3d_profiles(npz_file: Path, population_labels: Optional[Set[int]] = None
@@ -89,36 +114,18 @@ def compute_3d_metrics(profiles: List[np.ndarray]) -> Dict[str, float]:
     }
 
 
-def generate_fake_2d_slice(profiles: List[np.ndarray]) -> np.ndarray:
+def generate_iid_sample(all_radii_3d: np.ndarray, n_samples: int) -> np.ndarray:
     """
-    Generate a "fake" 2D slice by randomly sampling one radius from each axon.
+    Generate i.i.d. sample from pooled 3D distribution.
 
-    For each axon's 3D profile, pick one random radius measurement.
-    Combine all samples into a fake slice.
-    """
-    return np.array([np.random.choice(profile) for profile in profiles])
-
-
-def compute_fake_2d_metrics(profiles: List[np.ndarray], n_iterations: int
-                            ) -> Dict[str, np.ndarray]:
-    """
-    Generate many fake 2D slices and compute metrics for each.
+    Args:
+        all_radii_3d: All radii from 3D profiles (pooled)
+        n_samples: Number of samples to draw (mean axons per slice)
 
     Returns:
-        Dict with arrays of mean_radius and r_eff values (n_iterations each)
+        Array of sampled radii
     """
-    mean_radii = []
-    r_effs = []
-
-    for _ in range(n_iterations):
-        fake_radii = generate_fake_2d_slice(profiles)
-        mean_radii.append(np.mean(fake_radii))
-        r_effs.append(compute_r_eff(fake_radii))
-
-    return {
-        'mean_radius': np.array(mean_radii),
-        'r_eff': np.array(r_effs)
-    }
+    return np.random.choice(all_radii_3d, size=n_samples, replace=True)
 
 
 def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str, Set[int]]]:
@@ -155,239 +162,311 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str, Set[int]]
     return pairs
 
 
-def extract_group_info(sample_name: str) -> Tuple[str, str]:
-    """Extract group (TBI/Sham) and population (CC/CG) from sample name."""
-    name_lower = sample_name.lower()
-
-    if 'tbi' in name_lower:
-        group = "TBI"
-    elif 'sham' in name_lower:
-        group = "Sham"
-    else:
-        group = "Unknown"
-
-    if sample_name.endswith('_CC'):
-        population = "CC"
-    elif sample_name.endswith('_CG'):
-        population = "CG"
-    else:
-        population = None
-
-    return group, population
-
-
 def load_actual_2d_data(slice_file: Path, radius_type: str = 'circular'
                         ) -> Dict[str, np.ndarray]:
     """
     Load actual 2D slice data for Monte Carlo sampling.
 
-    Returns per-slice metrics arrays that can be randomly sampled.
+    Returns per-slice metrics arrays that can be randomly sampled,
+    plus pooled 2D radii for i.i.d. sampling.
     """
     data = np.load(slice_file)
     bin_centers = data['bin_centers']
+    bin_width = bin_centers[1] - bin_centers[0]
     histograms = data[f'histograms_{radius_type}']
     r_eff_per_slice = data[f'r_eff_{radius_type}_per_slice']
+    n_axons_per_slice = data['n_axons_per_slice']
 
-    # Compute per-slice arithmetic mean
+    # Compute per-slice arithmetic mean and pool 2D radii
     mean_radius_per_slice = []
     valid_slice_indices = []
+    axon_counts = []
+    pooled_2d_radii = []  # Reconstructed radii from histograms
+    valid_histograms = []  # Store per-slice histograms for Wasserstein
+
     for i, hist_slice in enumerate(histograms):
         counts = hist_slice.sum()
         if counts > 0 and r_eff_per_slice[i] > 0:
             mean_r = np.sum(bin_centers * hist_slice) / counts
             mean_radius_per_slice.append(mean_r)
             valid_slice_indices.append(i)
+            axon_counts.append(int(n_axons_per_slice[i]))
+            valid_histograms.append(hist_slice)
+
+            # Reconstruct radii from histogram (sample bin centers by counts)
+            for bin_idx, bin_count in enumerate(hist_slice):
+                if bin_count > 0:
+                    pooled_2d_radii.extend([bin_centers[bin_idx]] * int(bin_count))
 
     mean_radius_per_slice = np.array(mean_radius_per_slice)
     valid_r_eff = r_eff_per_slice[valid_slice_indices]
+    mean_axons_per_slice = int(np.mean(axon_counts)) if axon_counts else 0
+    pooled_2d_radii = np.array(pooled_2d_radii)
+    valid_histograms = np.array(valid_histograms)
 
     return {
         'mean_radius_per_slice': mean_radius_per_slice,
         'r_eff_per_slice': valid_r_eff,
-        'n_slices': len(mean_radius_per_slice)
+        'n_slices': len(mean_radius_per_slice),
+        'mean_axons_per_slice': mean_axons_per_slice,
+        'pooled_2d_radii': pooled_2d_radii,
+        'histograms': valid_histograms,
+        'bin_centers': bin_centers,
+        'bin_width': bin_width
     }
 
 
-def plot_single_scatter(ax, x_3d: np.ndarray, y_2d: np.ndarray,
-                        y_ci: Optional[np.ndarray],
-                        groups: List[str], populations: List[str],
-                        metric: str, title: str, axis_limits: Tuple[float, float]) -> float:
+def run_monte_carlo(roi_slice_data: List[Dict], roi_3d_cdfs: List[np.ndarray],
+                    n_iterations: int, seed: int = 42) -> Tuple[Dict, Dict]:
     """
-    Plot scatter for a single comparison (actual or fake 2D vs 3D).
+    Run Monte Carlo simulation for both 2D slice sampling and i.i.d. sampling.
+
+    2D slice sampling: Randomly pick one physical 2D slice per ROI
+    i.i.d. sampling: Sample mean_axons_per_slice radii from pooled 2D distribution
+
+    Both methods use the same underlying 2D radii (with minor axis bias),
+    ensuring a fair comparison of sampling strategies.
+
+    Uses separate RNG streams to ensure slice sampling results are independent
+    of changes to the i.i.d. sampling implementation.
 
     Returns:
-        Pearson R value
+        Tuple of (slice_results, iid_results) where each is a dict with:
+        - mean_radius: array of shape (n_rois, n_iterations)
+        - r_eff: array of shape (n_rois, n_iterations)
+        - wasserstein: array of shape (n_rois, n_iterations)
+    """
+    n_rois = len(roi_slice_data)
+
+    slice_mean = np.zeros((n_rois, n_iterations))
+    slice_reff = np.zeros((n_rois, n_iterations))
+    slice_wass = np.zeros((n_rois, n_iterations))
+    iid_mean = np.zeros((n_rois, n_iterations))
+    iid_reff = np.zeros((n_rois, n_iterations))
+    iid_wass = np.zeros((n_rois, n_iterations))
+
+    # Separate RNG streams for each method to ensure independence
+    rng_slice = np.random.default_rng(seed)
+    rng_iid = np.random.default_rng(seed + 1)
+
+    # Run Monte Carlo
+    for it in range(n_iterations):
+        for j in range(n_rois):
+            roi = roi_slice_data[j]
+            cdf_3d = roi_3d_cdfs[j]
+            bin_centers = roi['bin_centers']
+            bin_width = roi['bin_width']
+
+            # 2D slice sampling: sample one random slice
+            slice_idx = rng_slice.integers(0, roi['n_slices'])
+            slice_mean[j, it] = roi['mean_radius_per_slice'][slice_idx]
+            slice_reff[j, it] = roi['r_eff_per_slice'][slice_idx]
+
+            # Wasserstein for slice sampling (from histogram)
+            hist_slice = roi['histograms'][slice_idx]
+            cdf_2d_slice = np.cumsum(hist_slice) / hist_slice.sum()
+            slice_wass[j, it] = np.sum(np.abs(cdf_2d_slice - cdf_3d)) * bin_width
+
+            # i.i.d. sampling: sample mean_axons_per_slice radii from pooled 2D
+            n_samples = roi['mean_axons_per_slice']
+            iid_radii = rng_iid.choice(roi['pooled_2d_radii'], size=n_samples, replace=False)
+            iid_mean[j, it] = np.mean(iid_radii)
+            iid_reff[j, it] = compute_r_eff(iid_radii)
+
+            # Wasserstein for i.i.d. sampling
+            iid_wass[j, it] = compute_wasserstein(iid_radii, cdf_3d, bin_centers, bin_width)
+
+    return (
+        {'mean_radius': slice_mean, 'r_eff': slice_reff, 'wasserstein': slice_wass},
+        {'mean_radius': iid_mean, 'r_eff': iid_reff, 'wasserstein': iid_wass}
+    )
+
+
+def plot_scatter_comparison(ax, x_3d: np.ndarray, actual_results: np.ndarray,
+                             fake_results: np.ndarray, metric: str,
+                             shared_lim: Optional[Tuple[float, float]] = None) -> Tuple[float, float]:
+    """
+    Plot 2D vs 3D scatter comparing slice sampling and i.i.d. sampling.
+
+    Args:
+        ax: Matplotlib axes
+        x_3d: 3D metric values for each ROI (n_rois,)
+        actual_results: Actual 2D results (n_rois, n_iterations)
+        fake_results: Fake 2D results (n_rois, n_iterations)
+        metric: 'mean_radius' or 'r_eff'
+        shared_lim: Optional tuple (min_val, max_val) for shared axis limits
+
+    Returns:
+        Tuple of (r_actual, r_fake) mean correlation coefficients across iterations
     """
     font_settings = settings.fonts
+    err_settings = settings.error_bars
 
-    # Plot each ROI
-    for i in range(len(x_3d)):
-        color = settings.get_group_color(groups[i])
-        marker = settings.get_marker(populations[i])
+    # Colors for the two approaches (colored binary comparison)
+    color_actual = settings.colors['binary_a']  # Sand/tan for 2D slice sampling
+    color_fake = settings.colors['binary_b']    # Dusty teal for i.i.d. sampling
 
-        if y_ci is not None:
-            # Fake 2D with error bars
-            yerr = [[y_2d[i] - y_ci[0, i]], [y_ci[1, i] - y_2d[i]]]
-            ax.errorbar(x_3d[i], y_2d[i], yerr=yerr, fmt='none',
-                        ecolor=color, alpha=0.6, capsize=2, capthick=1, elinewidth=1, zorder=5)
+    n_iterations = actual_results.shape[1]
 
-        ax.scatter(x_3d[i], y_2d[i], c=color, marker=marker, s=60,
-                   edgecolors='black', linewidths=0.5, zorder=10)
+    # Compute R for each MC iteration, then average
+    r_actual_per_iter = []
+    r_fake_per_iter = []
+    for it in range(n_iterations):
+        r_act, _ = stats.pearsonr(x_3d, actual_results[:, it])
+        r_fake, _ = stats.pearsonr(x_3d, fake_results[:, it])
+        r_actual_per_iter.append(r_act)
+        r_fake_per_iter.append(r_fake)
 
-    # Compute correlation
-    mask = ~(np.isnan(x_3d) | np.isnan(y_2d))
-    r, p = stats.pearsonr(x_3d[mask], y_2d[mask])
+    r_actual_per_iter = np.array(r_actual_per_iter)
+    r_fake_per_iter = np.array(r_fake_per_iter)
 
-    # Identity line
-    min_val, max_val = axis_limits
+    r_actual_mean = np.mean(r_actual_per_iter)
+    r_actual_std = np.std(r_actual_per_iter)
+    r_fake_mean = np.mean(r_fake_per_iter)
+    r_fake_std = np.std(r_fake_per_iter)
+
+    # For plotting: compute mean and std of 2D values over iterations for each ROI
+    actual_mean = np.mean(actual_results, axis=1)
+    actual_std = np.std(actual_results, axis=1)
+    fake_mean = np.mean(fake_results, axis=1)
+    fake_std = np.std(fake_results, axis=1)
+
+    # Plot actual (2D slice sampling)
+    ax.errorbar(x_3d, actual_mean, yerr=actual_std, fmt='o', color=color_actual,
+                markersize=6, capsize=err_settings['capsize'],
+                capthick=err_settings['capthick'], elinewidth=err_settings['linewidth'],
+                markeredgecolor='black', markeredgewidth=0.5,
+                alpha=0.8, label='2D slice sampling', zorder=10)
+
+    # Plot fake (i.i.d. sampling)
+    ax.errorbar(x_3d, fake_mean, yerr=fake_std, fmt='s', color=color_fake,
+                markersize=6, capsize=err_settings['capsize'],
+                capthick=err_settings['capthick'], elinewidth=err_settings['linewidth'],
+                markeredgecolor='black', markeredgewidth=0.5,
+                alpha=0.8, label='i.i.d. sampling', zorder=10)
+
+    # Identity line and axis limits
+    if shared_lim is not None:
+        min_val, max_val = shared_lim
+    else:
+        all_vals = np.concatenate([x_3d, actual_mean, fake_mean])
+        min_val = np.nanmin(all_vals) * 0.95
+        max_val = np.nanmax(all_vals) * 1.05
+
     ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5,
             linewidth=1.5, zorder=0)
 
     ax.set_xlim(min_val, max_val)
     ax.set_ylim(min_val, max_val)
+
+    # Format ticks to 2 decimal places
+    ax.xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+
+    # Labels with math symbols
+    if metric == 'mean_radius':
+        xlabel = r'$\bar{r}$ (3D) [μm]'
+        ylabel = r'$\bar{r}$ (2D) [μm]'
+    else:
+        xlabel = r'$r_{\mathrm{MRI}}$ (3D) [μm]'
+        ylabel = r'$r_{\mathrm{MRI}}$ (2D) [μm]'
+
+    style_axis(ax, xlabel=xlabel, ylabel=ylabel)
+    ax.legend(loc='upper left', fontsize=font_settings['legend_size'])
+
+    # Correlation annotation (mean ± std across MC iterations)
+    ax.text(0.95, 0.15, f'R (slice) = {r_actual_mean:.3f}±{r_actual_std:.3f}',
+            transform=ax.transAxes, fontsize=font_settings['legend_size'],
+            ha='right', va='bottom', color=color_actual)
+    ax.text(0.95, 0.05, f'R (i.i.d.) = {r_fake_mean:.3f}±{r_fake_std:.3f}',
+            transform=ax.transAxes, fontsize=font_settings['legend_size'],
+            ha='right', va='bottom', color=color_fake)
+
     ax.set_box_aspect(1)
 
-    # Labels
-    if metric == 'mean_radius':
-        xlabel = r'3D $\bar{r}$ [μm]'
-        ylabel = r'2D $\bar{r}$ [μm]'
-    else:
-        xlabel = r'3D $r_{\mathrm{MRI}}$ [μm]'
-        ylabel = r'2D $r_{\mathrm{MRI}}$ [μm]'
-
-    ax.set_xlabel(xlabel, fontsize=font_settings['label_size'],
-                  fontweight=font_settings['weight'])
-    ax.set_ylabel(ylabel, fontsize=font_settings['label_size'],
-                  fontweight=font_settings['weight'])
-
-    # Title and correlation annotation
-    ax.text(0.05, 0.95, title,
-            transform=ax.transAxes, fontsize=font_settings['legend_size'] + 1,
-            ha='left', va='top', fontweight='bold')
-    ax.text(0.05, 0.85, f'R = {r:.3f}',
-            transform=ax.transAxes, fontsize=font_settings['legend_size'],
-            ha='left', va='top')
-
-    return r
+    return r_actual_mean, r_fake_mean, r_actual_std, r_fake_std
 
 
-def run_monte_carlo_actual_2d(roi_data: List[Dict], x_3d_mean: np.ndarray,
-                               x_3d_reff: np.ndarray, n_iterations: int) -> Dict:
+def plot_wasserstein_violin(ax, slice_wass: np.ndarray, iid_wass: np.ndarray) -> None:
     """
-    Run Monte Carlo simulation for actual 2D approach.
+    Plot violin comparison of Wasserstein distances (pooled over all MC iterations).
 
-    For each iteration:
-    - Sample one random slice per ROI
-    - Compute R between sampled 2D values and 3D values across ROIs
+    Args:
+        ax: Matplotlib axes
+        slice_wass: Wasserstein distances for slice sampling (n_rois, n_iterations)
+        iid_wass: Wasserstein distances for i.i.d. sampling (n_rois, n_iterations)
     """
-    r_mean_values = []
-    r_reff_values = []
-
-    for _ in range(n_iterations):
-        y_2d_mean = np.zeros(len(roi_data))
-        y_2d_reff = np.zeros(len(roi_data))
-
-        for j, roi in enumerate(roi_data):
-            # Sample one random slice
-            slice_idx = np.random.randint(0, roi['n_slices'])
-            y_2d_mean[j] = roi['mean_radius_per_slice'][slice_idx]
-            y_2d_reff[j] = roi['r_eff_per_slice'][slice_idx]
-
-        # Compute correlations
-        r_mean, _ = stats.pearsonr(x_3d_mean, y_2d_mean)
-        r_reff, _ = stats.pearsonr(x_3d_reff, y_2d_reff)
-
-        r_mean_values.append(r_mean)
-        r_reff_values.append(r_reff)
-
-    return {
-        'r_mean': np.array(r_mean_values),
-        'r_reff': np.array(r_reff_values)
-    }
-
-
-def run_monte_carlo_fake_2d(roi_profiles: List[List[np.ndarray]], x_3d_mean: np.ndarray,
-                             x_3d_reff: np.ndarray, n_iterations: int) -> Dict:
-    """
-    Run Monte Carlo simulation for fake 2D approach.
-
-    For each iteration:
-    - For each ROI, sample one random radius per axon to create "fake" slice
-    - Compute R between fake 2D values and 3D values across ROIs
-    """
-    r_mean_values = []
-    r_reff_values = []
-
-    for _ in range(n_iterations):
-        y_2d_mean = np.zeros(len(roi_profiles))
-        y_2d_reff = np.zeros(len(roi_profiles))
-
-        for j, profiles in enumerate(roi_profiles):
-            # Generate fake slice: one random radius per axon
-            fake_radii = generate_fake_2d_slice(profiles)
-            y_2d_mean[j] = np.mean(fake_radii)
-            y_2d_reff[j] = compute_r_eff(fake_radii)
-
-        # Compute correlations
-        r_mean, _ = stats.pearsonr(x_3d_mean, y_2d_mean)
-        r_reff, _ = stats.pearsonr(x_3d_reff, y_2d_reff)
-
-        r_mean_values.append(r_mean)
-        r_reff_values.append(r_reff)
-
-    return {
-        'r_mean': np.array(r_mean_values),
-        'r_reff': np.array(r_reff_values)
-    }
-
-
-def plot_r_distribution(ax, r_values: np.ndarray, color: str, metric_label: str):
-    """Plot histogram of R values with statistics."""
     font_settings = settings.fonts
 
-    # Fixed bins from 0 to 1 for all panels
-    bins = np.linspace(0, 1, 31)
-    ax.hist(r_values, bins=bins, alpha=0.7, color=color, edgecolor='black', linewidth=0.5)
+    # Pool all values across ROIs and iterations
+    slice_pooled = slice_wass.flatten()
+    iid_pooled = iid_wass.flatten()
 
-    # Statistics
-    r_median = np.median(r_values)
-    r_5, r_95 = np.percentile(r_values, [2.5, 97.5])
+    # Colors (colored binary comparison)
+    color_slice = settings.colors['binary_a']  # Sand/tan for slice sampling
+    color_iid = settings.colors['binary_b']    # Dusty teal for i.i.d. sampling
 
-    # Vertical line for median
-    ax.axvline(r_median, color='black', linestyle='--', linewidth=1.5)
+    # Create violin plots
+    parts = ax.violinplot([slice_pooled, iid_pooled], positions=[1, 2],
+                           showmeans=False, showmedians=True, widths=0.7)
 
-    # Shade 95% CI region
-    ax.axvspan(r_5, r_95, alpha=0.2, color='gray')
+    # Style violins
+    for i, body in enumerate(parts['bodies']):
+        body.set_facecolor([color_slice, color_iid][i])
+        body.set_edgecolor('black')
+        body.set_alpha(0.7)
 
-    ax.set_xlabel(f'R ({metric_label})', fontsize=font_settings['label_size'])
-    ax.set_ylabel('Count', fontsize=font_settings['label_size'])
-    ax.tick_params(labelsize=font_settings['tick_size'])
-    ax.set_xlim(0, 1)
+    for partname in ('cbars', 'cmins', 'cmaxes', 'cmedians'):
+        if partname in parts:
+            parts[partname].set_edgecolor('black')
+            parts[partname].set_linewidth(1.5)
 
-    # Stats text
-    stats_text = f'Median = {r_median:.3f}\n95% CI [{r_5:.3f}-{r_95:.3f}]'
-    ax.text(0.05, 0.95, stats_text, transform=ax.transAxes,
-            fontsize=font_settings['legend_size'], va='top',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    # Add scatter for individual points (subsample for clarity)
+    rng = np.random.default_rng(42)
+    n_show = min(500, len(slice_pooled))
+    idx_slice = rng.choice(len(slice_pooled), n_show, replace=False)
+    idx_iid = rng.choice(len(iid_pooled), n_show, replace=False)
 
-    # Add legend for CI
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
-    handles = [
-        Line2D([0], [0], color='black', linestyle='--', linewidth=1.5),
-        Patch(facecolor='gray', alpha=0.2)
-    ]
-    ax.legend(handles, ['Median', '95% CI'], loc='upper right',
-              fontsize=font_settings['legend_size'] - 1)
+    jitter_slice = rng.uniform(-0.15, 0.15, n_show)
+    jitter_iid = rng.uniform(-0.15, 0.15, n_show)
+
+    ax.scatter(1 + jitter_slice, slice_pooled[idx_slice], alpha=0.3, s=3,
+               color=color_slice, zorder=0)
+    ax.scatter(2 + jitter_iid, iid_pooled[idx_iid], alpha=0.3, s=3,
+               color=color_iid, zorder=0)
+
+    # Stats annotation
+    slice_median = np.median(slice_pooled)
+    iid_median = np.median(iid_pooled)
+    slice_iqr = np.percentile(slice_pooled, 75) - np.percentile(slice_pooled, 25)
+    iid_iqr = np.percentile(iid_pooled, 75) - np.percentile(iid_pooled, 25)
+
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels(['2D slice\nsampling', 'i.i.d.\nsampling'],
+                        fontsize=font_settings['tick_size'])
+    style_axis(ax, ylabel='Wasserstein distance [μm]')
+    ax.set_ylim(bottom=0)
+
+    # Add median ± IQR text
+    ax.text(0.05, 0.95, f'Median (IQR):\nSlice: {slice_median:.3f} ({slice_iqr:.3f})\n'
+            f'i.i.d.: {iid_median:.3f} ({iid_iqr:.3f})',
+            transform=ax.transAxes, fontsize=font_settings['legend_size'] - 1,
+            ha='left', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     ax.set_box_aspect(1)
 
-    return r_median, r_5, r_95
+
+def compute_3d_cdf(profiles: List[np.ndarray], bin_centers: np.ndarray) -> np.ndarray:
+    """Compute 3D CDF at given bin centers."""
+    all_radii = np.concatenate(profiles)
+    sorted_radii = np.sort(all_radii)
+    cdf_y = np.arange(1, len(sorted_radii) + 1) / len(sorted_radii)
+    return np.interp(bin_centers, sorted_radii, cdf_y, left=0, right=1)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Monte Carlo null test: actual vs fake 2D slices',
+        description='Monte Carlo comparison: 2D slice sampling vs i.i.d. sampling',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
@@ -408,7 +487,7 @@ def main():
     np.random.seed(args.seed)
 
     logger.info("=" * 70)
-    logger.info("Monte Carlo: R Distribution for 2D-3D Correlation")
+    logger.info("Monte Carlo: 2D Slice Sampling vs i.i.d. Sampling")
     logger.info("=" * 70)
 
     # Find all ROI pairs
@@ -417,25 +496,26 @@ def main():
 
     # Collect data for Monte Carlo
     x_3d_mean, x_3d_reff = [], []
-    roi_slice_data = []  # For actual 2D sampling
-    roi_profiles = []     # For fake 2D sampling
+    roi_slice_data = []  # For both slice and i.i.d. sampling (both use 2D data)
+    roi_3d_cdfs = []     # 3D CDFs for Wasserstein computation
+    roi_profiles = []    # Store profiles for CDF computation
 
     for slice_file, axon_file, sample_name, pop_labels in all_pairs:
         logger.info(f"Processing {sample_name}...")
 
-        # Load 3D profiles
+        # Load 3D profiles for ground truth
         profiles = load_3d_profiles(axon_file, pop_labels)
         if len(profiles) < 5:
             logger.warning(f"  Skipping - only {len(profiles)} axons")
             continue
 
-        # Load actual 2D slice data
+        # Load 2D slice data (for both slice sampling and i.i.d. sampling)
         slice_data = load_actual_2d_data(slice_file, args.radius_type)
         if slice_data['n_slices'] < 1:
             logger.warning(f"  Skipping - no valid slices")
             continue
 
-        # 3D metrics
+        # 3D metrics (ground truth)
         m3d = compute_3d_metrics(profiles)
         x_3d_mean.append(m3d['mean_radius'])
         x_3d_reff.append(m3d['r_eff'])
@@ -443,45 +523,63 @@ def main():
         roi_slice_data.append(slice_data)
         roi_profiles.append(profiles)
 
-        logger.info(f"  {len(profiles)} axons, {slice_data['n_slices']} slices")
+        logger.info(f"  {len(profiles)} axons, {slice_data['n_slices']} slices, "
+                    f"{len(slice_data['pooled_2d_radii'])} pooled 2D radii")
 
     x_3d_mean = np.array(x_3d_mean)
     x_3d_reff = np.array(x_3d_reff)
     n_rois = len(x_3d_mean)
 
+    # Compute 3D CDFs for each ROI (using bin_centers from first ROI)
+    logger.info("\nComputing 3D CDFs for Wasserstein distance...")
+    bin_centers = roi_slice_data[0]['bin_centers']
+    for profiles in roi_profiles:
+        cdf_3d = compute_3d_cdf(profiles, bin_centers)
+        roi_3d_cdfs.append(cdf_3d)
+
     logger.info(f"\nRunning Monte Carlo with {n_rois} ROIs, {args.n_iterations} iterations...")
 
-    # Run Monte Carlo for actual 2D
-    logger.info("  Running actual 2D Monte Carlo...")
-    actual_results = run_monte_carlo_actual_2d(roi_slice_data, x_3d_mean, x_3d_reff,
-                                                args.n_iterations)
+    # Run Monte Carlo
+    actual_results, fake_results = run_monte_carlo(roi_slice_data, roi_3d_cdfs,
+                                                    args.n_iterations, seed=args.seed)
 
-    # Run Monte Carlo for fake 2D
-    logger.info("  Running fake 2D Monte Carlo...")
-    fake_results = run_monte_carlo_fake_2d(roi_profiles, x_3d_mean, x_3d_reff,
-                                            args.n_iterations)
+    # Create 1x3 figure
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
-    # Create 2x2 figure: rows = metric, cols = approach
-    fig, axes = plt.subplots(2, 2, figsize=(7, 7))
+    # Panel (a): Wasserstein distance violin
+    logger.info("\nPlotting panel (a): Wasserstein distance comparison...")
+    plot_wasserstein_violin(axes[0], actual_results['wasserstein'],
+                            fake_results['wasserstein'])
 
-    color_actual = '#3498db'  # Blue
-    color_fake = '#e74c3c'    # Red
+    # Compute shared axis limits for both scatter plots
+    all_mean_vals = np.concatenate([
+        x_3d_mean,
+        np.mean(actual_results['mean_radius'], axis=1),
+        np.mean(fake_results['mean_radius'], axis=1)
+    ])
+    all_reff_vals = np.concatenate([
+        x_3d_reff,
+        np.mean(actual_results['r_eff'], axis=1),
+        np.mean(fake_results['r_eff'], axis=1)
+    ])
+    all_scatter_vals = np.concatenate([all_mean_vals, all_reff_vals])
+    shared_min = np.nanmin(all_scatter_vals) * 0.95
+    shared_max = np.nanmax(all_scatter_vals) * 1.05
+    shared_lim = (shared_min, shared_max)
 
-    # Row 1: Mean radius
-    plot_r_distribution(axes[0, 0], actual_results['r_mean'], color_actual, r'$\bar{r}$')
-    axes[0, 0].set_title('Actual 2D', fontsize=settings.fonts['label_size'],
-                         fontweight=settings.fonts['weight'])
+    # Panel (b): Mean radius
+    logger.info("Plotting panel (b): Mean radius comparison...")
+    r_mean_slice, r_mean_iid, r_mean_slice_std, r_mean_iid_std = plot_scatter_comparison(
+        axes[1], x_3d_mean, actual_results['mean_radius'],
+        fake_results['mean_radius'], 'mean_radius', shared_lim=shared_lim)
 
-    plot_r_distribution(axes[0, 1], fake_results['r_mean'], color_fake, r'$\bar{r}$')
-    axes[0, 1].set_title('Fake 2D', fontsize=settings.fonts['label_size'],
-                         fontweight=settings.fonts['weight'])
-
-    # Row 2: Effective radius
-    plot_r_distribution(axes[1, 0], actual_results['r_reff'], color_actual, r'$r_{\mathrm{MRI}}$')
-    plot_r_distribution(axes[1, 1], fake_results['r_reff'], color_fake, r'$r_{\mathrm{MRI}}$')
+    # Panel (c): Effective radius
+    logger.info("Plotting panel (c): Effective radius comparison...")
+    r_reff_slice, r_reff_iid, r_reff_slice_std, r_reff_iid_std = plot_scatter_comparison(
+        axes[2], x_3d_reff, actual_results['r_eff'],
+        fake_results['r_eff'], 'r_eff', shared_lim=shared_lim)
 
     plt.tight_layout()
-    add_panel_labels(axes)
 
     # Save
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -489,26 +587,30 @@ def main():
     svg_output = args.output.with_suffix('.svg')
     plt.savefig(svg_output, bbox_inches='tight')
     plt.close()
-    logger.info(f"\nSaved figure to {args.output}")
+    logger.info(f"\nSaved figure to {args.output} and {svg_output}")
+
+    # Wasserstein stats
+    wass_slice = actual_results['wasserstein'].flatten()
+    wass_iid = fake_results['wasserstein'].flatten()
+    wass_slice_median = np.median(wass_slice)
+    wass_iid_median = np.median(wass_iid)
+    wass_slice_iqr = np.percentile(wass_slice, 75) - np.percentile(wass_slice, 25)
+    wass_iid_iqr = np.percentile(wass_iid, 75) - np.percentile(wass_iid, 25)
 
     # Summary
     logger.info("\n" + "=" * 70)
     logger.info("RESULTS")
     logger.info("=" * 70)
-    logger.info(f"Mean radius (r̄):")
-    logger.info(f"  Actual 2D: R = {np.median(actual_results['r_mean']):.3f} "
-                f"[{np.percentile(actual_results['r_mean'], 2.5):.3f}, "
-                f"{np.percentile(actual_results['r_mean'], 97.5):.3f}]")
-    logger.info(f"  Fake 2D:   R = {np.median(fake_results['r_mean']):.3f} "
-                f"[{np.percentile(fake_results['r_mean'], 2.5):.3f}, "
-                f"{np.percentile(fake_results['r_mean'], 97.5):.3f}]")
-    logger.info(f"Effective radius (r_MRI):")
-    logger.info(f"  Actual 2D: R = {np.median(actual_results['r_reff']):.3f} "
-                f"[{np.percentile(actual_results['r_reff'], 2.5):.3f}, "
-                f"{np.percentile(actual_results['r_reff'], 97.5):.3f}]")
-    logger.info(f"  Fake 2D:   R = {np.median(fake_results['r_reff']):.3f} "
-                f"[{np.percentile(fake_results['r_reff'], 2.5):.3f}, "
-                f"{np.percentile(fake_results['r_reff'], 97.5):.3f}]")
+    logger.info(f"Wasserstein distance (median, IQR):")
+    logger.info(f"  2D slice sampling: {wass_slice_median:.4f} ({wass_slice_iqr:.4f})")
+    logger.info(f"  i.i.d. sampling:   {wass_iid_median:.4f} ({wass_iid_iqr:.4f})")
+    logger.info(f"Correlation with 3D (mean ± std across MC iterations):")
+    logger.info(f"  Mean radius:")
+    logger.info(f"    2D slice sampling: R = {r_mean_slice:.3f} ± {r_mean_slice_std:.3f}")
+    logger.info(f"    i.i.d. sampling:   R = {r_mean_iid:.3f} ± {r_mean_iid_std:.3f}")
+    logger.info(f"  Effective radius:")
+    logger.info(f"    2D slice sampling: R = {r_reff_slice:.3f} ± {r_reff_slice_std:.3f}")
+    logger.info(f"    i.i.d. sampling:   R = {r_reff_iid:.3f} ± {r_reff_iid_std:.3f}")
 
     # Save metadata
     metadata = {
@@ -516,27 +618,30 @@ def main():
         'n_rois': n_rois,
         'radius_type': args.radius_type,
         'seed': args.seed,
+        'wasserstein': {
+            'slice_sampling_median': float(wass_slice_median),
+            'slice_sampling_iqr': float(wass_slice_iqr),
+            'iid_sampling_median': float(wass_iid_median),
+            'iid_sampling_iqr': float(wass_iid_iqr),
+        },
         'mean_radius': {
-            'actual_median': float(np.median(actual_results['r_mean'])),
-            'actual_ci': [float(np.percentile(actual_results['r_mean'], 2.5)),
-                          float(np.percentile(actual_results['r_mean'], 97.5))],
-            'fake_median': float(np.median(fake_results['r_mean'])),
-            'fake_ci': [float(np.percentile(fake_results['r_mean'], 2.5)),
-                        float(np.percentile(fake_results['r_mean'], 97.5))],
+            'r_slice_sampling': float(r_mean_slice),
+            'r_slice_sampling_std': float(r_mean_slice_std),
+            'r_iid_sampling': float(r_mean_iid),
+            'r_iid_sampling_std': float(r_mean_iid_std),
         },
         'r_eff': {
-            'actual_median': float(np.median(actual_results['r_reff'])),
-            'actual_ci': [float(np.percentile(actual_results['r_reff'], 2.5)),
-                          float(np.percentile(actual_results['r_reff'], 97.5))],
-            'fake_median': float(np.median(fake_results['r_reff'])),
-            'fake_ci': [float(np.percentile(fake_results['r_reff'], 2.5)),
-                        float(np.percentile(fake_results['r_reff'], 97.5))],
+            'r_slice_sampling': float(r_reff_slice),
+            'r_slice_sampling_std': float(r_reff_slice_std),
+            'r_iid_sampling': float(r_reff_iid),
+            'r_iid_sampling_std': float(r_reff_iid_std),
         }
     }
 
     json_output = args.output.with_suffix('.json')
     with open(json_output, 'w') as f:
         json.dump(metadata, f, indent=2)
+    logger.info(f"Saved metadata to {json_output}")
 
 
 if __name__ == '__main__':
