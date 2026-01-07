@@ -43,7 +43,8 @@ settings = get_plot_settings()
 
 # Constants
 DEFAULT_BIN_WIDTH = 0.05  # μm
-SAMPLE_SIZES = [100, 1_000, 10_000, 100_000, 1_000_000]  # 10², 10³, 10⁴, 10⁵, 10⁶
+# Sample sizes for bias plots (end at 10^5)
+SAMPLE_SIZES = [100, 300, 1_000, 3_000, 10_000, 30_000, 100_000]
 N_SUBSAMPLES = 50
 N_QUANTILES = 50
 MIN_BIN_PROB = 1e-300
@@ -394,7 +395,6 @@ def plot_pdf_combined(
 ) -> None:
     """Plot PDFs for both datasets with subsampling variability."""
     font_settings = settings.fonts
-    line_settings = settings.line
     label_size = font_settings['label_size'] - FONT_REDUCTION
     tick_size = font_settings['tick_size'] - FONT_REDUCTION
     legend_size = font_settings['legend_size'] - FONT_REDUCTION
@@ -407,12 +407,22 @@ def plot_pdf_combined(
     x_eval = np.linspace(0.02, x_max, 200)
 
     datasets = [
-        (human_bin_centers, human_pooled_counts, human_color, 'Human CC'),
-        (rat_bin_centers, rat_pooled_counts, rat_color, 'Rat WM'),
+        (rat_bin_centers, rat_pooled_counts, rat_color, 'Rat'),
+        (human_bin_centers, human_pooled_counts, human_color, 'Human'),
     ]
 
-    for bin_centers, pooled_counts, color, label in datasets:
-        total_count = pooled_counts.sum()
+    # Line styles for different sample sizes: dashed for subsamples
+    line_styles = ['--']
+    # Alphas for shaded areas
+    fill_alphas = [0.25]
+
+    n_repeats = 5000  # Repeat 5k times for good 95% CI
+
+    # Store legend handles
+    legend_handles = []
+
+    for bin_centers, pooled_counts, color, species_label in datasets:
+        total_count = int(pooled_counts.sum())
         bin_width = bin_centers[1] - bin_centers[0]
         probs = pooled_counts / total_count
 
@@ -420,18 +430,11 @@ def plot_pdf_combined(
         pdf_ref = pooled_counts / (total_count * bin_width)
         pdf_ref_interp = np.interp(x_eval, bin_centers, pdf_ref, left=0, right=0)
 
-        # Plot full distribution (thin line)
-        ax.plot(x_eval, pdf_ref_interp, color=color, linewidth=1.0,
-                label=f'{label}', zorder=10)
+        # Plot subsamples first (so full sample is on top)
+        # Sort sample sizes so smaller ones are plotted first (behind)
+        sorted_sizes = sorted([s for s in sample_sizes if s <= total_count])
 
-        # Subsampling for multiple sample sizes, repeated many times for CI
-        n_repeats = 5000  # Repeat 5k times for good 95% CI
-        alphas = [0.35, 0.25, 0.15]  # Decreasing alpha for larger sample sizes
-
-        for idx, sample_size in enumerate(sample_sizes):
-            if sample_size > total_count:
-                continue
-
+        for idx, sample_size in enumerate(sorted_sizes):
             pdf_subsamples = []
             for _ in range(n_repeats):
                 sampled_bins = np.random.choice(len(bin_centers), size=sample_size, p=probs)
@@ -444,17 +447,82 @@ def plot_pdf_combined(
             pdf_lo = np.percentile(pdf_subsamples, 2.5, axis=0)
             pdf_hi = np.percentile(pdf_subsamples, 97.5, axis=0)
 
-            # Smooth only the CI bands (not the PDFs themselves)
-            sigma = max(1, 3 - idx)  # More smoothing for smaller samples
+            # Smooth only the CI bands
+            sigma = max(1, 3 - idx)
             pdf_lo = gaussian_filter1d(pdf_lo, sigma=sigma)
             pdf_hi = gaussian_filter1d(pdf_hi, sigma=sigma)
 
-            ax.fill_between(x_eval, pdf_lo, pdf_hi, alpha=alphas[idx], color=color)
+            # Shaded area
+            ax.fill_between(x_eval, pdf_lo, pdf_hi, alpha=fill_alphas[idx], color=color,
+                           zorder=1 + idx)
+
+            # Boundary lines with different styles
+            linestyle = line_styles[idx] if idx < len(line_styles) else '-'
+            ax.plot(x_eval, pdf_lo, color=color, linestyle=linestyle, linewidth=0.8,
+                   alpha=0.7, zorder=2 + idx)
+            ax.plot(x_eval, pdf_hi, color=color, linestyle=linestyle, linewidth=0.8,
+                   alpha=0.7, zorder=2 + idx)
+
+        # Plot full distribution on top (solid line)
+        line, = ax.plot(x_eval, pdf_ref_interp, color=color, linewidth=1.5,
+                        linestyle='-', zorder=10)
+
+    # Build legend manually
+    from matplotlib.lines import Line2D
+
+    def format_sample_size(n: int) -> str:
+        """Format sample size as 10^x notation."""
+        import math
+        exp = math.log10(n)
+        if exp == int(exp):
+            return rf'$10^{int(exp)}$'
+        else:
+            # For non-powers of 10, find closest representation
+            exp_floor = int(math.floor(exp))
+            mantissa = n / (10 ** exp_floor)
+            if abs(mantissa - round(mantissa)) < 0.01:
+                mantissa = int(round(mantissa))
+            return rf'$\sim 10^{exp_floor + 1}$' if mantissa >= 5 else rf'$\sim 10^{exp_floor}$'
+
+    import math
+    from matplotlib.patches import Patch, FancyBboxPatch
+    import matplotlib.patches as mpatches
+
+    for bin_centers, pooled_counts, color, species_label in datasets:
+        total_count = int(pooled_counts.sum())
+        # Full sample - format as mantissa × 10^exp (e.g., 5×10^7)
+        exp = int(math.floor(math.log10(total_count)))
+        mantissa = total_count / (10 ** exp)
+        if mantissa >= 9.5:
+            exp += 1
+            mantissa = 1
+        mantissa_rounded = int(round(mantissa))
+        if mantissa_rounded == 1:
+            full_label = rf'{species_label} ($n \approx 10^{exp}$)'
+        else:
+            full_label = rf'{species_label} ($n \approx {mantissa_rounded}\times 10^{exp}$)'
+        legend_handles.append(Line2D([0], [0], color=color, linewidth=1.5, linestyle='-',
+                                      label=full_label))
+        # Subsamples - show as shaded patch with dashed edge
+        sorted_sizes = sorted([s for s in sample_sizes if s <= total_count])
+        for idx, sample_size in enumerate(sorted_sizes):
+            linestyle = line_styles[idx] if idx < len(line_styles) else '-'
+            alpha = fill_alphas[idx] if idx < len(fill_alphas) else 0.25
+            exp_sub = int(math.log10(sample_size))
+            # Create a patch with dashed edge to represent shaded area
+            # Convert color to RGBA with alpha for facecolor, keep edge fully opaque
+            import matplotlib.colors as mcolors
+            face_rgba = list(mcolors.to_rgba(color))
+            face_rgba[3] = alpha
+            legend_handles.append(mpatches.Patch(
+                facecolor=face_rgba, edgecolor=color,
+                linestyle=linestyle, linewidth=1.5,
+                label=rf'{species_label} ($n = 10^{exp_sub}$)'))
 
     ax.set_xlabel('Axon radius [μm]', fontsize=label_size)
     ax.set_ylabel('Probability density [μm⁻¹]', fontsize=label_size)
     ax.tick_params(labelsize=tick_size)
-    ax.legend(loc='upper right', fontsize=legend_size - 1)
+    ax.legend(handles=legend_handles, loc='upper right', fontsize=legend_size)
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
     ax.set_box_aspect(1)
@@ -476,11 +544,11 @@ def plot_within_vs_between_wasserstein(
     n_subsamples: int = 500
 ) -> None:
     """
-    Plot within-sample vs between-ROI Wasserstein distances.
+    Plot within-sample Wasserstein distances with inter-ROI medians as reference.
 
     X-axis: sample sizes
     Grouped violins: Human (blue) and Rat (red) for each sample size
-    Reference: ROI↔ROI distances shown as horizontal band
+    Reference: Median inter-ROI distances shown as horizontal dashed lines
     """
     font_settings = settings.fonts
     label_size = font_settings['label_size'] - FONT_REDUCTION
@@ -492,12 +560,12 @@ def plot_within_vs_between_wasserstein(
     rat_color = settings.colors['rat']
 
     datasets = [
-        (human_bin_centers, human_counts_matrix, 'Human CC', human_color),
-        (rat_bin_centers, rat_counts_matrix, 'Rat WM', rat_color),
+        (rat_bin_centers, rat_counts_matrix, 'Rat', rat_color),
+        (human_bin_centers, human_counts_matrix, 'Human', human_color),
     ]
 
     # Compute between-ROI distances per species
-    between_per_species = {}
+    between_median_per_species = {}
     for bin_centers, counts_matrix, name, color in datasets:
         bin_width = bin_centers[1] - bin_centers[0]
         n_rois = counts_matrix.shape[0]
@@ -516,7 +584,7 @@ def plot_within_vs_between_wasserstein(
             for j in range(i + 1, len(roi_cdfs)):
                 w_dist = compute_wasserstein_from_cdfs(roi_cdfs[i], roi_cdfs[j], bin_width)
                 species_between.append(w_dist)
-        between_per_species[name] = np.array(species_between)
+        between_median_per_species[name] = np.median(species_between)
 
     # Compute within-sample distances for each sample size and dataset
     np.random.seed(42)
@@ -553,20 +621,8 @@ def plot_within_vs_between_wasserstein(
             all_positions.append(size_idx + offset)
             all_colors.append(color)
 
-    # Add inter-ROI violins per species at the rightmost position
-    inter_roi_pos = n_sample_sizes + 0.5  # Add gap before inter-ROI
-    for dataset_idx, (_, _, name, color) in enumerate(datasets):
-        all_violin_data.append(between_per_species[name])
-        offset = -width/2 if dataset_idx == 0 else width/2
-        all_positions.append(inter_roi_pos + offset)
-        all_colors.append(color)
-
-    # Add gray background for inter-ROI section
-    divider_x = n_sample_sizes - 0.25  # Position of divider line
-    ax.axvspan(divider_x, inter_roi_pos + 0.6, color='#E0E0E0', zorder=0)
-    ax.axvline(divider_x, color='#808080', linestyle='--', linewidth=1.5, zorder=1)
-    # Set x-axis limits to reduce unused space
-    ax.set_xlim(-0.5, inter_roi_pos + 0.6)
+    # Set x-axis limits
+    ax.set_xlim(-0.5, n_sample_sizes - 0.5)
 
     # Plot thin violins
     parts = ax.violinplot(all_violin_data, positions=all_positions,
@@ -586,29 +642,27 @@ def plot_within_vs_between_wasserstein(
     parts['cmins'].set_color('gray')
     parts['cmaxes'].set_color('gray')
 
+    # Draw horizontal dashed lines for inter-ROI medians
+    ax.axhline(between_median_per_species['Human'], color=human_color,
+               linestyle='--', linewidth=2, label='Human inter-ROI', zorder=1)
+    ax.axhline(between_median_per_species['Rat'], color=rat_color,
+               linestyle='--', linewidth=2, label='Rat inter-ROI', zorder=1)
+
     # Add legend manually
     from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     handles = [
-        Patch(facecolor=human_color, alpha=0.7, label='Human CC'),
-        Patch(facecolor=rat_color, alpha=0.7, label='Rat WM'),
+        Patch(facecolor=rat_color, alpha=0.7, label='Rat (sampling)'),
+        Patch(facecolor=human_color, alpha=0.7, label='Human (sampling)'),
+        Line2D([0], [0], color=rat_color, linestyle='--', linewidth=2, label='Rat (anat. var.)'),
+        Line2D([0], [0], color=human_color, linestyle='--', linewidth=2, label='Human (anat. var.)'),
     ]
-    ax.legend(handles=handles, loc='upper right', fontsize=legend_size - 1)
+    ax.legend(handles=handles, loc='upper right', fontsize=legend_size)
 
-    # X-axis: sample sizes + inter-ROI label
-    all_xticks = list(x_positions) + [inter_roi_pos]
-    all_xlabels = [SAMPLE_SIZE_LABELS[s] for s in sample_sizes] + ['Inter-\nROI']
-    ax.set_xticks(all_xticks)
-    ax.set_xticklabels(all_xlabels, fontsize=tick_size)
-
-    # Add curly brace below sample sizes with label
-    brace_y = -0.15  # Position below x-axis in axes coordinates
-    brace_center = (x_positions[0] + x_positions[-1]) / 2
-    ax.annotate('', xy=(x_positions[0] - 0.35, brace_y), xytext=(x_positions[-1] + 0.35, brace_y),
-                xycoords=('data', 'axes fraction'), textcoords=('data', 'axes fraction'),
-                arrowprops=dict(arrowstyle='-', color='black', lw=1,
-                               connectionstyle='bar,fraction=-0.2'))
-    ax.text(brace_center, brace_y - 0.06, 'Sample size', ha='center', va='top',
-            fontsize=tick_size, transform=ax.get_xaxis_transform())
+    # X-axis: sample sizes only
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels([SAMPLE_SIZE_LABELS[s] for s in sample_sizes], fontsize=tick_size)
+    ax.set_xlabel('Sample size', fontsize=label_size)
     ax.set_ylabel('Wasserstein distance [μm]', fontsize=label_size)
     ax.tick_params(axis='y', labelsize=tick_size)
     ax.set_ylim(bottom=0)
@@ -872,11 +926,12 @@ def plot_combined_bias(
     rat_color = settings.colors['rat']
 
     datasets = [
-        (rat_results, 'Rat WM', rat_color, 's'),      # Squares on bottom
-        (human_results, 'Human CC', human_color, 'o'),  # Circles on top
+        (rat_results, 'Rat', rat_color, 's'),      # Squares on bottom
+        (human_results, 'Human', human_color, 'o'),  # Circles on top
     ]
 
     for dataset_results, label, color, marker in datasets:
+        # Use all sample sizes
         sample_sizes_present = [s for s in SAMPLE_SIZES if s in dataset_results.results_by_size]
         if not sample_sizes_present:
             continue
@@ -909,10 +964,12 @@ def plot_combined_bias(
         bias_lo = np.array(bias_lo)
         bias_hi = np.array(bias_hi)
 
-        # Plot with error bands
+        # Plot IQR band
         ax.fill_between(sample_sizes_present, bias_lo, bias_hi, alpha=0.2, color=color)
+
+        # Plot line with markers at all sample sizes
         ax.plot(sample_sizes_present, bias_median, color=color, marker=marker,
-                markersize=8, linewidth=2, label=label)
+                markersize=6, linewidth=2, label=label)
 
     ax.axhline(0, color='black', linestyle='-', linewidth=1)
     ax.set_xscale('log')
@@ -935,8 +992,8 @@ def create_figure(
     """Create the 2×2 figure."""
     fig, axes = plt.subplots(2, 2, figsize=(7, 7))
 
-    # Sample sizes for subsampling visualization (10^2, 10^3, 10^4)
-    pdf_sample_sizes = [100, 1_000, 10_000]
+    # Sample sizes for subsampling visualization (10^3 only)
+    pdf_sample_sizes = [1_000]
 
     # Pooled counts for PDF plot
     human_pooled_counts = human_counts_matrix.sum(axis=0)
@@ -950,7 +1007,7 @@ def create_figure(
     # (b) Within-sample vs Between-ROI Wasserstein distances
     plot_within_vs_between_wasserstein(axes[0, 1], human_bin_centers, human_counts_matrix,
                                         rat_bin_centers, rat_counts_matrix,
-                                        sample_sizes=[100, 1000, 10000], n_subsamples=500)
+                                        sample_sizes=[100, 1000, 10000, 100000], n_subsamples=500)
 
     # (c) Arithmetic mean radius: percentage error vs sample size (both datasets)
     plot_combined_bias(axes[1, 0], human_results, rat_results,
@@ -960,13 +1017,11 @@ def create_figure(
     plot_combined_bias(axes[1, 1], human_results, rat_results,
                        'r_eff', r'$r_{\mathrm{MRI}}$ error [%]')
 
-    # Set same y-axis scale for (c) and (d)
-    ymin = min(axes[1, 0].get_ylim()[0], axes[1, 1].get_ylim()[0])
-    ymax = max(axes[1, 0].get_ylim()[1], axes[1, 1].get_ylim()[1])
-    # Make symmetric around 0
-    ylim_max = max(abs(ymin), abs(ymax))
-    axes[1, 0].set_ylim(-ylim_max, ylim_max)
-    axes[1, 1].set_ylim(-ylim_max, ylim_max)
+    # Set y-axis scale symmetric around 0 for each panel independently
+    for ax in [axes[1, 0], axes[1, 1]]:
+        ymin, ymax = ax.get_ylim()
+        ylim_max = max(abs(ymin), abs(ymax))
+        ax.set_ylim(-ylim_max, ylim_max)
 
     # Set aspect ratio 1 for bottom panels
     for ax in [axes[1, 0], axes[1, 1]]:
