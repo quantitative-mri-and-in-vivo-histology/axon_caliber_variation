@@ -128,9 +128,9 @@ def load_human_cc_histograms(
     data_dir: Path,
     bin_width: float = DEFAULT_BIN_WIDTH
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-    """Load human corpus callosum histogram data."""
+    """Load human corpus callosum histogram data (MinorAxis radii)."""
     bin_edges_file = data_dir / 'desc-binEdges_radii.tsv'
-    counts_file = data_dir / 'desc-countsCircularEq_radii.tsv'
+    counts_file = data_dir / 'desc-countsMinorAxis_radii.tsv'
 
     bin_edges_orig = np.loadtxt(bin_edges_file, delimiter='\t', skiprows=1)
     counts_matrix_orig = np.loadtxt(counts_file, delimiter='\t', skiprows=1, dtype=float)
@@ -156,9 +156,13 @@ def load_human_cc_histograms(
 def load_rat_histograms(
     data_dir: Path,
     bin_width: float = DEFAULT_BIN_WIDTH,
-    r_max: float = 3.0
+    r_max: float = 3.0,
+    min_axons: int = 1000
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-    """Load rat LM data from NPZ files, split by population."""
+    """Load rat LM data from NPZ files, split by population.
+
+    Only includes ROIs with at least min_axons axons.
+    """
     npz_files = sorted(data_dir.glob('*_axon_profiles.npz'))
     if not npz_files:
         raise ValueError(f"No *_axon_profiles.npz files found in {data_dir}")
@@ -183,6 +187,13 @@ def load_rat_histograms(
 
             for pop in pop_data['populations']:
                 pop_name = pop['name'].upper()
+                n_axons = pop.get('n_axons', len(pop['axon_labels']))
+
+                # Skip ROIs with too few axons
+                if n_axons < min_axons:
+                    logger.debug(f"Skipping {volume_name}_{pop_name}: only {n_axons} axons (min: {min_axons})")
+                    continue
+
                 pop_labels = set(pop['axon_labels'])
 
                 mask = np.isin(labels, list(pop_labels))
@@ -198,7 +209,7 @@ def load_rat_histograms(
             all_names.append(volume_name)
 
     counts_matrix = np.array(all_counts, dtype=float)
-    logger.info(f"Rat WM: {len(all_names)} ROIs, {int(counts_matrix.sum()):,} total radii")
+    logger.info(f"Rat WM: {len(all_names)} ROIs with ≥{min_axons} axons, {int(counts_matrix.sum()):,} total radii")
 
     return bin_edges, bin_centers, counts_matrix, all_names
 
@@ -416,7 +427,7 @@ def plot_pdf_combined(
     # Alphas for shaded areas
     fill_alphas = [0.25]
 
-    n_repeats = 5000  # Repeat 5k times for good 95% CI
+    n_repeats = 25000  # Repeat 25k times for good 95% CI
 
     # Store legend handles
     legend_handles = []
