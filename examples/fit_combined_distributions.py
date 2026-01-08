@@ -860,9 +860,12 @@ def _plot_pooled_pdf_with_fits(
     hist_data: HistogramData,
     fit_results: List[FitResult],
     species_color: str,
-    inset_xlim: Tuple[float, float] = (1.0, 3.0)
+    inset_xlim: Tuple[float, float] = (1.0, 3.0),
+    distribution_order: List[str] = None
 ) -> None:
     """Plot pooled histogram with all fitted PDFs in distribution colors."""
+    from matplotlib.patches import Rectangle
+
     bin_width = np.diff(hist_data.bin_edges).mean()
     density = hist_data.counts / (hist_data.total_count * bin_width)
 
@@ -871,8 +874,17 @@ def _plot_pooled_pdf_with_fits(
            alpha=0.4, color=species_color, edgecolor='white', linewidth=0.5,
            zorder=1)
 
-    # Plot all fitted distributions in their colors
-    for result in fit_results:
+    # Sort fit_results according to distribution_order if provided
+    if distribution_order is not None:
+        # Create a mapping from name to result
+        result_map = {r.distribution_name: r for r in fit_results}
+        # Reorder according to distribution_order
+        ordered_results = [result_map[name] for name in distribution_order if name in result_map]
+    else:
+        ordered_results = fit_results
+
+    # Plot all fitted distributions in their colors (in specified order)
+    for result in ordered_results:
         color = get_dist_color(result.distribution_name)
         display_name = get_display_name(result.distribution_name)
         ax.plot(hist_data.bin_centers, result.pdf_values, '-',
@@ -894,7 +906,7 @@ def _plot_pooled_pdf_with_fits(
     ax_inset = ax.inset_axes([0.32, 0.32, 0.66, 0.66])  # [x, y, width, height]
     ax_inset.bar(hist_data.bin_centers, density, width=bin_width * 0.9,
                  alpha=0.4, color=species_color, edgecolor='white', linewidth=0.3)
-    for result in fit_results:
+    for result in ordered_results:
         color = get_dist_color(result.distribution_name)
         ax_inset.plot(hist_data.bin_centers, result.pdf_values, '-',
                       color=color, linewidth=1.5)
@@ -903,10 +915,10 @@ def _plot_pooled_pdf_with_fits(
     ax_inset.tick_params(labelsize=settings.fonts['tick_size'] - 2)
     ax_inset.set_xlabel('')
     ax_inset.set_ylabel('')
-    # Add subtle border
-    for spine in ax_inset.spines.values():
-        spine.set_edgecolor('gray')
-        spine.set_linewidth(0.8)
+
+    # Add indicator rectangle with connector lines to inset
+    ax.indicate_inset_zoom(ax_inset, edgecolor='gray', linewidth=1.5,
+                           linestyle='--', alpha=0.8)
 
 
 def create_combined_figure(
@@ -961,18 +973,23 @@ def create_combined_figure(
     human_inter_roi_w = compute_inter_roi_wasserstein(human_per_sample)
     rat_inter_roi_w = compute_inter_roi_wasserstein(rat_per_sample)
 
+    # Use human distribution order (by AIC) for consistency with bottom row
+    dist_order = human_metrics.distribution_names
+
     # (a) Rat pooled PDF with all fits
     _plot_pooled_pdf_with_fits(
         ax_a, rat_pooled, rat_metrics.pooled_results,
         species_color=RAT_COLOR,
-        inset_xlim=(0.5, 1.2)  # Rat tail starts earlier
+        inset_xlim=(0.5, 1.2),  # Rat tail starts earlier
+        distribution_order=dist_order
     )
 
     # (b) Human pooled PDF with all fits
     _plot_pooled_pdf_with_fits(
         ax_b, human_pooled, human_metrics.pooled_results,
         species_color=HUMAN_COLOR,
-        inset_xlim=(1.0, 3.0)  # Human tail
+        inset_xlim=(1.0, 3.0),  # Human tail
+        distribution_order=dist_order
     )
 
     # Create shared legend above panels a-b
@@ -1155,9 +1172,9 @@ def _plot_win_rate(
     names = human_metrics.distribution_names
     display_names = [get_display_name(n, multiline=True) for n in names]
 
-    # Get win rates for each species
-    human_win = np.array([human_metrics.win_rate.get(n, 0) for n in names])
-    rat_win = np.array([rat_metrics.win_rate.get(n, 0) for n in names])
+    # Get win rates for each species (as percentages)
+    human_win = np.array([human_metrics.win_rate.get(n, 0) for n in names]) * 100
+    rat_win = np.array([rat_metrics.win_rate.get(n, 0) for n in names]) * 100
 
     y_spacing = 1.3  # Spacing between distributions
     y_pos = np.arange(len(names)) * y_spacing
@@ -1175,9 +1192,9 @@ def _plot_win_rate(
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
-    ax.set_xlabel('Win rate', fontsize=settings.fonts['label_size'])
-    ax.set_xlim(-0.05, 1.0)
-    ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_xlabel('Win rate [%]', fontsize=settings.fonts['label_size'])
+    ax.set_xlim(-5, 100)
+    ax.set_xticks([0, 25, 50, 75, 100])
     ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
     ax.legend(loc='upper right', fontsize=settings.fonts['legend_size'], ncol=2,
               frameon=True, edgecolor='gray', facecolor='white', framealpha=1.0,
