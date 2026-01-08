@@ -167,6 +167,7 @@ class FitResult:
     bic: float
     ks_statistic: float
     rmse: float
+    wasserstein: float = 0.0  # Wasserstein distance between empirical and fitted CDF
     pdf_values: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
@@ -197,6 +198,8 @@ class AggregatedMetrics:
     dist_name_to_idx: Dict[str, int] = field(default_factory=dict)
     # Per-sample AIC values: shape (n_distributions, n_samples)
     all_aic: np.ndarray = field(default_factory=lambda: np.array([]))
+    # Per-sample Wasserstein distances: shape (n_distributions, n_samples)
+    all_wasserstein: np.ndarray = field(default_factory=lambda: np.array([]))
     # Win rate per distribution (fraction of samples where it has lowest AIC)
     win_rate: Dict[str, float] = field(default_factory=dict)
 
@@ -234,7 +237,7 @@ def load_human_cc_data(
     em_correction_scale_range: Tuple[float, float] = (0.5, 1.0)
 ) -> Tuple[HistogramData, PerSampleHistogramData]:
     """
-    Load human corpus callosum histogram data (CircularEq).
+    Load human corpus callosum histogram data (MinorAxis).
 
     Args:
         data_dir: Directory containing human LM histogram files
@@ -247,7 +250,7 @@ def load_human_cc_data(
         Tuple of (pooled HistogramData, per-ROI PerSampleHistogramData)
     """
     bin_edges_file = data_dir / 'desc-binEdges_radii.tsv'
-    counts_file = data_dir / 'desc-countsCircularEq_radii.tsv'
+    counts_file = data_dir / 'desc-countsMinorAxis_radii.tsv'
 
     # Load bin edges
     bin_edges_orig = np.loadtxt(bin_edges_file, delimiter='\t', skiprows=1)
@@ -346,12 +349,14 @@ def radii_to_histogram(
 def load_rat_data(
     data_dir: Path,
     bin_width: float = DEFAULT_BIN_WIDTH,
-    r_max: float = 3.0
+    r_max: float = 3.0,
+    min_axons: int = 1000
 ) -> Tuple[HistogramData, PerSampleHistogramData]:
     """
     Load rat LM data from all NPZ files, split by population (CC and CG).
 
     Each volume has 2 populations (CC and CG), giving 10 volumes × 2 = 20 ROIs.
+    Only includes ROIs with at least min_axons axons.
 
     Returns:
         Tuple of (pooled HistogramData, per-ROI PerSampleHistogramData)
@@ -391,6 +396,13 @@ def load_rat_data(
 
             for pop in pop_data['populations']:
                 pop_name = pop['name'].upper()  # CC or CG
+                n_axons = pop.get('n_axons', len(pop['axon_labels']))
+
+                # Skip ROIs with too few axons
+                if n_axons < min_axons:
+                    logger.debug(f"Skipping {volume_name}_{pop_name}: only {n_axons} axons (min: {min_axons})")
+                    continue
+
                 pop_labels = set(pop['axon_labels'])
 
                 # Get radii for this population
@@ -415,7 +427,7 @@ def load_rat_data(
     pooled_counts = counts_matrix.sum(axis=0)
     total_count = int(pooled_counts.sum())
 
-    logger.info(f"Rat: {n_rois} ROIs (CC+CG), {total_count:,} total radii, {n_bins} bins")
+    logger.info(f"Rat: {n_rois} ROIs (CC+CG) with ≥{min_axons} axons, {total_count:,} total radii, {n_bins} bins")
 
     pooled = HistogramData(
         bin_edges=bin_edges,
@@ -451,13 +463,13 @@ CANDIDATE_DISTRIBUTIONS = [
     ('gamma', stats.gamma),              # Gamma
 ]
 
-# Display names matching Sepehrband et al. (2016)
+# Display names matching Sepehrband et al. (2016) - single line for legends
 DIST_DISPLAY_NAMES = {
-    'genextreme': 'Gen. Extreme\nValue',
+    'genextreme': 'Gen. Ext. Value',
     'lognorm': 'Log Normal',
-    'invgauss': 'Inverse\nGaussian',
+    'invgauss': 'Inverse Gaussian',
     'fisk': 'Log Logistic',
-    'fatiguelife': 'Birnbaum-\nSaunders',
+    'fatiguelife': 'Birnbaum-Saunders',
     'gamma': 'Gamma',
     'nakagami': 'Nakagami',
     'weibull_min': 'Weibull',
@@ -467,9 +479,27 @@ DIST_DISPLAY_NAMES = {
     'expon': 'Exponential',
 }
 
+# Multi-line display names for y-axis labels in bottom row plots
+DIST_DISPLAY_NAMES_MULTILINE = {
+    'genextreme': 'Gen. Ext.\nValue',
+    'lognorm': 'Log\nNormal',
+    'invgauss': 'Inverse\nGaussian',
+    'fisk': 'Log\nLogistic',
+    'fatiguelife': 'Birnbaum-\nSaunders',
+    'gamma': 'Gamma',
+    'nakagami': 'Nakagami',
+    'weibull_min': 'Weibull',
+    'rayleigh': 'Rayleigh',
+    'rice': 'Rician',
+    'genpareto': 'Gen.\nPareto',
+    'expon': 'Exponential',
+}
 
-def get_display_name(scipy_name: str) -> str:
+
+def get_display_name(scipy_name: str, multiline: bool = False) -> str:
     """Get display name for a distribution."""
+    if multiline:
+        return DIST_DISPLAY_NAMES_MULTILINE.get(scipy_name, scipy_name)
     return DIST_DISPLAY_NAMES.get(scipy_name, scipy_name)
 
 
@@ -604,6 +634,9 @@ def fit_distribution_mle(
         fitted_cdf = dist.cdf(bin_centers, *shape_params, loc=loc, scale=scale)
         ks_stat = np.max(np.abs(empirical_cdf - fitted_cdf))
 
+        # Wasserstein distance = integral of |CDF_empirical - CDF_fitted|
+        wasserstein = np.sum(np.abs(empirical_cdf - fitted_cdf)) * bin_width
+
         hist_density = counts / (total * bin_width)
         rmse = np.sqrt(np.mean((pdf_values - hist_density) ** 2))
 
@@ -616,6 +649,7 @@ def fit_distribution_mle(
             bic=bic,
             ks_statistic=ks_stat,
             rmse=rmse,
+            wasserstein=wasserstein,
             pdf_values=pdf_values
         )
         np.random.set_state(saved_state)  # Restore random state
@@ -661,6 +695,7 @@ def fit_all_samples(
     n_methods = len(all_method_names)
 
     all_aics = np.full((n_methods, n_samples), np.nan)
+    all_wasserstein = np.full((n_methods, n_samples), np.nan)
     all_r_arith = np.full((n_methods, n_samples), np.nan)
     all_r_eff = np.full((n_methods, n_samples), np.nan)
 
@@ -691,6 +726,7 @@ def fit_all_samples(
             )
             if result is not None:
                 all_aics[dist_idx, sample_idx] = result.aic
+                all_wasserstein[dist_idx, sample_idx] = result.wasserstein
                 # Compute r_arith and r_eff from fitted distribution
                 r_arith, r_eff = compute_distribution_radii(dist, result.params)
                 all_r_arith[dist_idx, sample_idx] = r_arith
@@ -758,6 +794,7 @@ def fit_all_samples(
         empirical_r_eff_per_sample=empirical_r_eff,
         dist_name_to_idx=dist_name_to_idx,
         all_aic=all_aics,
+        all_wasserstein=all_wasserstein,
         win_rate=win_rate_dict
     )
 
@@ -767,25 +804,109 @@ def fit_all_samples(
 # =============================================================================
 
 # Fixed colors per distribution (consistent across all panels)
+# Distribution colors - avoid red/blue which are reserved for species
 DIST_COLORS = {
-    'genextreme': '#e41a1c',      # Red
-    'lognorm': '#377eb8',         # Blue
-    'invgauss': '#4daf4a',        # Green
-    'fisk': '#984ea3',            # Purple
-    'fatiguelife': '#ff7f00',     # Orange
-    'gamma': '#a65628',           # Brown
-    'nakagami': '#f781bf',        # Pink
-    'weibull_min': '#999999',     # Gray
-    'rayleigh': '#66c2a5',        # Teal
-    'rice': '#1b9e77',            # Dark teal
-    'genpareto': '#d95f02',       # Dark orange
-    'expon': '#7570b3',           # Lavender
+    'genextreme': '#2ca02c',      # Green
+    'lognorm': '#ff7f0e',         # Orange
+    'invgauss': '#9467bd',        # Purple
+    'fatiguelife': '#8c564b',     # Brown
+    'gamma': '#008080',           # Teal (distinct from brown, avoids red/blue)
+    'fisk': '#bcbd22',            # Olive
+    'nakagami': '#e377c2',        # Pink
+    'weibull_min': '#7f7f7f',     # Gray
+    'rayleigh': '#98df8a',        # Light green
+    'rice': '#c49c94',            # Tan
+    'genpareto': '#f7b6d2',       # Light pink
+    'expon': '#c7c7c7',           # Light gray
 }
 
 
 def get_dist_color(dist_name: str) -> str:
     """Get fixed color for a distribution."""
     return DIST_COLORS.get(dist_name, '#333333')
+
+
+def compute_inter_roi_wasserstein(per_sample: PerSampleHistogramData) -> float:
+    """Compute median pairwise Wasserstein distance between ROIs.
+
+    This gives a reference for biological variability between ROIs.
+    """
+    bin_centers = per_sample.bin_centers
+    bin_width = np.diff(per_sample.bin_edges).mean()
+    n_samples = per_sample.n_samples
+
+    # Compute CDF for each ROI
+    cdfs = []
+    for i in range(n_samples):
+        counts = per_sample.counts_matrix[i]
+        total = counts.sum()
+        if total > 100:
+            cdf = np.cumsum(counts) / total
+            cdfs.append(cdf)
+
+    # Compute pairwise Wasserstein distances
+    n_rois = len(cdfs)
+    pairwise_distances = []
+    for i in range(n_rois):
+        for j in range(i + 1, n_rois):
+            w_dist = np.sum(np.abs(cdfs[i] - cdfs[j])) * bin_width
+            pairwise_distances.append(w_dist)
+
+    return np.median(pairwise_distances) if pairwise_distances else 0.0
+
+
+def _plot_pooled_pdf_with_fits(
+    ax: plt.Axes,
+    hist_data: HistogramData,
+    fit_results: List[FitResult],
+    species_color: str,
+    inset_xlim: Tuple[float, float] = (1.0, 3.0)
+) -> None:
+    """Plot pooled histogram with all fitted PDFs in distribution colors."""
+    bin_width = np.diff(hist_data.bin_edges).mean()
+    density = hist_data.counts / (hist_data.total_count * bin_width)
+
+    # Plot histogram in species color (no label - will use custom legend entry)
+    ax.bar(hist_data.bin_centers, density, width=bin_width * 0.9,
+           alpha=0.4, color=species_color, edgecolor='white', linewidth=0.5,
+           zorder=1)
+
+    # Plot all fitted distributions in their colors
+    for result in fit_results:
+        color = get_dist_color(result.distribution_name)
+        display_name = get_display_name(result.distribution_name)
+        ax.plot(hist_data.bin_centers, result.pdf_values, '-',
+                color=color, linewidth=1.5, label=display_name, zorder=2)
+
+    ax.set_xlim(0, PLOT_XLIM_MAX)
+    ax.set_ylim(0, None)
+    ax.set_xlabel('Axon radius [μm]', fontsize=settings.fonts['label_size'])
+    ax.set_ylabel(r'Probability density [μm$^{-1}$]', fontsize=settings.fonts['label_size'])
+    # Title will be added externally
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
+
+    # Add tail inset - larger, using most of plot area with narrow margin
+    # Find appropriate y-limit for inset (max density in tail region)
+    tail_mask = hist_data.bin_centers >= inset_xlim[0]
+    tail_density = density[tail_mask]
+    tail_y_max = tail_density.max() * 1.2 if tail_density.max() > 0 else 0.1
+
+    ax_inset = ax.inset_axes([0.32, 0.32, 0.66, 0.66])  # [x, y, width, height]
+    ax_inset.bar(hist_data.bin_centers, density, width=bin_width * 0.9,
+                 alpha=0.4, color=species_color, edgecolor='white', linewidth=0.3)
+    for result in fit_results:
+        color = get_dist_color(result.distribution_name)
+        ax_inset.plot(hist_data.bin_centers, result.pdf_values, '-',
+                      color=color, linewidth=1.5)
+    ax_inset.set_xlim(*inset_xlim)
+    ax_inset.set_ylim(0, tail_y_max)
+    ax_inset.tick_params(labelsize=settings.fonts['tick_size'] - 2)
+    ax_inset.set_xlabel('')
+    ax_inset.set_ylabel('')
+    # Add subtle border
+    for spine in ax_inset.spines.values():
+        spine.set_edgecolor('gray')
+        spine.set_linewidth(0.8)
 
 
 def create_combined_figure(
@@ -800,55 +921,141 @@ def create_combined_figure(
     output_file: Path,
     top_n: int = 5
 ) -> None:
-    """Create redesigned 4-panel figure.
+    """Create 6-panel figure with 2 rows.
 
-    (a) Summed delta AIC: Total fit quality per distribution
-    (b) Win rate: Fraction of ROIs where each distribution wins
-    (c) r_arith bias: Both species on same axes
-    (d) r_eff bias: Both species on same axes
+    Row 1 (top): Pooled PDFs with all fitted distributions
+        (a) Human pooled PDF with fits
+        (b) Rat pooled PDF with fits
+
+    Row 2 (bottom): Model comparison metrics
+        (c) Win rate
+        (d) Wasserstein distance (with inter-ROI reference)
+        (e) r_arith error
+        (f) r_eff error
     """
-    # Species colors (matching sample size figure)
-    HUMAN_COLOR = '#1f77b4'  # Blue
-    RAT_COLOR = '#d62728'    # Red
+    from matplotlib.gridspec import GridSpec
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    ax_a, ax_b = axes[0]
-    ax_c, ax_d = axes[1]
+    # Species colors from settings
+    HUMAN_COLOR = settings.colors['human']
+    RAT_COLOR = settings.colors['rat']
 
-    # Set 1:1 aspect ratio for all panels
-    for ax in axes.flat:
-        ax.set_box_aspect(1)
+    # Create figure with GridSpec: 2 rows, top row has 2 panels, bottom has 4
+    fig = plt.figure(figsize=(17, 9.5))
+    gs = GridSpec(2, 4, figure=fig, height_ratios=[1, 1], hspace=0.35, wspace=0.35)
 
-    # (a) Summed delta AIC
-    _plot_summed_delta_aic(
-        ax_a, human_metrics, rat_metrics,
-        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
+    # Top row: 2 panels spanning 2 columns each
+    ax_a = fig.add_subplot(gs[0, 0:2])  # Rat PDF
+    ax_b = fig.add_subplot(gs[0, 2:4])  # Human PDF
+
+    # Bottom row: 4 panels
+    ax_c = fig.add_subplot(gs[1, 0])  # Win rate
+    ax_d = fig.add_subplot(gs[1, 1])  # Wasserstein
+    ax_e = fig.add_subplot(gs[1, 2])  # r_arith error
+    ax_f = fig.add_subplot(gs[1, 3])  # r_eff error
+
+    # Set aspect ratio for bottom row panels
+    for ax in [ax_c, ax_d, ax_e, ax_f]:
+        ax.set_box_aspect(1 / 0.75)
+
+    # Compute inter-ROI Wasserstein for reference lines
+    human_inter_roi_w = compute_inter_roi_wasserstein(human_per_sample)
+    rat_inter_roi_w = compute_inter_roi_wasserstein(rat_per_sample)
+
+    # (a) Rat pooled PDF with all fits
+    _plot_pooled_pdf_with_fits(
+        ax_a, rat_pooled, rat_metrics.pooled_results,
+        species_color=RAT_COLOR,
+        inset_xlim=(0.5, 1.2)  # Rat tail starts earlier
     )
 
-    # (b) Win rate
+    # (b) Human pooled PDF with all fits
+    _plot_pooled_pdf_with_fits(
+        ax_b, human_pooled, human_metrics.pooled_results,
+        species_color=HUMAN_COLOR,
+        inset_xlim=(1.0, 3.0)  # Human tail
+    )
+
+    # Create shared legend above panels a-b
+    # Get handles and labels from ax_a (distribution fits only, no data)
+    handles, labels = ax_a.get_legend_handles_labels()
+
+    # Create custom half-blue/half-red patch for empirical data
+    from matplotlib.patches import FancyBboxPatch
+    from matplotlib.legend_handler import HandlerBase
+
+    class SplitColorHandler(HandlerBase):
+        """Custom handler for split-color rectangle."""
+        def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                           width, height, fontsize, trans):
+            # Create two rectangles side by side (Rat first, then Human)
+            from matplotlib.patches import Rectangle
+            half_width = width / 2
+            left_rect = Rectangle(
+                (xdescent, ydescent), half_width, height,
+                facecolor=RAT_COLOR, edgecolor='white', linewidth=0.5,
+                alpha=0.6, transform=trans
+            )
+            right_rect = Rectangle(
+                (xdescent + half_width, ydescent), half_width, height,
+                facecolor=HUMAN_COLOR, edgecolor='white', linewidth=0.5,
+                alpha=0.6, transform=trans
+            )
+            return [left_rect, right_rect]
+
+    # Create dummy handle for empirical data
+    from matplotlib.patches import Patch
+    empirical_patch = Patch(facecolor='gray')  # placeholder, handler will override
+
+    # Prepend empirical data to handles/labels
+    all_handles = [empirical_patch] + handles
+    all_labels = ['Empirical data'] + labels
+
+    # Create legend with frame
+    fig.legend(
+        all_handles, all_labels,
+        loc='upper center',
+        bbox_to_anchor=(0.5, 0.98),
+        ncol=len(all_handles),
+        fontsize=settings.fonts['legend_size'],
+        frameon=True,
+        edgecolor='gray',
+        fancybox=True,
+        columnspacing=1.5,
+        handler_map={empirical_patch: SplitColorHandler()}
+    )
+
+    # (c) Win rate
     _plot_win_rate(
-        ax_b, human_metrics, rat_metrics,
+        ax_c, human_metrics, rat_metrics,
         human_color=HUMAN_COLOR, rat_color=RAT_COLOR
     )
 
-    # (c) r_arith bias - both species
+    # (d) Wasserstein distance with inter-ROI reference
+    _plot_wasserstein_both_species(
+        ax_d, human_metrics, rat_metrics,
+        human_color=HUMAN_COLOR, rat_color=RAT_COLOR,
+        human_inter_roi=human_inter_roi_w, rat_inter_roi=rat_inter_roi_w
+    )
+
+    # (e) r_arith error - both species
     _plot_radius_bias_both_species(
-        ax_c, human_metrics, rat_metrics,
+        ax_e, human_metrics, rat_metrics,
         radius_type='r_arith',
         human_color=HUMAN_COLOR, rat_color=RAT_COLOR
     )
 
-    # (d) r_eff bias - both species
+    # (f) r_eff error - both species
     _plot_radius_bias_both_species(
-        ax_d, human_metrics, rat_metrics,
+        ax_f, human_metrics, rat_metrics,
         radius_type='r_eff',
         human_color=HUMAN_COLOR, rat_color=RAT_COLOR
     )
 
-    plt.tight_layout()
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
+    svg_file = output_file.with_suffix('.svg')
+    plt.savefig(svg_file, bbox_inches='tight')
     plt.close()
-    logger.info(f"Saved figure to {output_file}")
+    logger.info(f"Saved figure to {output_file} and {svg_file}")
 
 
 def _plot_histogram_illustrative(
@@ -886,9 +1093,11 @@ def _plot_summed_delta_aic(
     human_metrics: AggregatedMetrics,
     rat_metrics: AggregatedMetrics,
     human_color: str,
-    rat_color: str
+    rat_color: str,
+    human_total_count: int,
+    rat_total_count: int
 ) -> None:
-    """Plot summed delta AIC dot plot with both species on same axes."""
+    """Plot summed delta AIC dot plot with both species on same axes, normalized by observation count."""
     # Get distribution names (use human order - sorted by AIC)
     names = human_metrics.distribution_names
     display_names = [get_display_name(n) for n in names]
@@ -905,17 +1114,17 @@ def _plot_summed_delta_aic(
         for n in names
     ])
 
-    # Delta AIC from minimum (in millions for readability)
-    human_delta = (human_aic - np.nanmin(human_aic)) / 1e6
-    rat_delta = (rat_aic - np.nanmin(rat_aic)) / 1e6
+    # Delta AIC from minimum, normalized by total observation count (per million obs)
+    human_delta = (human_aic - np.nanmin(human_aic)) / human_total_count * 1e6
+    rat_delta = (rat_aic - np.nanmin(rat_aic)) / rat_total_count * 1e6
 
     y_pos = np.arange(len(names))
 
     # Plot dots (rat first so human is on top)
-    ax.scatter(rat_delta, y_pos, color=rat_color, s=80, marker='s',
-               label='Rat WM', zorder=3, edgecolor='white', linewidth=0.5)
-    ax.scatter(human_delta, y_pos, color=human_color, s=80, marker='o',
-               label='Human CC', zorder=4, edgecolor='white', linewidth=0.5)
+    ax.scatter(rat_delta, y_pos, color=rat_color, s=120, marker='s',
+               label='Rat', zorder=3, edgecolor='white', linewidth=0.5)
+    ax.scatter(human_delta, y_pos, color=human_color, s=120, marker='d',
+               label='Human', zorder=4, edgecolor='white', linewidth=0.5)
 
     # Connect dots with lines
     for i in range(len(names)):
@@ -924,10 +1133,13 @@ def _plot_summed_delta_aic(
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
-    ax.set_xlabel(r'$\Sigma\Delta$AIC [$\times 10^6$]', fontsize=settings.fonts['label_size'])
-    ax.set_xlim(-0.05, None)  # Start near 0
-    ax.invert_yaxis()
-    ax.legend(loc='upper right', fontsize=settings.fonts['legend_size'])
+    ax.set_xlabel(r'$\Delta$AIC per $10^6$ obs.', fontsize=settings.fonts['label_size'])
+    # Add margin on left for markers at 0
+    x_max = max(np.nanmax(human_delta), np.nanmax(rat_delta))
+    ax.set_xlim(-x_max * 0.05, x_max * 1.05)
+    ax.set_ylim(len(names) - 0.5, -2.0)  # Inverted, with extra padding at top
+    ax.legend(loc='upper right', fontsize=settings.fonts['legend_size'], ncol=2,
+              frameon=True, edgecolor='gray', facecolor='white', framealpha=1.0)
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
@@ -941,19 +1153,20 @@ def _plot_win_rate(
     """Plot win rate dot plot with both species on same axes."""
     # Get distribution names (use human order)
     names = human_metrics.distribution_names
-    display_names = [get_display_name(n) for n in names]
+    display_names = [get_display_name(n, multiline=True) for n in names]
 
     # Get win rates for each species
     human_win = np.array([human_metrics.win_rate.get(n, 0) for n in names])
     rat_win = np.array([rat_metrics.win_rate.get(n, 0) for n in names])
 
-    y_pos = np.arange(len(names))
+    y_spacing = 1.3  # Spacing between distributions
+    y_pos = np.arange(len(names)) * y_spacing
 
     # Plot dots (rat first so human is on top)
-    ax.scatter(rat_win, y_pos, color=rat_color, s=80, marker='s',
-               label='Rat WM', zorder=3, edgecolor='white', linewidth=0.5)
-    ax.scatter(human_win, y_pos, color=human_color, s=80, marker='o',
-               label='Human CC', zorder=4, edgecolor='white', linewidth=0.5)
+    ax.scatter(rat_win, y_pos, color=rat_color, s=120, marker='s',
+               label='Rat', zorder=3, edgecolor='white', linewidth=0.5)
+    ax.scatter(human_win, y_pos, color=human_color, s=120, marker='d',
+               label='Human', zorder=4, edgecolor='white', linewidth=0.5)
 
     # Connect dots with lines
     for i in range(len(names)):
@@ -963,9 +1176,175 @@ def _plot_win_rate(
     ax.set_yticks(y_pos)
     ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
     ax.set_xlabel('Win rate', fontsize=settings.fonts['label_size'])
-    ax.set_xlim(-0.05, 1.05)
-    ax.invert_yaxis()
-    ax.legend(loc='lower right', fontsize=settings.fonts['legend_size'])
+    ax.set_xlim(-0.05, 1.0)
+    ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
+    ax.legend(loc='upper right', fontsize=settings.fonts['legend_size'], ncol=2,
+              frameon=True, edgecolor='gray', facecolor='white', framealpha=1.0,
+              handletextpad=0.3, borderpad=0.3,
+              columnspacing=0.8, handlelength=1.2)
+    ax.tick_params(labelsize=settings.fonts['tick_size'])
+
+
+def _plot_wasserstein_both_species(
+    ax: plt.Axes,
+    human_metrics: AggregatedMetrics,
+    rat_metrics: AggregatedMetrics,
+    human_color: str,
+    rat_color: str,
+    human_inter_roi: float = None,
+    rat_inter_roi: float = None
+) -> None:
+    """Plot Wasserstein distance boxplots for both species on same axes.
+
+    Optionally shows inter-ROI Wasserstein as vertical dashed reference lines.
+    """
+    # Use human distribution order (sorted by AIC)
+    names = human_metrics.distribution_names
+    display_names = [get_display_name(n, multiline=True) for n in names]
+
+    y_spacing = 1.3  # Spacing between distributions
+    y_pos = np.arange(len(names)) * y_spacing
+    box_width = 0.4
+
+    # Collect Wasserstein data for each distribution
+    box_data_human = []
+    box_data_rat = []
+
+    for dist_name in names:
+        dist_idx = human_metrics.dist_name_to_idx[dist_name]
+
+        # Human Wasserstein values
+        human_w = human_metrics.all_wasserstein[dist_idx]
+        human_w_valid = human_w[~np.isnan(human_w)]
+        box_data_human.append(human_w_valid)
+
+        # Rat Wasserstein values
+        rat_dist_idx = rat_metrics.dist_name_to_idx.get(dist_name, -1)
+        if rat_dist_idx >= 0:
+            rat_w = rat_metrics.all_wasserstein[rat_dist_idx]
+            rat_w_valid = rat_w[~np.isnan(rat_w)]
+            box_data_rat.append(rat_w_valid)
+        else:
+            box_data_rat.append(np.array([]))
+
+    # Plot boxplots for human (offset down)
+    human_positions = [y_pos[i] - box_width/2 for i in range(len(box_data_human))]
+    bp_human = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_human],
+                          positions=human_positions, vert=False, widths=box_width * 0.8,
+                          patch_artist=True, showfliers=False,
+                          medianprops=dict(color=human_color, linewidth=2),
+                          whiskerprops=dict(color=human_color, linewidth=1.5),
+                          capprops=dict(color=human_color, linewidth=1.5))
+    for patch in bp_human['boxes']:
+        patch.set_facecolor(human_color)
+        patch.set_alpha(0.5)
+        patch.set_edgecolor(human_color)
+
+    # Plot boxplots for rat (offset up)
+    rat_positions = [y_pos[i] + box_width/2 for i in range(len(box_data_rat))]
+    bp_rat = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_rat],
+                        positions=rat_positions, vert=False, widths=box_width * 0.8,
+                        patch_artist=True, showfliers=False,
+                        medianprops=dict(color=rat_color, linewidth=2),
+                        whiskerprops=dict(color=rat_color, linewidth=1.5),
+                        capprops=dict(color=rat_color, linewidth=1.5))
+    for patch in bp_rat['boxes']:
+        patch.set_facecolor(rat_color)
+        patch.set_alpha(0.5)
+        patch.set_edgecolor(rat_color)
+
+    # Add inter-ROI reference lines (vertical dashed)
+    if human_inter_roi is not None:
+        ax.axvline(human_inter_roi, color=human_color, linestyle='--', linewidth=2,
+                   alpha=0.8, zorder=1)
+    if rat_inter_roi is not None:
+        ax.axvline(rat_inter_roi, color=rat_color, linestyle='--', linewidth=2,
+                   alpha=0.8, zorder=1)
+
+    # Add legend manually (Rat, Human on first row; Anat. Var. on second row)
+    from matplotlib.patches import Patch, Rectangle
+    from matplotlib.lines import Line2D
+    from matplotlib.legend_handler import HandlerBase
+
+    # Custom handler for solid colored rectangle
+    class SolidPatchHandler(HandlerBase):
+        def __init__(self, color):
+            self.color = color
+            super().__init__()
+
+        def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                           width, height, fontsize, trans):
+            rect = Rectangle((xdescent, ydescent), width, height,
+                            facecolor=self.color, edgecolor=self.color,
+                            linewidth=1, alpha=1.0, transform=trans)
+            return [rect]
+
+    # Custom handler for dual colored dashed lines (stacked vertically)
+    class DualDashedLineHandler(HandlerBase):
+        def __init__(self, color1, color2):
+            self.color1 = color1
+            self.color2 = color2
+            super().__init__()
+
+        def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                           width, height, fontsize, trans):
+            # Draw two dashed lines stacked on top of each other
+            y_offset = height * 0.2
+            y_top = ydescent + height / 2 + y_offset
+            y_bottom = ydescent + height / 2 - y_offset
+            # First line (rat color) on top
+            line1 = Line2D([xdescent, xdescent + width],
+                          [y_top, y_top],
+                          color=self.color1, linestyle='--', linewidth=1.5,
+                          transform=trans)
+            # Second line (human color) on bottom
+            line2 = Line2D([xdescent, xdescent + width],
+                          [y_bottom, y_bottom],
+                          color=self.color2, linestyle='--', linewidth=1.5,
+                          transform=trans)
+            return [line1, line2]
+
+    # With ncol=2, matplotlib fills column-wise: (0,0), (1,0), (0,1), (1,1)...
+    # To get Row1: [Rat, Human], Row2: [Anat. Var.], order must be: [Rat, Anat. Var., Human]
+    rat_handle = Patch(facecolor=rat_color, label='Rat')
+    human_handle = Patch(facecolor=human_color, label='Human')
+
+    if human_inter_roi is not None or rat_inter_roi is not None:
+        # Placeholder handle for Anat. Var. (handler will draw the actual symbol)
+        anat_var_handle = Line2D([0], [0], color='none')
+        # Single row: Rat, Human, Anat. Var.
+        legend_elements = [rat_handle, human_handle, anat_var_handle]
+        labels = ['Rat', 'Human', 'Anat. Var.']
+        handler_map = {
+            rat_handle: SolidPatchHandler(rat_color),
+            human_handle: SolidPatchHandler(human_color),
+            anat_var_handle: DualDashedLineHandler(rat_color, human_color)
+        }
+        ncol = 3
+    else:
+        legend_elements = [rat_handle, human_handle]
+        labels = ['Rat', 'Human']
+        handler_map = {
+            rat_handle: SolidPatchHandler(rat_color),
+            human_handle: SolidPatchHandler(human_color)
+        }
+        ncol = 2
+
+    ax.legend(handles=legend_elements, labels=labels,
+              loc='upper right', fontsize=settings.fonts['legend_size'], ncol=ncol,
+              frameon=True, edgecolor='gray', facecolor='white', framealpha=1.0,
+              handletextpad=0.2, borderpad=0.2,
+              columnspacing=0.5, handlelength=1.0,
+              bbox_to_anchor=(1.02, 1.0),
+              handler_map=handler_map)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
+    ax.set_xlabel('Wasserstein distance [μm]', fontsize=settings.fonts['label_size'])
+    ax.set_xlim(0, 0.08)
+    ax.set_xticks([0, 0.02, 0.04, 0.06, 0.08])
+    ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
@@ -1138,9 +1517,10 @@ def _plot_radius_bias_both_species(
     """
     # Use human distribution order (sorted by AIC)
     names = human_metrics.distribution_names
-    display_names = [get_display_name(n) for n in names]
+    display_names = [get_display_name(n, multiline=True) for n in names]
 
-    y_pos = np.arange(len(names))
+    y_spacing = 1.3  # Spacing between distributions
+    y_pos = np.arange(len(names)) * y_spacing
 
     # Get per-sample values for each species
     if radius_type == 'r_arith':
@@ -1148,20 +1528,20 @@ def _plot_radius_bias_both_species(
         rat_all = rat_metrics.all_r_arith
         human_emp_per_sample = human_metrics.empirical_r_arith_per_sample
         rat_emp_per_sample = rat_metrics.empirical_r_arith_per_sample
-        xlabel = r'$\bar{r}$ bias [%]'
+        xlabel = r'$\bar{r}$ error [%]'
         x_lim = 5  # ±5%
     else:  # r_eff
         human_all = human_metrics.all_r_eff
         rat_all = rat_metrics.all_r_eff
         human_emp_per_sample = human_metrics.empirical_r_eff_per_sample
         rat_emp_per_sample = rat_metrics.empirical_r_eff_per_sample
-        xlabel = r'$r_{\mathrm{MRI}}$ bias [%]'
+        xlabel = r'$r_{\mathrm{MRI}}$ error [%]'
         x_lim = 50  # ±50%
 
     # Compute per-sample bias for each distribution
-    violin_width = 0.35
-    violin_data_human = []
-    violin_data_rat = []
+    box_width = 0.4
+    box_data_human = []
+    box_data_rat = []
 
     for dist_name in names:
         dist_idx = human_metrics.dist_name_to_idx[dist_name]
@@ -1170,7 +1550,7 @@ def _plot_radius_bias_both_species(
         human_fitted = human_all[dist_idx]
         human_bias = (human_fitted - human_emp_per_sample) / human_emp_per_sample * 100
         human_bias_valid = human_bias[~np.isnan(human_bias)]
-        violin_data_human.append(human_bias_valid)
+        box_data_human.append(human_bias_valid)
 
         # Rat
         rat_dist_idx = rat_metrics.dist_name_to_idx.get(dist_name, -1)
@@ -1178,79 +1558,146 @@ def _plot_radius_bias_both_species(
             rat_fitted = rat_all[rat_dist_idx]
             rat_bias = (rat_fitted - rat_emp_per_sample) / rat_emp_per_sample * 100
             rat_bias_valid = rat_bias[~np.isnan(rat_bias)]
-            violin_data_rat.append(rat_bias_valid)
+            box_data_rat.append(rat_bias_valid)
         else:
-            violin_data_rat.append(np.array([]))
+            box_data_rat.append(np.array([]))
 
-    # Plot violins for human (offset down)
-    for i, data in enumerate(violin_data_human):
-        if len(data) > 1:
-            parts = ax.violinplot(data, positions=[y_pos[i] - violin_width/2],
-                                  vert=False, widths=violin_width, showmeans=True,
-                                  showextrema=False)
-            for pc in parts['bodies']:
-                pc.set_facecolor(human_color)
-                pc.set_alpha(0.6)
-            parts['cmeans'].set_color(human_color)
-            parts['cmeans'].set_linewidth(2)
+    # Use renamed variable for annotation loop compatibility
+    violin_width = box_width
+    violin_data_human = box_data_human
+    violin_data_rat = box_data_rat
 
-    # Plot violins for rat (offset up)
-    for i, data in enumerate(violin_data_rat):
-        if len(data) > 1:
-            parts = ax.violinplot(data, positions=[y_pos[i] + violin_width/2],
-                                  vert=False, widths=violin_width, showmeans=True,
-                                  showextrema=False)
-            for pc in parts['bodies']:
-                pc.set_facecolor(rat_color)
-                pc.set_alpha(0.6)
-            parts['cmeans'].set_color(rat_color)
-            parts['cmeans'].set_linewidth(2)
+    # Plot boxplots for human (offset down)
+    human_positions = [y_pos[i] - box_width/2 for i in range(len(box_data_human))]
+    bp_human = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_human],
+                          positions=human_positions, vert=False, widths=box_width * 0.8,
+                          patch_artist=True, showfliers=False,
+                          medianprops=dict(color=human_color, linewidth=2),
+                          whiskerprops=dict(color=human_color, linewidth=1.5),
+                          capprops=dict(color=human_color, linewidth=1.5))
+    for patch in bp_human['boxes']:
+        patch.set_facecolor(human_color)
+        patch.set_alpha(0.5)
+        patch.set_edgecolor(human_color)
+
+    # Plot boxplots for rat (offset up)
+    rat_positions = [y_pos[i] + box_width/2 for i in range(len(box_data_rat))]
+    bp_rat = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_rat],
+                        positions=rat_positions, vert=False, widths=box_width * 0.8,
+                        patch_artist=True, showfliers=False,
+                        medianprops=dict(color=rat_color, linewidth=2),
+                        whiskerprops=dict(color=rat_color, linewidth=1.5),
+                        capprops=dict(color=rat_color, linewidth=1.5))
+    for patch in bp_rat['boxes']:
+        patch.set_facecolor(rat_color)
+        patch.set_alpha(0.5)
+        patch.set_edgecolor(rat_color)
 
     # Add zero reference line
     ax.axvline(0, color='gray', linestyle='-', linewidth=1.5, alpha=0.7)
 
-    # Annotate out-of-bounds means with arrows and values
-    for i, (h_data, r_data) in enumerate(zip(violin_data_human, violin_data_rat)):
+    # Annotate out-of-bounds medians with arrows and values
+    annot_fontsize = settings.fonts['tick_size']  # Larger, more visible
+    for i, (h_data, r_data) in enumerate(zip(box_data_human, box_data_rat)):
         # Human
         if len(h_data) > 0:
-            h_mean = np.mean(h_data)
-            if h_mean > x_lim:
-                ax.annotate(f'{h_mean:.0f}%', xy=(x_lim, y_pos[i] - violin_width/2),
-                            xytext=(x_lim - 5, y_pos[i] - violin_width/2),
-                            fontsize=8, color=human_color, ha='right', va='center',
-                            arrowprops=dict(arrowstyle='->', color=human_color, lw=1.2))
-            elif h_mean < -x_lim:
-                ax.annotate(f'{h_mean:.0f}%', xy=(-x_lim, y_pos[i] - violin_width/2),
-                            xytext=(-x_lim + 5, y_pos[i] - violin_width/2),
-                            fontsize=8, color=human_color, ha='left', va='center',
-                            arrowprops=dict(arrowstyle='->', color=human_color, lw=1.2))
+            h_median = np.median(h_data)
+            if h_median > x_lim:
+                ax.annotate(f'{h_median:.0f}%', xy=(x_lim, y_pos[i] - box_width/2),
+                            xytext=(x_lim - 8, y_pos[i] - box_width/2),
+                            fontsize=annot_fontsize, fontweight='bold',
+                            color=human_color, ha='right', va='center',
+                            arrowprops=dict(arrowstyle='->', color=human_color, lw=1.5))
+            elif h_median < -x_lim:
+                ax.annotate(f'{h_median:.0f}%', xy=(-x_lim, y_pos[i] - box_width/2),
+                            xytext=(-x_lim + 8, y_pos[i] - box_width/2),
+                            fontsize=annot_fontsize, fontweight='bold',
+                            color=human_color, ha='left', va='center',
+                            arrowprops=dict(arrowstyle='->', color=human_color, lw=1.5))
         # Rat
         if len(r_data) > 0:
-            r_mean = np.mean(r_data)
-            if r_mean > x_lim:
-                ax.annotate(f'{r_mean:.0f}%', xy=(x_lim, y_pos[i] + violin_width/2),
-                            xytext=(x_lim - 5, y_pos[i] + violin_width/2),
-                            fontsize=8, color=rat_color, ha='right', va='center',
-                            arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.2))
-            elif r_mean < -x_lim:
-                ax.annotate(f'{r_mean:.0f}%', xy=(-x_lim, y_pos[i] + violin_width/2),
-                            xytext=(-x_lim + 5, y_pos[i] + violin_width/2),
-                            fontsize=8, color=rat_color, ha='left', va='center',
-                            arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.2))
+            r_median = np.median(r_data)
+            if r_median > x_lim:
+                ax.annotate(f'{r_median:.0f}%', xy=(x_lim, y_pos[i] + box_width/2),
+                            xytext=(x_lim - 8, y_pos[i] + box_width/2),
+                            fontsize=annot_fontsize, fontweight='bold',
+                            color=rat_color, ha='right', va='center',
+                            arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.5))
+            elif r_median < -x_lim:
+                ax.annotate(f'{r_median:.0f}%', xy=(-x_lim, y_pos[i] + box_width/2),
+                            xytext=(-x_lim + 8, y_pos[i] + box_width/2),
+                            fontsize=annot_fontsize, fontweight='bold',
+                            color=rat_color, ha='left', va='center',
+                            arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.5))
 
-    # Add legend manually (violinplot doesn't support labels)
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor=human_color, alpha=0.6, label='Human CC'),
-        Patch(facecolor=rat_color, alpha=0.6, label='Rat WM')
-    ]
-    ax.legend(handles=legend_elements, loc='lower right', fontsize=settings.fonts['legend_size'])
+    # Add legend with boxplot-style handles (Rat first)
+    from matplotlib.patches import Patch, FancyBboxPatch
+    from matplotlib.lines import Line2D
+    from matplotlib.legend_handler import HandlerBase
+
+    class BoxplotHandler(HandlerBase):
+        """Custom handler that draws a mini boxplot with whisker caps."""
+        def __init__(self, facecolor, edgecolor):
+            self.facecolor = facecolor
+            self.edgecolor = edgecolor
+            super().__init__()
+
+        def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                           width, height, fontsize, trans):
+            from matplotlib.patches import Rectangle
+            from matplotlib.lines import Line2D
+            # Box (IQR) - centered, takes middle 50% of width
+            box_left = xdescent + width * 0.25
+            box_width = width * 0.5
+            box = Rectangle((box_left, ydescent + height * 0.15),
+                           box_width, height * 0.7,
+                           facecolor=self.facecolor, edgecolor=self.edgecolor,
+                           linewidth=1, alpha=1.0, transform=trans)
+            # Median line (inside box)
+            median = Line2D([box_left, box_left + box_width],
+                          [ydescent + height * 0.5, ydescent + height * 0.5],
+                          color='white', linewidth=1.5, transform=trans)
+            # Left whisker (horizontal line)
+            left_whisker = Line2D([xdescent, box_left],
+                                 [ydescent + height * 0.5, ydescent + height * 0.5],
+                                 color=self.edgecolor, linewidth=1, transform=trans)
+            # Right whisker (horizontal line)
+            right_whisker = Line2D([box_left + box_width, xdescent + width],
+                                  [ydescent + height * 0.5, ydescent + height * 0.5],
+                                  color=self.edgecolor, linewidth=1, transform=trans)
+            # Left whisker cap (vertical line)
+            left_cap = Line2D([xdescent, xdescent],
+                             [ydescent + height * 0.25, ydescent + height * 0.75],
+                             color=self.edgecolor, linewidth=1, transform=trans)
+            # Right whisker cap (vertical line)
+            right_cap = Line2D([xdescent + width, xdescent + width],
+                              [ydescent + height * 0.25, ydescent + height * 0.75],
+                              color=self.edgecolor, linewidth=1, transform=trans)
+            return [box, median, left_whisker, right_whisker, left_cap, right_cap]
+
+    # Create dummy patches for legend (alpha=1.0 for solid)
+    rat_patch = Patch(facecolor=rat_color, label='Rat', alpha=1.0)
+    human_patch = Patch(facecolor=human_color, label='Human', alpha=1.0)
+
+    ax.legend(handles=[rat_patch, human_patch], loc='upper right',
+              fontsize=settings.fonts['legend_size'], ncol=2,
+              frameon=True, edgecolor='gray', facecolor='white', framealpha=1.0,
+              handletextpad=0.3, borderpad=0.3,
+              columnspacing=0.8, handlelength=1.8,
+              handler_map={rat_patch: BoxplotHandler(rat_color, rat_color),
+                          human_patch: BoxplotHandler(human_color, human_color)})
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
     ax.set_xlabel(xlabel, fontsize=settings.fonts['label_size'])
+    # Symmetric range around 0
     ax.set_xlim(-x_lim, x_lim)
-    ax.invert_yaxis()
+    # Add intermediate ticks
+    if radius_type == 'r_arith':
+        ax.set_xticks([-5, -2.5, 0, 2.5, 5])
+    else:  # r_eff
+        ax.set_xticks([-50, -25, 0, 25, 50])
+    ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
