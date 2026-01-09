@@ -265,7 +265,8 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
                               radius_type: str = 'circular',
                               x_max: float = 2.0) -> None:
     """
-    Plot PDF comparison: 3D (solid) vs 2D (dashed + IQR) for multiple samples.
+    Plot PDF comparison: 3D (solid) vs 2D (IQR) for sample(s).
+    Shows r̄ and r_MRI with median and IQR across cross-sections.
 
     Args:
         ax: Matplotlib axes
@@ -277,42 +278,49 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     font_settings = settings.fonts
     line_settings = settings.line
 
-    # Representative example colors (green, orange, purple)
-    colors = [settings.colors['example_1'],
-              settings.colors['example_2'],
-              settings.colors['example_3']]
-    sample_info = []  # Store (color, short_name, mean_r) for custom legend
+    # Colors - gray for PDF, representative colors for metrics
+    pdf_color = settings.colors['single_line']    # Gray for PDF
+    r_arith_color = settings.colors['example_2']  # Orange for r̄
+    r_eff_color = settings.colors['example_3']    # Purple for r_MRI
 
     for idx, (slice_file, axon_file, sample_name, mean_r) in enumerate(samples):
         # Load 2D slice data
         npz_2d = np.load(slice_file)
         bin_centers = npz_2d['bin_centers']
         histograms = npz_2d[f'histograms_{radius_type}']
+        r_eff_per_slice = npz_2d[f'r_eff_{radius_type}_per_slice']
 
         n_slices, n_bins = histograms.shape
 
-        # Convert each slice histogram to PDF
+        # Convert each slice histogram to PDF and compute per-slice metrics
         pdfs = np.zeros((n_slices, n_bins))
         valid_slices = []
+        r_arith_per_slice = []
 
         for i in range(n_slices):
-            if histograms[i].sum() > MIN_AXON_COUNT:
+            counts = histograms[i].sum()
+            if counts > MIN_AXON_COUNT:
                 pdfs[i] = histogram_to_pdf(histograms[i], bin_centers)
                 valid_slices.append(i)
+                # Compute arithmetic mean for this slice
+                r_arith = np.sum(bin_centers * histograms[i]) / counts
+                r_arith_per_slice.append(r_arith)
 
         if len(valid_slices) == 0:
             logger.warning(f"No valid slices for {sample_name}")
             continue
 
         pdfs_valid = pdfs[valid_slices]
+        r_arith_per_slice = np.array(r_arith_per_slice)
+        r_eff_valid = r_eff_per_slice[valid_slices]
+        r_eff_valid = r_eff_valid[r_eff_valid > 0]  # Filter invalid
 
-        # Compute 2D median and IQR
-        pdf_2d_median = np.median(pdfs_valid, axis=0)
+        # Compute 2D PDF IQR
         pdf_2d_lo = np.percentile(pdfs_valid, 25, axis=0)
         pdf_2d_hi = np.percentile(pdfs_valid, 75, axis=0)
 
         # Load 3D axon data and filter by population
-        population = sample_name.split('_')[-1].lower()  # e.g., 'cc' or 'cg'
+        population = sample_name.split('_')[-1].lower()
         base_name = slice_file.stem.replace(f'_{population}_slice_profiles', '')
         pop_labels = load_population_labels(data_dir, base_name, population)
 
@@ -339,51 +347,91 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
         # Crop to x_max
         mask = bin_centers <= x_max
         x = bin_centers[mask]
-        y_2d_med = pdf_2d_median[mask]
         y_2d_lo = pdf_2d_lo[mask]
         y_2d_hi = pdf_2d_hi[mask]
         y_3d = pdf_3d[mask]
 
-        # Plot
-        color = colors[idx]
-        # Extract short name like "25 ipsi CC" from "sham_25_ipsi_CC"
-        parts = sample_name.split('_')
-        short_name = f"{parts[1]} {parts[2]} {parts[3]}"
-
-        # 3D: solid line (no label, we'll build custom legend)
-        ax.plot(x, y_3d, color=color, linewidth=line_settings['linewidth'],
+        # Plot PDF: 3D solid line + 2D IQR shading
+        ax.plot(x, y_3d, color=pdf_color, linewidth=line_settings['linewidth'],
                 linestyle='-')
-        # 2D: IQR shading only (no median line)
-        ax.fill_between(x, y_2d_lo, y_2d_hi, alpha=0.3, color=color)
+        ax.fill_between(x, y_2d_lo, y_2d_hi, alpha=0.3, color=pdf_color)
 
-        # Store info for custom legend
-        sample_info.append((color, short_name, mean_r))
+        # Compute median and IQR for r̄ and r_MRI across slices
+        r_arith_median = np.median(r_arith_per_slice)
+        r_arith_lo = np.percentile(r_arith_per_slice, 25)
+        r_arith_hi = np.percentile(r_arith_per_slice, 75)
 
-    # Build custom legend
-    from matplotlib.patches import Patch
+        r_eff_median = np.median(r_eff_valid)
+        r_eff_lo = np.percentile(r_eff_valid, 25)
+        r_eff_hi = np.percentile(r_eff_valid, 75)
+
+        logger.info(f"  r̄: median={r_arith_median:.3f}, IQR=[{r_arith_lo:.3f}, {r_arith_hi:.3f}] (width={r_arith_hi-r_arith_lo:.3f})")
+        logger.info(f"  r_MRI: median={r_eff_median:.3f}, IQR=[{r_eff_lo:.3f}, {r_eff_hi:.3f}] (width={r_eff_hi-r_eff_lo:.3f})")
+
+        # Get y-axis range for vertical spans
+        y_max = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else np.max(y_3d) * 1.1
+
+        # Plot r̄: IQR as shaded region + median line (thin line)
+        ax.axvspan(r_arith_lo, r_arith_hi, alpha=0.3, color=r_arith_color, zorder=0)
+        ax.axvline(r_arith_median, color=r_arith_color, linestyle='-', linewidth=1.2, alpha=0.9)
+
+        # Plot r_MRI: IQR as shaded region + median line (thin line)
+        ax.axvspan(r_eff_lo, r_eff_hi, alpha=0.3, color=r_eff_color, zorder=0)
+        ax.axvline(r_eff_median, color=r_eff_color, linestyle='-', linewidth=1.2, alpha=0.9)
+
+    # Build custom legend (compact: 3 entries with line + shaded background)
+    from matplotlib.patches import Patch, FancyBboxPatch
     from matplotlib.lines import Line2D
+    from matplotlib.legend_handler import HandlerBase
+
+    # Custom handler to draw line over shaded rectangle
+    class HandlerLineWithBackground(HandlerBase):
+        def __init__(self, line_color, bg_color, bg_alpha=0.3):
+            self.line_color = line_color
+            self.bg_color = bg_color
+            self.bg_alpha = bg_alpha
+            super().__init__()
+
+        def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                          width, height, fontsize, trans):
+            # Background rectangle
+            rect = plt.Rectangle([xdescent, ydescent], width, height,
+                                  facecolor=self.bg_color, alpha=self.bg_alpha,
+                                  edgecolor='none', transform=trans)
+            # Line in center
+            line = plt.Line2D([xdescent, xdescent + width],
+                              [ydescent + height/2, ydescent + height/2],
+                              color=self.line_color, linewidth=1.5, transform=trans)
+            return [rect, line]
 
     handles = []
     labels = []
+    handler_map = {}
 
-    # Style indicators
-    handles.append(Line2D([0], [0], color='gray', linewidth=line_settings['linewidth'], linestyle='-'))
-    labels.append('3D reference')
-    handles.append(Patch(facecolor='gray', alpha=0.3, edgecolor='none'))
-    labels.append('2D slice IQR')
+    # PDF: line + shaded patch
+    pdf_dummy = Line2D([0], [0])
+    handles.append(pdf_dummy)
+    labels.append('PDF (3D ref. + 2D IQR)')
+    handler_map[pdf_dummy] = HandlerLineWithBackground(pdf_color, pdf_color, 0.3)
 
-    # Sample indicators with colors
-    for color, short_name, mean_r in sample_info:
-        handles.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=color,
-                              markersize=8, markeredgecolor='none'))
-        labels.append(rf"{short_name} ($\bar{{r}}$ = {mean_r:.2f})")
+    # r̄: line + shaded background
+    r_arith_dummy = Line2D([0], [0])
+    handles.append(r_arith_dummy)
+    labels.append(r'$\bar{r}$ (median + IQR)')
+    handler_map[r_arith_dummy] = HandlerLineWithBackground(r_arith_color, r_arith_color, 0.3)
+
+    # r_MRI: line + shaded background
+    r_eff_dummy = Line2D([0], [0])
+    handles.append(r_eff_dummy)
+    labels.append(r'$r_{\mathrm{MRI}}$ (median + IQR)')
+    handler_map[r_eff_dummy] = HandlerLineWithBackground(r_eff_color, r_eff_color, 0.3)
 
     ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
     ax.set_ylabel('Probability density [μm⁻¹]', fontsize=font_settings['label_size'],
                   fontweight=font_settings['weight'])
     ax.legend(handles, labels, loc='upper right', fontsize=font_settings['legend_size'] - 1,
-              framealpha=0.9)
+              framealpha=0.9, handler_map=handler_map)
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
     ax.set_box_aspect(1)  # Square subplot box
@@ -1098,8 +1146,17 @@ def main():
     logger.info("2D vs 3D Distribution Comparison")
     logger.info("=" * 80)
 
-    # Find samples with small, medium, high mean radius for panel (a)
-    pdf_samples = find_samples_by_mean_radius(args.data_dir)
+    # Use sham_25_ipsi_CG - has highest IQR for both r̄ and r_MRI
+    slice_file = args.data_dir / "sham_25_ipsi_cg_slice_profiles.npz"
+    axon_file = args.data_dir / "sham_25_ipsi_axon_profiles.npz"
+    sample_name = "sham_25_ipsi_CG"
+    # Load mean_r for the tuple
+    npz = np.load(slice_file)
+    bin_centers = npz['bin_centers']
+    total_hist = npz['total_histogram_circular']
+    mean_r = np.sum(bin_centers * total_hist) / total_hist.sum()
+    representative_sample = (slice_file, axon_file, sample_name, mean_r)
+    logger.info(f"Using representative sample: {sample_name} (r̄={mean_r:.3f})")
 
     # Find all pairs for panels (b), (c) and (d)
     all_pairs = find_matching_pairs(args.data_dir)
@@ -1125,9 +1182,9 @@ def main():
     # Create figure (2x2 layout)
     fig, axes = plt.subplots(2, 2, figsize=(10, 9))
 
-    # Panel (a): PDF stability with 3 samples (small, medium, high mean radius)
-    logger.info("\nPlotting panel (a): PDF stability (3 samples)...")
-    plot_pdf_stability_multi(axes[0, 0], pdf_samples, args.data_dir, args.radius_type, args.x_max)
+    # Panel (a): PDF stability with single representative sample
+    logger.info("\nPlotting panel (a): PDF stability (single sample)...")
+    plot_pdf_stability_multi(axes[0, 0], [representative_sample], args.data_dir, args.radius_type, args.x_max)
 
     # Panel (b): Within-ROI vs Between-ROI Wasserstein distances
     logger.info("\nPlotting panel (b): Within vs Between ROI distances...")
