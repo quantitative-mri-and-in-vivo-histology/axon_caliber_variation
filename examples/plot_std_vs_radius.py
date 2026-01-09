@@ -22,12 +22,13 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 
-def load_axon_data(npz_file: Path) -> Tuple[np.ndarray, np.ndarray, str]:
+def load_axon_data(npz_file: Path, min_length: float = 20.0) -> Tuple[np.ndarray, np.ndarray, str]:
     """
     Load axon data from NPZ file.
 
     Args:
         npz_file: Path to 3D axon profiles NPZ file
+        min_length: Minimum axon length in μm (default 20.0)
 
     Returns:
         Tuple of (mean_radii, std_radii, sample_name)
@@ -36,16 +37,17 @@ def load_axon_data(npz_file: Path) -> Tuple[np.ndarray, np.ndarray, str]:
 
     mean_radii = data['mean_radii_um']
     std_radii = data['std_radii_um']
+    lengths = data['lengths_um']
 
     # Extract sample name from filename
     sample_name = npz_file.stem.replace('_axon_profiles', '')
 
-    # Filter valid data
-    valid = (mean_radii > 0) & np.isfinite(std_radii)
+    # Filter valid data with minimum length
+    valid = (mean_radii > 0) & np.isfinite(std_radii) & (lengths >= min_length)
     mean_radii = mean_radii[valid]
     std_radii = std_radii[valid]
 
-    logger.info(f"Loaded {len(mean_radii)} axons from {npz_file.name}")
+    logger.info(f"Loaded {len(mean_radii)} axons from {npz_file.name} (length >= {min_length} μm)")
 
     return mean_radii, std_radii, sample_name
 
@@ -153,6 +155,12 @@ def main():
         type=Path,
         help='Output PNG file path'
     )
+    parser.add_argument(
+        '--min-length',
+        type=float,
+        default=20.0,
+        help='Minimum axon length in μm (default: 20.0)'
+    )
 
     args = parser.parse_args()
 
@@ -172,7 +180,7 @@ def main():
     # Load all data
     all_data = []
     for npz_file in input_files:
-        mean_radii, std_radii, sample_name = load_axon_data(npz_file)
+        mean_radii, std_radii, sample_name = load_axon_data(npz_file, min_length=args.min_length)
         all_data.append((mean_radii, std_radii, sample_name))
 
     # Create plot

@@ -47,12 +47,13 @@ def extract_group(sample_name: str) -> str:
     return "Unknown"
 
 
-def load_axon_cv_data(npz_file: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, dict]:
+def load_axon_cv_data(npz_file: Path, min_length: float = 20.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, dict]:
     """
     Load axon data and compute CV for each axon.
 
     Args:
         npz_file: Path to 3D axon profiles NPZ file
+        min_length: Minimum axon length in μm (default 20.0)
 
     Returns:
         Tuple of (mean_radii, cv_values, std_values, slowdown_factors, sample_name, profiles_dict)
@@ -98,14 +99,15 @@ def load_axon_cv_data(npz_file: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarra
         'skeleton_coords': skeleton_coords,  # 3D positions for centroid computation
     }
 
-    # Filter out NaN values
-    valid = np.isfinite(cv) & np.isfinite(mean_radii) & np.isfinite(std_radii) & np.isfinite(slowdown)
+    # Filter: finite values AND minimum length
+    valid = (np.isfinite(cv) & np.isfinite(mean_radii) & np.isfinite(std_radii) &
+             np.isfinite(slowdown) & (lengths >= min_length))
     mean_radii = mean_radii[valid]
     cv = cv[valid]
     std_radii = std_radii[valid]
     slowdown = slowdown[valid]
 
-    logger.info(f"Loaded {len(mean_radii)} axons from {npz_file.name}")
+    logger.info(f"Loaded {len(mean_radii)} axons from {npz_file.name} (length >= {min_length} μm)")
     logger.info(f"  Mean radius range: {mean_radii.min():.3f} - {mean_radii.max():.3f} um")
     logger.info(f"  CV range: {cv.min():.3f} - {cv.max():.3f}")
     logger.info(f"  Slowdown factor range: {slowdown.min():.3f} - {slowdown.max():.3f}")
@@ -751,11 +753,13 @@ def plot_cv_vs_radius(
     ax_vol = fig.add_subplot(gs[:, 0], projection='3d')
     # Position: extend beyond bounds, crop left whitespace
     ax_vol.set_position([-0.42, -0.5, 0.55, 2.0])
-    # Subplots (b-e): 2x2 grid in columns 1-2
+    # Subplots (b, c, e): standard grid positions
     ax_prof = fig.add_subplot(gs[0, 1])  # b
     ax_hist = fig.add_subplot(gs[0, 2])  # c
-    ax_cv = fig.add_subplot(gs[1, 1])    # d
     ax_vel = fig.add_subplot(gs[1, 2])   # e
+
+    # Subplot (d): CV vs radius
+    ax_cv = fig.add_subplot(gs[1, 1])
 
     axes_list = [ax_vol, ax_prof, ax_hist, ax_cv, ax_vel]
 
@@ -911,12 +915,13 @@ def plot_cv_vs_radius(
     ax_hist.axvline(np.median(all_y), color=settings.colors['median_line'], linestyle=':',
                     linewidth=line_settings['linewidth'], label=f'Median = {np.median(all_y):.3f}')
     style_axis(ax_hist, xlabel='CV', ylabel='Count')
+    ax_hist.set_xlim(0, 0.8)  # Fixed x-axis for comparison
     ax_hist.legend(loc='upper right', fontsize=font_settings['legend_size'])
     # Use scientific notation for y-axis (×10^4 at top)
     ax_hist.ticklabel_format(axis='y', style='sci', scilimits=(4, 4), useMathText=True)
     ax_hist.yaxis.get_offset_text().set_fontsize(font_settings['tick_size'])
 
-    # === (d): CV vs radius ===
+    # === (d): CV vs radius with marginal histogram on top ===
     x_max = np.percentile(all_x, 99.5)
     n_bins = 30
     bin_edges = np.linspace(0, x_max, n_bins + 1)
@@ -942,6 +947,10 @@ def plot_cv_vs_radius(
     bin_q75 = np.array(bin_q75)
     valid = ~np.isnan(bin_medians)
 
+    # Get x-axis range from valid bins
+    x_min_data = bin_centers[valid].min()
+    x_max_data = bin_centers[valid].max()
+
     single_line_color = settings.colors['single_line']  # Dark gray for single lines
     ax_cv.plot(bin_centers[valid], bin_medians[valid], color=single_line_color, linestyle='-',
                linewidth=line_settings['linewidth'], marker='o',
@@ -949,10 +958,8 @@ def plot_cv_vs_radius(
     ax_cv.fill_between(bin_centers[valid], bin_q25[valid], bin_q75[valid],
                        color=single_line_color, alpha=line_settings['fill_alpha'], label='IQR (25-75%)')
     style_axis(ax_cv, xlabel='Along-axon mean radius [μm]', ylabel='CV')
-    # Set x-axis to exact data range
-    x_min_data = bin_centers[valid].min()
-    x_max_data = bin_centers[valid].max()
-    ax_cv.set_xlim(x_min_data, x_max_data)
+    ax_cv.set_xlim(0.1, 0.6)  # Fixed x-axis for comparison
+    ax_cv.set_ylim(0, 0.35)  # Fixed y-axis for comparison
 
     # === (1,2): Slowdown factor vs axon size (continuous median + IQR) ===
     # Bin axons by mean radius and compute slowdown stats per bin
@@ -1029,17 +1036,10 @@ def plot_cv_vs_radius(
 
     ax_vel.legend(loc='upper right', fontsize=font_settings['legend_size'])
     style_axis(ax_vel, xlabel='Along-axon mean radius [μm]', ylabel='Reduction [%]')
-    # Set x-axis to exact data range
-    x_min_vel = size_bin_centers[valid_bins].min()
-    x_max_vel = size_bin_centers[valid_bins].max()
-    ax_vel.set_xlim(x_min_vel, x_max_vel)
+    ax_vel.set_xlim(0.1, 0.6)  # Fixed x-axis for comparison
+    ax_vel.set_ylim(0, 30)  # Fixed y-axis for comparison
 
-    # Set y-axis to show relevant range
-    y_max = max(np.nanmax(cond_reduction_q75[valid_bins]),
-                np.nanmax(diff_reduction_q75[valid_bins]))
-    ax_vel.set_ylim(0, y_max * 1.1)
-
-    # Set 1:1 aspect ratio for square subplots (not the tall 3D volume)
+    # Set aspect ratios for subplots (not the tall 3D volume)
     for ax in [ax_prof, ax_hist, ax_cv, ax_vel]:
         ax.set_aspect('auto')
         ax.set_box_aspect(1)  # Square subplot
@@ -1087,6 +1087,8 @@ Examples:
                         help='Output PNG file path')
     parser.add_argument('--mat-dir', type=Path, default=None,
                         help='Directory containing .mat files for 3D rendering (optional)')
+    parser.add_argument('--min-length', type=float, default=20.0,
+                        help='Minimum axon length in μm (default: 20.0)')
 
     args = parser.parse_args()
 
@@ -1102,7 +1104,7 @@ Examples:
     # Load all data
     all_data = []
     for f in files:
-        mean_radii, cv, std_radii, slowdown, sample_name, profiles_dict = load_axon_cv_data(f)
+        mean_radii, cv, std_radii, slowdown, sample_name, profiles_dict = load_axon_cv_data(f, min_length=args.min_length)
         all_data.append((mean_radii, cv, std_radii, slowdown, sample_name, profiles_dict))
 
     # Find corresponding mat files if mat-dir is provided
