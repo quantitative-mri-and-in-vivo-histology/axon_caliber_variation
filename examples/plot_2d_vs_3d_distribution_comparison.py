@@ -31,6 +31,15 @@ settings = get_plot_settings()
 
 # Constants
 MIN_AXON_COUNT = 100  # Minimum axons per slice for valid statistics
+MIN_RADIUS_UM = 0.1   # Minimum radius filter (consistent with 3D filtering)
+
+
+def filter_histogram_by_min_radius(histogram: np.ndarray, bin_centers: np.ndarray,
+                                    min_radius: float = MIN_RADIUS_UM) -> np.ndarray:
+    """Zero out histogram bins below minimum radius threshold."""
+    filtered = histogram.copy()
+    filtered[bin_centers < min_radius] = 0
+    return filtered
 
 
 def compute_r_eff(radii: np.ndarray) -> float:
@@ -146,7 +155,7 @@ def find_samples_by_mean_radius(data_dir: Path, min_axons: int = 1_000_000
 
 
 def load_population_labels(data_dir: Path, base_name: str, population: str) -> Set[int]:
-    """Load axon labels for a specific population from JSON file."""
+    """Load axon labels for a specific population from JSON file (legacy)."""
     pop_json = data_dir / f"{base_name}_populations.json"
 
     with open(pop_json, 'r') as f:
@@ -157,6 +166,73 @@ def load_population_labels(data_dir: Path, base_name: str, population: str) -> S
             return set(pop['axon_labels'])
 
     raise ValueError(f"Population '{population}' not found in {pop_json}")
+
+
+def load_population_roi_bounds(data_dir: Path, base_name: str, population: str
+                                ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load ROI bounds for a specific population from JSON file.
+
+    Args:
+        data_dir: Directory containing ROI JSON files
+        base_name: Base name of the sample (e.g., 'sham_25_ipsi')
+        population: Population name ('cc' or 'cg')
+
+    Returns:
+        Tuple of (min_bounds, max_bounds) as numpy arrays in [Z, Y, X] μm
+    """
+    roi_json = data_dir / f"{base_name}_population_rois.json"
+
+    with open(roi_json, 'r') as f:
+        data = json.load(f)
+
+    pop_lower = population.lower()
+    if pop_lower not in data['rois']:
+        raise ValueError(f"Population '{population}' not found in {roi_json}")
+
+    roi = data['rois'][pop_lower]
+    min_bounds = np.array(roi['min_um'])  # [Z, Y, X]
+    max_bounds = np.array(roi['max_um'])  # [Z, Y, X]
+
+    return min_bounds, max_bounds
+
+
+def filter_3d_radii_by_roi(axon_file: Path, roi_min: np.ndarray, roi_max: np.ndarray
+                            ) -> np.ndarray:
+    """
+    Filter 3D radius samples to only include those within ROI bounds.
+
+    Args:
+        axon_file: Path to axon profiles NPZ file
+        roi_min: Minimum ROI bounds [Z, Y, X] in μm
+        roi_max: Maximum ROI bounds [Z, Y, X] in μm
+
+    Returns:
+        Array of radius values for samples within the ROI
+    """
+    npz = np.load(axon_file, allow_pickle=True)
+    radii_profiles = npz['radii_profiles_um']
+    skeleton_coords = npz['skeleton_coords_um']
+
+    filtered_radii = []
+
+    for i in range(len(radii_profiles)):
+        coords = np.array(skeleton_coords[i])  # (N, 3) in [Z, Y, X]
+        radii = np.array(radii_profiles[i])
+
+        if len(coords) == 0:
+            continue
+
+        # Check which points are within ROI bounds
+        within_roi = (
+            (coords[:, 0] >= roi_min[0]) & (coords[:, 0] <= roi_max[0]) &  # Z
+            (coords[:, 1] >= roi_min[1]) & (coords[:, 1] <= roi_max[1]) &  # Y
+            (coords[:, 2] >= roi_min[2]) & (coords[:, 2] <= roi_max[2])    # X
+        )
+
+        filtered_radii.extend(radii[within_roi])
+
+    return np.array(filtered_radii)
 
 
 def histogram_to_pdf(histogram: np.ndarray, bin_centers: np.ndarray) -> np.ndarray:
@@ -208,7 +284,11 @@ def plot_pdf_stability(ax, slice_file: Path, radius_type: str = 'circular',
     """
     npz = np.load(slice_file)
     bin_centers = npz['bin_centers']
-    histograms = npz[f'histograms_{radius_type}']  # (n_slices, n_bins)
+    histograms_raw = npz[f'histograms_{radius_type}']  # (n_slices, n_bins)
+
+    # Filter out small radii from histograms
+    histograms = np.array([filter_histogram_by_min_radius(h, bin_centers)
+                           for h in histograms_raw])
 
     n_slices, n_bins = histograms.shape
     logger.info(f"Computing PDFs for {n_slices} slices...")
@@ -271,7 +351,7 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     Args:
         ax: Matplotlib axes
         samples: List of (slice_file, axon_file, sample_name, mean_radius) tuples
-        data_dir: Directory containing population JSON files
+        data_dir: Directory containing population ROI JSON files
         radius_type: 'circular' or 'minor'
         x_max: Maximum x-axis value for cropping
     """
@@ -283,12 +363,16 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     r_arith_color = settings.colors['example_2']  # Orange for r̄
     r_eff_color = settings.colors['example_3']    # Purple for r_MRI
 
-    for idx, (slice_file, axon_file, sample_name, mean_r) in enumerate(samples):
+    for _, (slice_file, axon_file, sample_name, _) in enumerate(samples):
         # Load 2D slice data
         npz_2d = np.load(slice_file)
         bin_centers = npz_2d['bin_centers']
-        histograms = npz_2d[f'histograms_{radius_type}']
+        histograms_raw = npz_2d[f'histograms_{radius_type}']
         r_eff_per_slice = npz_2d[f'r_eff_{radius_type}_per_slice']
+
+        # Filter out small radii from histograms
+        histograms = np.array([filter_histogram_by_min_radius(h, bin_centers)
+                               for h in histograms_raw])
 
         n_slices, n_bins = histograms.shape
 
@@ -319,21 +403,14 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
         pdf_2d_lo = np.percentile(pdfs_valid, 25, axis=0)
         pdf_2d_hi = np.percentile(pdfs_valid, 75, axis=0)
 
-        # Load 3D axon data and filter by population
+        # Load 3D axon data and filter by ROI bounds
         population = sample_name.split('_')[-1].lower()
         base_name = slice_file.stem.replace(f'_{population}_slice_profiles', '')
-        pop_labels = load_population_labels(data_dir, base_name, population)
+        roi_min, roi_max = load_population_roi_bounds(data_dir, base_name, population)
 
-        npz_3d = np.load(axon_file, allow_pickle=True)
-        axon_labels = npz_3d['labels']
-        radii_profiles = npz_3d['radii_profiles_um']
-
-        # Collect all 3D radii for this population
-        all_radii_3d = []
-        for i, label in enumerate(axon_labels):
-            if int(label) in pop_labels:
-                all_radii_3d.extend(radii_profiles[i])
-        all_radii_3d = np.array(all_radii_3d)
+        # Filter 3D radii to ROI bounds and apply minimum radius filter
+        all_radii_3d = filter_3d_radii_by_roi(axon_file, roi_min, roi_max)
+        all_radii_3d = all_radii_3d[all_radii_3d >= MIN_RADIUS_UM]
 
         # Compute 3D PDF using same bin centers
         bin_width = bin_centers[1] - bin_centers[0]
@@ -417,13 +494,13 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
     # r̄: line + shaded background
     r_arith_dummy = Line2D([0], [0])
     handles.append(r_arith_dummy)
-    labels.append(r'$\bar{r}$ (median + IQR)')
+    labels.append(r'$\bar{r}$ (2D median + IQR)')
     handler_map[r_arith_dummy] = HandlerLineWithBackground(r_arith_color, r_arith_color, 0.3)
 
     # r_MRI: line + shaded background
     r_eff_dummy = Line2D([0], [0])
     handles.append(r_eff_dummy)
-    labels.append(r'$r_{\mathrm{MRI}}$ (median + IQR)')
+    labels.append(r'$r_{\mathrm{MRI}}$ (2D median + IQR)')
     handler_map[r_eff_dummy] = HandlerLineWithBackground(r_eff_color, r_eff_color, 0.3)
 
     ax.set_xlabel('Axon radius [μm]', fontsize=font_settings['label_size'],
@@ -438,11 +515,17 @@ def plot_pdf_stability_multi(ax, samples: List[Tuple[Path, Path, str, float]],
 
 
 def compute_ks_and_wasserstein_per_slice(slice_file: Path, axon_file: Path,
-                                          population_labels: Set[int],
+                                          roi_bounds: Tuple[np.ndarray, np.ndarray],
                                           radius_type: str = 'circular'
                                           ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute KS and Wasserstein distances between each 2D slice and 3D ground truth.
+
+    Args:
+        slice_file: Path to slice profiles NPZ file
+        axon_file: Path to axon profiles NPZ file
+        roi_bounds: Tuple of (roi_min, roi_max) arrays in [Z, Y, X] μm
+        radius_type: 'circular' or 'minor'
 
     Returns:
         Tuple of (ks_values, wasserstein_values) arrays (one per valid slice)
@@ -450,20 +533,20 @@ def compute_ks_and_wasserstein_per_slice(slice_file: Path, axon_file: Path,
     # Load 2D slice data
     npz_2d = np.load(slice_file)
     bin_centers = npz_2d['bin_centers']
-    histograms = npz_2d[f'histograms_{radius_type}']
+    histograms_raw = npz_2d[f'histograms_{radius_type}']
     bin_width = bin_centers[1] - bin_centers[0]
 
-    # Load 3D data and filter by population
-    npz_3d = np.load(axon_file, allow_pickle=True)
-    axon_labels = npz_3d['labels']
-    radii_profiles = npz_3d['radii_profiles_um']
+    # Filter out small radii from histograms
+    histograms = np.array([filter_histogram_by_min_radius(h, bin_centers)
+                           for h in histograms_raw])
 
-    # Collect 3D radii for this population
-    all_radii_3d = []
-    for i, label in enumerate(axon_labels):
-        if int(label) in population_labels:
-            all_radii_3d.extend(radii_profiles[i])
-    all_radii_3d = np.array(all_radii_3d)
+    # Load 3D data and filter by ROI bounds
+    roi_min, roi_max = roi_bounds
+    all_radii_3d = filter_3d_radii_by_roi(axon_file, roi_min, roi_max)
+    all_radii_3d = all_radii_3d[all_radii_3d >= MIN_RADIUS_UM]  # Apply same filter
+
+    if len(all_radii_3d) == 0:
+        return np.array([]), np.array([])
 
     # Compute 3D CDF at bin centers
     sorted_3d = np.sort(all_radii_3d)
@@ -491,25 +574,22 @@ def compute_ks_and_wasserstein_per_slice(slice_file: Path, axon_file: Path,
     return np.array(ks_values), np.array(wasserstein_values)
 
 
-def compute_3d_cdf(axon_file: Path, population_labels: Set[int],
+def compute_3d_cdf(axon_file: Path, roi_bounds: Tuple[np.ndarray, np.ndarray],
                     bin_centers: np.ndarray) -> np.ndarray:
-    """Compute 3D CDF at given bin centers for a population."""
-    npz_3d = np.load(axon_file, allow_pickle=True)
-    axon_labels = npz_3d['labels']
-    radii_profiles = npz_3d['radii_profiles_um']
+    """Compute 3D CDF at given bin centers for a population using ROI bounds."""
+    roi_min, roi_max = roi_bounds
+    all_radii = filter_3d_radii_by_roi(axon_file, roi_min, roi_max)
+    all_radii = all_radii[all_radii >= MIN_RADIUS_UM]  # Apply minimum radius filter
 
-    all_radii = []
-    for i, label in enumerate(axon_labels):
-        if int(label) in population_labels:
-            all_radii.extend(radii_profiles[i])
-    all_radii = np.array(all_radii)
+    if len(all_radii) == 0:
+        return np.zeros_like(bin_centers)
 
     sorted_radii = np.sort(all_radii)
     cdf_y = np.arange(1, len(sorted_radii) + 1) / len(sorted_radii)
     return np.interp(bin_centers, sorted_radii, cdf_y, left=0, right=1)
 
 
-def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, Set[int]]],
+def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, Tuple[np.ndarray, np.ndarray]]],
                                       radius_type: str = 'circular') -> None:
     """
     Plot within-ROI vs between-ROI Wasserstein distances.
@@ -519,7 +599,7 @@ def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, 
 
     Args:
         ax: Matplotlib axes
-        all_pairs: List of (slice_file, axon_file, sample_name, population_labels) tuples
+        all_pairs: List of (slice_file, axon_file, sample_name, roi_bounds) tuples
         radius_type: 'circular' or 'minor'
     """
     font_settings = settings.fonts
@@ -533,13 +613,13 @@ def plot_within_vs_between_distances(ax, all_pairs: List[Tuple[Path, Path, str, 
     within_distances = []
     roi_cdfs = []  # Store 3D CDFs for between-ROI comparison
 
-    for slice_file, axon_file, sample_name, pop_labels in all_pairs:
+    for slice_file, axon_file, _, roi_bounds in all_pairs:
         _, wasserstein_values = compute_ks_and_wasserstein_per_slice(
-            slice_file, axon_file, pop_labels, radius_type)
+            slice_file, axon_file, roi_bounds, radius_type)
         within_distances.extend(wasserstein_values)
 
         # Store 3D CDF for this ROI
-        cdf_3d = compute_3d_cdf(axon_file, pop_labels, bin_centers)
+        cdf_3d = compute_3d_cdf(axon_file, roi_bounds, bin_centers)
         roi_cdfs.append(cdf_3d)
 
     # Compute between-ROI distances (pairwise comparisons of 3D distributions)
@@ -599,7 +679,11 @@ def compute_2d_pooled_cdf(slice_file: Path, bin_centers: np.ndarray,
                            radius_type: str = 'circular') -> Optional[np.ndarray]:
     """Compute pooled 2D CDF from all slices. Returns None if no valid slices."""
     npz_2d = np.load(slice_file)
-    histograms = npz_2d[f'histograms_{radius_type}']
+    histograms_raw = npz_2d[f'histograms_{radius_type}']
+
+    # Filter out small radii from histograms
+    histograms = np.array([filter_histogram_by_min_radius(h, bin_centers)
+                           for h in histograms_raw])
 
     # Pool all valid slices
     pooled_hist = np.zeros(len(bin_centers))
@@ -613,7 +697,7 @@ def compute_2d_pooled_cdf(slice_file: Path, bin_centers: np.ndarray,
     return np.cumsum(pooled_hist) / pooled_hist.sum()
 
 
-def plot_discriminability_scatter(ax, all_pairs: List[Tuple[Path, Path, str, Set[int]]],
+def plot_discriminability_scatter(ax, all_pairs: List[Tuple[Path, Path, str, Tuple[np.ndarray, np.ndarray]]],
                                    radius_type: str = 'circular') -> None:
     """
     Plot W_2D vs W_3D for all ROI pairs (discriminability test).
@@ -622,7 +706,7 @@ def plot_discriminability_scatter(ax, all_pairs: List[Tuple[Path, Path, str, Set
 
     Args:
         ax: Matplotlib axes
-        all_pairs: List of (slice_file, axon_file, sample_name, population_labels) tuples
+        all_pairs: List of (slice_file, axon_file, sample_name, roi_bounds) tuples
         radius_type: 'circular' or 'minor'
     """
     font_settings = settings.fonts
@@ -637,7 +721,7 @@ def plot_discriminability_scatter(ax, all_pairs: List[Tuple[Path, Path, str, Set
     roi_cdfs_2d = []
     roi_names = []
 
-    for slice_file, axon_file, sample_name, pop_labels in all_pairs:
+    for slice_file, axon_file, sample_name, roi_bounds in all_pairs:
         # 2D pooled CDF (check first to skip invalid ROIs)
         cdf_2d = compute_2d_pooled_cdf(slice_file, bin_centers, radius_type)
         if cdf_2d is None:
@@ -645,7 +729,7 @@ def plot_discriminability_scatter(ax, all_pairs: List[Tuple[Path, Path, str, Set
             continue
 
         # 3D CDF
-        cdf_3d = compute_3d_cdf(axon_file, pop_labels, bin_centers)
+        cdf_3d = compute_3d_cdf(axon_file, roi_bounds, bin_centers)
 
         roi_cdfs_3d.append(cdf_3d)
         roi_cdfs_2d.append(cdf_2d)
@@ -729,8 +813,12 @@ def load_2d_metrics(npz_file: Path, radius_type: str = 'circular') -> Dict[str, 
     data = np.load(npz_file)
     bin_centers = data['bin_centers']
 
-    histograms = data[f'histograms_{radius_type}']
+    histograms_raw = data[f'histograms_{radius_type}']
     r_eff_per_slice = data[f'r_eff_{radius_type}_per_slice']
+
+    # Filter out small radii from histograms
+    histograms = np.array([filter_histogram_by_min_radius(h, bin_centers)
+                           for h in histograms_raw])
 
     # Compute per-slice arithmetic mean
     mean_radius_per_slice = []
@@ -773,8 +861,12 @@ def load_2d_slice_data(npz_file: Path, radius_type: str = 'circular',
     """
     data = np.load(npz_file)
     bin_centers = data['bin_centers']
-    histograms = data[f'histograms_{radius_type}']
+    histograms_raw = data[f'histograms_{radius_type}']
     r_eff_per_slice = data[f'r_eff_{radius_type}_per_slice']
+
+    # Filter out small radii from histograms
+    histograms = np.array([filter_histogram_by_min_radius(h, bin_centers)
+                           for h in histograms_raw])
 
     # First pass: compute mean axon count per slice
     all_counts = []
@@ -818,7 +910,7 @@ def load_2d_slice_data(npz_file: Path, radius_type: str = 'circular',
 
 
 def run_monte_carlo_correlation(
-    all_pairs: List[Tuple[Path, Path, str, Set[int]]],
+    all_pairs: List[Tuple[Path, Path, str, Tuple[np.ndarray, np.ndarray]]],
     radius_type: str = 'circular',
     n_iterations: int = 10000,
     seed: int = 42
@@ -831,7 +923,7 @@ def run_monte_carlo_correlation(
     - Compute correlation R between 2D sample and 3D ground truth
 
     Args:
-        all_pairs: List of (slice_file, axon_file, sample_name, population_labels) tuples
+        all_pairs: List of (slice_file, axon_file, sample_name, roi_bounds) tuples
         radius_type: 'circular' or 'minor'
         n_iterations: Number of MC iterations
         seed: Random seed for reproducibility
@@ -846,7 +938,7 @@ def run_monte_carlo_correlation(
     x_3d_mean = []
     x_3d_reff = []
 
-    for slice_file, axon_file, sample_name, pop_labels in all_pairs:
+    for slice_file, axon_file, sample_name, roi_bounds in all_pairs:
         # Load 2D slice data (filters ROIs with < 1000 mean axons per slice)
         slice_data = load_2d_slice_data(slice_file, radius_type, min_mean_axons_per_slice=1000)
         if slice_data['n_valid_slices'] < 1:
@@ -855,7 +947,7 @@ def run_monte_carlo_correlation(
             continue
 
         # Load 3D metrics
-        m3d = load_3d_metrics(axon_file, pop_labels)
+        m3d = load_3d_metrics(axon_file, roi_bounds)
         if np.isnan(m3d['mean_radius']):
             continue
 
@@ -952,26 +1044,29 @@ def run_monte_carlo_correlation(
     }
 
 
-def load_3d_metrics(npz_file: Path, population_labels: Optional[Set[int]] = None) -> Dict[str, float]:
-    """Load 3D axon-based metrics from NPZ file."""
-    data = np.load(npz_file, allow_pickle=True)
+def load_3d_metrics(npz_file: Path,
+                     roi_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None) -> Dict[str, float]:
+    """
+    Load 3D axon-based metrics from NPZ file.
 
-    if population_labels is not None:
-        axon_labels = data['labels']
-        radii_profiles = data['radii_profiles_um']
-
-        filtered_radii_list = []
-        for i, label in enumerate(axon_labels):
-            if int(label) in population_labels:
-                filtered_radii_list.append(radii_profiles[i])
-
-        if not filtered_radii_list:
-            logger.warning(f"No axons matched population labels in {npz_file.name}")
-            return {'mean_radius': np.nan, 'r_eff': np.nan}
-
-        all_radii = np.concatenate(filtered_radii_list)
+    Args:
+        npz_file: Path to axon profiles NPZ file
+        roi_bounds: Optional tuple of (roi_min, roi_max) arrays in [Z, Y, X] μm.
+            If provided, only radii within the ROI are included.
+    """
+    if roi_bounds is not None:
+        roi_min, roi_max = roi_bounds
+        all_radii = filter_3d_radii_by_roi(npz_file, roi_min, roi_max)
     else:
+        data = np.load(npz_file, allow_pickle=True)
         all_radii = data['all_radii_um']
+
+    # Apply minimum radius filter
+    all_radii = all_radii[all_radii >= MIN_RADIUS_UM]
+
+    if len(all_radii) == 0:
+        logger.warning(f"No radius samples within ROI in {npz_file.name}")
+        return {'mean_radius': np.nan, 'r_eff': np.nan}
 
     return {
         'mean_radius': np.mean(all_radii),
@@ -979,14 +1074,16 @@ def load_3d_metrics(npz_file: Path, population_labels: Optional[Set[int]] = None
     }
 
 
-def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str, Set[int]]]:
+def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str, Tuple[np.ndarray, np.ndarray]]]:
     """
-    Find all matching 2D/3D file pairs with population labels.
+    Find all matching 2D/3D file pairs with ROI bounds.
 
     Returns:
-        List of (slice_file, axon_file, sample_name, population_labels) tuples
+        List of (slice_file, axon_file, sample_name, (roi_min, roi_max)) tuples
+        where roi_min and roi_max are numpy arrays in [Z, Y, X] μm
     """
-    import re
+    # Samples to exclude from analysis
+    EXCLUDED_SAMPLES = {'tbi_2_ipsi'}
 
     pairs = []
 
@@ -997,20 +1094,31 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str, Set[int]]
         for slice_file in slice_files:
             # Extract base name
             base_name = slice_file.stem.replace(f'_{pop}_slice_profiles', '')
+
+            # Skip excluded samples
+            if base_name in EXCLUDED_SAMPLES:
+                logger.info(f"Skipping excluded sample: {base_name}_{pop}")
+                continue
+
             axon_file = data_dir / f"{base_name}_axon_profiles.npz"
-            pop_json = data_dir / f"{base_name}_populations.json"
+            roi_json = data_dir / f"{base_name}_population_rois.json"
 
-            if axon_file.exists() and pop_json.exists():
-                # Load population labels
-                with open(pop_json, 'r') as f:
-                    pop_data = json.load(f)
+            if axon_file.exists() and roi_json.exists():
+                # Load ROI bounds
+                try:
+                    roi_min, roi_max = load_population_roi_bounds(data_dir, base_name, pop)
 
-                for p in pop_data['populations']:
-                    if p['name'].lower() == pop:
-                        labels = set(p['axon_labels'])
-                        sample_name = f"{base_name}_{pop.upper()}"
-                        pairs.append((slice_file, axon_file, sample_name, labels))
-                        break
+                    # Check if there are any 3D samples within the ROI (after min radius filter)
+                    radii_3d = filter_3d_radii_by_roi(axon_file, roi_min, roi_max)
+                    radii_3d = radii_3d[radii_3d >= MIN_RADIUS_UM]
+                    if len(radii_3d) == 0:
+                        logger.info(f"Skipping {base_name}_{pop}: no 3D samples within ROI")
+                        continue
+
+                    sample_name = f"{base_name}_{pop.upper()}"
+                    pairs.append((slice_file, axon_file, sample_name, (roi_min, roi_max)))
+                except (FileNotFoundError, ValueError) as e:
+                    logger.warning(f"Skipping {base_name}_{pop}: {e}")
 
     return pairs
 
@@ -1164,9 +1272,9 @@ def main():
 
     # Load metrics for all pairs
     all_metrics = []
-    for sf, af, sn, labels in all_pairs:
+    for sf, af, sn, roi_bounds in all_pairs:
         m2d = load_2d_metrics(sf, args.radius_type)
-        m3d = load_3d_metrics(af, labels)
+        m3d = load_3d_metrics(af, roi_bounds)
         all_metrics.append((m2d, m3d, sn))
 
     # Run Monte Carlo to compute R with uncertainty

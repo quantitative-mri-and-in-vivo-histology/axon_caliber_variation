@@ -273,7 +273,8 @@ def visualize_precomputed(
             first_metadata = metadata
 
         # Build precomputed URL
-        if url_base:
+        # When data_dir itself is a volume, url_base == name, so don't duplicate
+        if url_base and url_base != name:
             precomputed_url = f"precomputed://http://localhost:{http_port}/{url_base}/{name}"
         else:
             precomputed_url = f"precomputed://http://localhost:{http_port}/{name}"
