@@ -21,7 +21,7 @@ import multiprocessing as mp
 from typing import Tuple, Union, Optional, List
 
 import numpy as np
-from scipy.ndimage import zoom, find_objects, median_filter
+from scipy.ndimage import find_objects, median_filter
 from tqdm import tqdm
 
 # Import from axonometry library
@@ -37,10 +37,10 @@ from axonometry import (
     unit_tangent_vector,
     compute_arc_length,
     resample_curve_by_arc_length,
-    sample_perpendicular_cross_section,
     validate_skeleton_points,
     find_longest_contiguous_segment,
 )
+from numba import njit
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -49,6 +49,153 @@ logger = logging.getLogger(__name__)
 # Global variables for worker processes
 _shared_volume = None
 _shared_bboxes = None
+_base_grid_xyz = None  # Precomputed base grid for cross-section sampling
+_grid_size = None
+
+
+@njit(cache=True, fastmath=True)
+def _sample_and_flood_fill(volume, base_grid, grid_size,
+                           point_0, point_1, point_2,
+                           tan_0, tan_1, tan_2,
+                           plane_resolution):
+    """
+    Fused kernel: rotation + translation + bool interpolation + flood-fill.
+
+    Single Numba function that replaces:
+    - create_perpendicular_plane_grid (rotation)
+    - nearest_interp_3d_bool (interpolation)
+    - flood-fill (connected component at center)
+
+    No Python round-trips, no intermediate arrays except the 2D grid.
+    """
+    n_grid = base_grid.shape[0]
+    sz0, sz1, sz2 = volume.shape
+
+    # Compute rotation matrix from tangent vector
+    dot_zt = tan_2
+
+    if dot_zt > 0.9999:
+        r00 = 1.0; r01 = 0.0; r02 = 0.0
+        r10 = 0.0; r11 = 1.0; r12 = 0.0
+        r20 = 0.0; r21 = 0.0; r22 = 1.0
+    elif dot_zt < -0.9999:
+        r00 = 1.0; r01 = 0.0; r02 = 0.0
+        r10 = 0.0; r11 = 1.0; r12 = 0.0
+        r20 = 0.0; r21 = 0.0; r22 = -1.0
+    else:
+        rn = np.sqrt(tan_0 * tan_0 + tan_1 * tan_1)
+        rx = -tan_1 / rn
+        ry = tan_0 / rn
+
+        clamped = max(-1.0, min(1.0, dot_zt))
+        theta = np.arccos(clamped)
+
+        a = np.cos(theta * 0.5)
+        s = np.sin(theta * 0.5)
+        b = -rx * s
+        c = -ry * s
+
+        aa = a * a; bb = b * b; cc = c * c
+        bc = b * c; ac = a * c; ab = a * b
+
+        r00 = aa + bb - cc;  r01 = 2.0 * bc;       r02 = -2.0 * ac
+        r10 = 2.0 * bc;      r11 = aa + cc - bb;    r12 = 2.0 * ab
+        r20 = 2.0 * ac;      r21 = -2.0 * ab;       r22 = aa - bb - cc
+
+    bw = np.zeros((grid_size, grid_size), dtype=np.uint8)
+
+    for i in range(n_grid):
+        gx = base_grid[i, 0]
+        gy = base_grid[i, 1]
+
+        sx = r00 * gx + r01 * gy + point_0
+        sy = r10 * gx + r11 * gy + point_1
+        sz = r20 * gx + r21 * gy + point_2
+
+        ix = int(sx + 0.5)
+        iy = int(sy + 0.5)
+        iz = int(sz + 0.5)
+
+        if ix >= 0 and ix < sz0 and iy >= 0 and iy < sz1 and iz >= 0 and iz < sz2:
+            if volume[ix, iy, iz]:
+                row = i // grid_size
+                col = i % grid_size
+                bw[row, col] = 1
+
+    # Flood-fill from center
+    center = grid_size // 2
+    if not bw[center, center]:
+        return 0
+
+    queue_r = np.empty(grid_size * grid_size, dtype=np.int32)
+    queue_c = np.empty(grid_size * grid_size, dtype=np.int32)
+    visited = np.zeros((grid_size, grid_size), dtype=np.uint8)
+
+    queue_r[0] = center
+    queue_c[0] = center
+    visited[center, center] = 1
+    head = 0
+    tail = 1
+    area = 0
+
+    while head < tail:
+        r = queue_r[head]
+        c_ = queue_c[head]
+        head += 1
+        area += 1
+
+        if r > 0 and not visited[r - 1, c_] and bw[r - 1, c_]:
+            visited[r - 1, c_] = 1
+            queue_r[tail] = r - 1
+            queue_c[tail] = c_
+            tail += 1
+        if r < grid_size - 1 and not visited[r + 1, c_] and bw[r + 1, c_]:
+            visited[r + 1, c_] = 1
+            queue_r[tail] = r + 1
+            queue_c[tail] = c_
+            tail += 1
+        if c_ > 0 and not visited[r, c_ - 1] and bw[r, c_ - 1]:
+            visited[r, c_ - 1] = 1
+            queue_r[tail] = r
+            queue_c[tail] = c_ - 1
+            tail += 1
+        if c_ < grid_size - 1 and not visited[r, c_ + 1] and bw[r, c_ + 1]:
+            visited[r, c_ + 1] = 1
+            queue_r[tail] = r
+            queue_c[tail] = c_ + 1
+            tail += 1
+
+    return area
+
+
+def precompute_base_grid(plane_radius, plane_resolution):
+    """Precompute the XY plane grid (identical for every cross-section)."""
+    global _base_grid_xyz, _grid_size
+    coords = np.arange(-plane_radius, plane_radius + plane_resolution, plane_resolution)
+    x, y = np.meshgrid(coords, coords)
+    z = np.zeros_like(x)
+    _base_grid_xyz = np.ascontiguousarray(
+        np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1)
+    )
+    _grid_size = len(coords)
+
+
+def sample_cross_section_fast(volume_bool, point, tangent_vec, plane_resolution):
+    """
+    Sample perpendicular cross-section area using fused Numba kernel.
+
+    Single compiled function handles rotation + interpolation + flood-fill
+    with no Python round-trips and no intermediate array allocations.
+    """
+    area = _sample_and_flood_fill(
+        volume_bool, _base_grid_xyz, _grid_size,
+        point[0], point[1], point[2],
+        tangent_vec[0], tangent_vec[1], tangent_vec[2],
+        plane_resolution
+    )
+    if area == 0:
+        return None
+    return area * (plane_resolution ** 2)
 
 
 def init_worker():
@@ -129,33 +276,40 @@ def process_single_axon(args):
             return None
 
         min_coords, max_coords = bbox
-
-        # Add padding for cross-section sampling
-        padding = int(plane_radius) + 5
         vol_shape = np.array(_shared_volume.shape)
-        min_padded = np.maximum(min_coords - padding, 0)
-        max_padded = np.minimum(max_coords + padding, vol_shape)
 
-        # Extract subvolume and create binary mask
-        subvol = _shared_volume[
-            min_padded[0]:max_padded[0],
-            min_padded[1]:max_padded[1],
-            min_padded[2]:max_padded[2]
+        # Tight crop for skeleton extraction (small padding for boundary distance)
+        skel_pad = 5
+        min_tight = np.maximum(min_coords - skel_pad, 0)
+        max_tight = np.minimum(max_coords + skel_pad, vol_shape)
+
+        subvol_tight = _shared_volume[
+            min_tight[0]:max_tight[0],
+            min_tight[1]:max_tight[1],
+            min_tight[2]:max_tight[2]
         ]
+        cropped_tight = (subvol_tight == axon_label)
 
-        cropped = (subvol == axon_label).astype(np.uint8)
-
-        local_coords = np.argwhere(cropped)
-        if len(local_coords) < 100:
+        # Use count_nonzero instead of argwhere — avoids allocating coordinate array
+        n_voxels = np.count_nonzero(cropped_tight)
+        if n_voxels < 100:
             return None
 
-        # Extract skeleton (optionally downsampled)
+        # Extract skeleton on tight crop (FMM runs on much smaller volume)
         if skeleton_downsample > 1:
-            cropped_ds = zoom(cropped, 1.0 / skeleton_downsample, order=0)
+            cropped_ds = cropped_tight[::skeleton_downsample, ::skeleton_downsample, ::skeleton_downsample]
             skel_segments = extract_skeleton(cropped_ds, verbose=False, path_method=path_method)
             skel_segments = [seg * skeleton_downsample for seg in skel_segments]
         else:
-            skel_segments = extract_skeleton(cropped, verbose=False, path_method=path_method)
+            skel_segments = extract_skeleton(cropped_tight, verbose=False, path_method=path_method)
+
+        # Wide crop for cross-section sampling (needs plane_radius padding)
+        sampling_pad = int(plane_radius) + 5
+        min_padded = np.maximum(min_coords - sampling_pad, 0)
+        max_padded = np.minimum(max_coords + sampling_pad, vol_shape)
+
+        # Offset to convert skeleton coords from tight crop to wide crop space
+        tight_to_wide_offset = min_tight - min_padded
 
         if len(skel_segments) == 0:
             return None
@@ -170,8 +324,8 @@ def process_single_axon(args):
         if len(main_skel) < 3:
             return None
 
-        # Validate skeleton points are inside the axon
-        valid_mask = validate_skeleton_points(main_skel, cropped)
+        # Validate skeleton points are inside the axon (in tight crop space)
+        valid_mask = validate_skeleton_points(main_skel, cropped_tight)
         if not np.any(valid_mask):
             return None
 
@@ -184,6 +338,9 @@ def process_single_axon(args):
 
         if len(main_skel) < 3:
             return None
+
+        # Convert skeleton from tight crop to wide crop coordinate space
+        main_skel = main_skel.astype(np.float64) + tight_to_wide_offset
 
         # Compute arc length and resample
         voxel_size_tuple = (vz, vy, vx)
@@ -201,31 +358,35 @@ def process_single_axon(args):
         # Compute tangent vectors
         tangent_vecs = unit_tangent_vector(sampled_skel)
 
-        # Pre-convert volume to float64 for interpolation
-        volume_float = cropped.astype(np.float64)
+        # Extract wide crop for cross-section sampling
+        subvol_wide = _shared_volume[
+            min_padded[0]:max_padded[0],
+            min_padded[1]:max_padded[1],
+            min_padded[2]:max_padded[2]
+        ]
+        cropped_wide = (subvol_wide == axon_label)
+
+        # Precompute constants outside the inner loop
+        voxel_scale = np.array([vz, vy, vx])
+        inv_sqrt_pi = 1.0 / np.sqrt(np.pi)
 
         # Sample cross-sections and compute radii
         radii = []
         valid_skel_points = []
 
         for point, tangent in zip(sampled_skel, tangent_vecs):
-            if np.allclose(tangent, 0):
+            if tangent[0] == 0 and tangent[1] == 0 and tangent[2] == 0:
                 continue
 
-            area = sample_perpendicular_cross_section(
-                cropped, point, tangent,
-                plane_radius=plane_radius,
-                plane_resolution=plane_resolution,
-                volume_float=volume_float
+            area = sample_cross_section_fast(
+                cropped_wide, point, tangent, plane_resolution
             )
 
             if area is not None and area > 0:
-                radius_voxels = np.sqrt(area / np.pi)
-                radius_um = radius_voxels * voxel_geom_mean
+                radius_um = np.sqrt(area) * inv_sqrt_pi * voxel_geom_mean
 
                 radii.append(radius_um)
-                original_point = point + min_padded
-                valid_skel_points.append(original_point * np.array([vz, vy, vx]))
+                valid_skel_points.append((point + min_padded) * voxel_scale)
 
         if len(radii) < 2:
             return None
@@ -279,6 +440,10 @@ def compute_fiber_profiles(mat_file: Path,
     """
     logger.info("Warming up Numba JIT compilation...")
     skeleton_warmup()
+    # Warmup fused kernel JIT
+    _dummy_vol = np.ones((3, 3, 3), dtype=np.bool_)
+    _dummy_grid = np.zeros((1, 3), dtype=np.float64)
+    _sample_and_flood_fill(_dummy_vol, _dummy_grid, 1, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0)
 
     # Load volume and metadata (voxel size from override, JSON, or default)
     logger.info(f"Loading {mat_file}")
@@ -299,12 +464,14 @@ def compute_fiber_profiles(mat_file: Path,
 
     logger.info(f"Max axon radius: {max_axon_radius_um:.2f} μm = {plane_radius_voxels} voxels")
 
-    # Compute bounding boxes
+    # Precompute base grid for cross-section sampling (reused for every sample point)
+    precompute_base_grid(plane_radius_voxels, plane_resolution)
+
+    # Compute bounding boxes (also gives us all labels — no need for np.unique)
     bboxes = compute_bounding_boxes(volume)
 
-    # Get unique axon labels
-    axon_labels = np.unique(volume)
-    axon_labels = axon_labels[axon_labels > 0]
+    # Get axon labels from bounding boxes (avoids expensive np.unique on full volume)
+    axon_labels = np.array(sorted(bboxes.keys()))
 
     logger.info(f"Found {len(axon_labels)} axons")
 
