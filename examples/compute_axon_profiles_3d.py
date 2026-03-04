@@ -314,51 +314,12 @@ def process_single_axon(args):
         if len(skel_segments) == 0:
             return None
 
-        # Use the longest skeleton segment
-        if len(skel_segments) == 1:
-            main_skel = skel_segments[0]
-        else:
-            lengths = [len(seg) for seg in skel_segments]
-            main_skel = skel_segments[np.argmax(lengths)]
+        # Sort segments by length (longest first = main trunk)
+        seg_lengths = [len(seg) for seg in skel_segments]
+        seg_order = np.argsort(seg_lengths)[::-1]
+        skel_segments = [skel_segments[i] for i in seg_order]
 
-        if len(main_skel) < 3:
-            return None
-
-        # Validate skeleton points are inside the axon (in tight crop space)
-        valid_mask = validate_skeleton_points(main_skel, cropped_tight)
-        if not np.any(valid_mask):
-            return None
-
-        # Keep only valid skeleton points
-        if not np.all(valid_mask):
-            segment_range = find_longest_contiguous_segment(valid_mask)
-            if segment_range is None or segment_range[1] - segment_range[0] < 3:
-                return None
-            main_skel = main_skel[segment_range[0]:segment_range[1]]
-
-        if len(main_skel) < 3:
-            return None
-
-        # Convert skeleton from tight crop to wide crop coordinate space
-        main_skel = main_skel.astype(np.float64) + tight_to_wide_offset
-
-        # Compute arc length and resample
-        voxel_size_tuple = (vz, vy, vx)
-        cumulative_length = compute_arc_length(main_skel, voxel_size_tuple)
-        total_length = cumulative_length[-1]
-
-        if total_length < step_size:
-            sampled_skel = main_skel
-        else:
-            sampled_skel = resample_curve_by_arc_length(main_skel, step_size, voxel_size_tuple)
-
-        if len(sampled_skel) < 2:
-            return None
-
-        # Compute tangent vectors
-        tangent_vecs = unit_tangent_vector(sampled_skel)
-
-        # Extract wide crop for cross-section sampling
+        # Extract wide crop for cross-section sampling (shared across all segments)
         subvol_wide = _shared_volume[
             min_padded[0]:max_padded[0],
             min_padded[1]:max_padded[1],
@@ -369,43 +330,110 @@ def process_single_axon(args):
         # Precompute constants outside the inner loop
         voxel_scale = np.array([vz, vy, vx])
         inv_sqrt_pi = 1.0 / np.sqrt(np.pi)
+        voxel_size_tuple_local = (vz, vy, vx)
 
-        # Sample cross-sections and compute radii
-        radii = []
-        valid_skel_points = []
+        # Process all segments (main trunk first, then branches)
+        main_result = None
+        main_sampled_skel = None  # Store main trunk skeleton for proximity filtering
+        branch_radii_list = []
+        proximity_threshold_sq = plane_radius ** 2  # squared distance in voxel space
 
-        for point, tangent in zip(sampled_skel, tangent_vecs):
-            if tangent[0] == 0 and tangent[1] == 0 and tangent[2] == 0:
+        for skel_seg in skel_segments:
+            if len(skel_seg) < 3:
                 continue
 
-            area = sample_cross_section_fast(
-                cropped_wide, point, tangent, plane_resolution
-            )
+            # Validate skeleton points are inside the axon (in tight crop space)
+            valid_mask = validate_skeleton_points(skel_seg, cropped_tight)
+            if not np.any(valid_mask):
+                continue
 
-            if area is not None and area > 0:
-                radius_um = np.sqrt(area) * inv_sqrt_pi * voxel_geom_mean
+            # Keep only valid skeleton points
+            if not np.all(valid_mask):
+                segment_range = find_longest_contiguous_segment(valid_mask)
+                if segment_range is None or segment_range[1] - segment_range[0] < 3:
+                    continue
+                skel_seg = skel_seg[segment_range[0]:segment_range[1]]
 
-                radii.append(radius_um)
-                valid_skel_points.append((point + min_padded) * voxel_scale)
+            if len(skel_seg) < 3:
+                continue
 
-        if len(radii) < 2:
+            # Convert skeleton from tight crop to wide crop coordinate space
+            skel_seg = skel_seg.astype(np.float64) + tight_to_wide_offset
+
+            # Compute arc length and resample
+            cumulative_length = compute_arc_length(skel_seg, voxel_size_tuple_local)
+            seg_total_length = cumulative_length[-1]
+
+            if seg_total_length < step_size:
+                sampled_skel = skel_seg
+            else:
+                sampled_skel = resample_curve_by_arc_length(skel_seg, step_size, voxel_size_tuple_local)
+
+            if len(sampled_skel) < 2:
+                continue
+
+            # For branches: skip points near the main trunk (junction zone)
+            if main_sampled_skel is not None:
+                diffs = sampled_skel[:, np.newaxis, :] - main_sampled_skel[np.newaxis, :, :]
+                min_dist_sq = np.min(np.sum(diffs ** 2, axis=2), axis=1)
+                far_mask = min_dist_sq > proximity_threshold_sq
+                sampled_skel = sampled_skel[far_mask]
+                if len(sampled_skel) < 2:
+                    continue
+
+            # Compute tangent vectors
+            tangent_vecs = unit_tangent_vector(sampled_skel)
+
+            # Sample cross-sections and compute radii
+            radii = []
+            valid_skel_points = []
+
+            for point, tangent in zip(sampled_skel, tangent_vecs):
+                if tangent[0] == 0 and tangent[1] == 0 and tangent[2] == 0:
+                    continue
+
+                area = sample_cross_section_fast(
+                    cropped_wide, point, tangent, plane_resolution
+                )
+
+                if area is not None and area > 0:
+                    radius_um = np.sqrt(area) * inv_sqrt_pi * voxel_geom_mean
+                    radii.append(radius_um)
+                    valid_skel_points.append((point + min_padded) * voxel_scale)
+
+            if len(radii) < 2:
+                continue
+
+            radii = np.array(radii)
+            radii = filter_radius_outliers(radii, window_size=5, threshold=3.0)
+
+            if main_result is None:
+                # Main trunk (longest segment)
+                main_sampled_skel = sampled_skel
+                skel_coords = np.array(valid_skel_points)
+                main_result = {
+                    'label': axon_label,
+                    'radii_um': radii,
+                    'skeleton_um': skel_coords,
+                    'n_points': len(radii),
+                    'mean_radius_um': np.mean(radii),
+                    'std_radius_um': np.std(radii),
+                    'length_um': seg_total_length,
+                }
+            else:
+                # Branch segment — cap at main trunk max to catch residual junction artifacts
+                max_main_r = np.max(main_result['radii_um'])
+                radii = radii[radii <= max_main_r]
+                if len(radii) >= 2:
+                    branch_radii_list.append(radii)
+
+        if main_result is None:
             return None
 
-        radii = np.array(radii)
-        skel_coords = np.array(valid_skel_points)
+        # Attach branch radii to main result
+        main_result['branch_radii_um'] = branch_radii_list
 
-        # Filter outliers
-        radii = filter_radius_outliers(radii, window_size=5, threshold=3.0)
-
-        return {
-            'label': axon_label,
-            'radii_um': radii,
-            'skeleton_um': skel_coords,
-            'n_points': len(radii),
-            'mean_radius_um': np.mean(radii),
-            'std_radius_um': np.std(radii),
-            'length_um': total_length
-        }
+        return main_result
 
     except Exception as e:
         logger.error(f"Axon {axon_label}: Processing failed - {e}\n{traceback.format_exc()}")
@@ -530,7 +558,13 @@ def compute_fiber_profiles(mat_file: Path,
     lengths = np.array([r['length_um'] for r in results])
     radii_profiles = np.array([r['radii_um'] for r in results], dtype=object)
     skeleton_coords = np.array([r['skeleton_um'] for r in results], dtype=object)
-    all_radii = np.concatenate([r['radii_um'] for r in results])
+
+    # Pool radii: main trunk only (wo branches) and all segments (w branches)
+    all_radii_wo = np.concatenate([r['radii_um'] for r in results])
+    all_radii_w_parts = [r['radii_um'] for r in results]
+    for r in results:
+        all_radii_w_parts.extend(r['branch_radii_um'])
+    all_radii_w = np.concatenate(all_radii_w_parts)
 
     np.savez(
         output_file,
@@ -541,7 +575,8 @@ def compute_fiber_profiles(mat_file: Path,
         lengths_um=lengths,
         radii_profiles_um=radii_profiles,
         skeleton_coords_um=skeleton_coords,
-        all_radii_um=all_radii,
+        all_radii_wo_branches_um=all_radii_wo,
+        all_radii_w_branches_um=all_radii_w,
         voxel_size_um=np.array(voxel_size_tuple),
         max_axon_radius_um=max_axon_radius_um,
         plane_radius_voxels=plane_radius_voxels,
@@ -553,16 +588,21 @@ def compute_fiber_profiles(mat_file: Path,
     logger.info(f"Saved results to {output_file}")
 
     # Summary statistics
+    n_branch_radii = len(all_radii_w) - len(all_radii_wo)
     logger.info("\nSummary Statistics:")
     logger.info(f"  Total axons processed: {len(results)}")
-    logger.info(f"  Total radius samples: {len(all_radii)}")
+    logger.info(f"  Radius samples (main trunk): {len(all_radii_wo)}")
+    logger.info(f"  Radius samples (branches): {n_branch_radii}")
+    logger.info(f"  Radius samples (total): {len(all_radii_w)}")
     logger.info(f"  Mean axon length: {np.mean(lengths):.2f} ± {np.std(lengths):.2f} μm")
     logger.info(f"  Mean points per axon: {np.mean(n_points):.1f}")
-    logger.info(f"  Mean radius: {np.mean(all_radii):.3f} ± {np.std(all_radii):.3f} μm")
-    logger.info(f"  Median radius: {np.median(all_radii):.3f} μm")
 
-    r_eff = (np.mean(all_radii**6) / np.mean(all_radii**2)) ** 0.25
-    logger.info(f"  Effective radius (r_eff): {r_eff:.3f} μm")
+    r_eff_wo = (np.mean(all_radii_wo**6) / np.mean(all_radii_wo**2)) ** 0.25
+    r_eff_w = (np.mean(all_radii_w**6) / np.mean(all_radii_w**2)) ** 0.25
+    logger.info(f"  r_eff (wo branches): {r_eff_wo:.3f} μm")
+    logger.info(f"  r_eff (w branches):  {r_eff_w:.3f} μm")
+    logger.info(f"  r̄ (wo branches): {np.mean(all_radii_wo):.3f} μm")
+    logger.info(f"  r̄ (w branches):  {np.mean(all_radii_w):.3f} μm")
 
 
 def batch_compute_fiber_profiles(
