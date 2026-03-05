@@ -11,7 +11,7 @@ Creates a combined figure with:
   with per-subject scatter points
 
 Usage:
-    python examples/fit_philip_cc_distributions.py \
+    python scripts/figures/fit_philip_cc_distributions.py \
         --lm-data data/raw_LM \
         --em-data data/raw_philip/CC_anonymized.csv \
         --output fig/lm_vs_em_distribution_fits.png
@@ -36,7 +36,11 @@ from matplotlib.legend_handler import HandlerBase
 from scipy import stats
 from scipy.optimize import OptimizeWarning
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry import get_plot_settings, style_axis
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

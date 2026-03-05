@@ -6,7 +6,7 @@ Generates frames showing how axon radii vary along the bundle, with the image
 cropped to the ROI containing the population of interest.
 
 Usage:
-    python examples/create_slice_movie.py \
+    python scripts/exploratory/create_slice_movie.py \
         data/processed/LM/sham_25_ipsi_axon_profiles.npz \
         fig/slice_movie \
         --mat-file data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \
@@ -362,7 +362,7 @@ def main():
         epilog="""
 Examples:
     # Create movie for CG population
-    python examples/create_slice_movie.py \\
+    python scripts/exploratory/create_slice_movie.py \\
         data/processed/LM/sham_25_ipsi_axon_profiles.npz \\
         fig/slice_movie \\
         --mat-file data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\

@@ -20,13 +20,13 @@ Visualization (optional):
 
 Usage:
     # Create/update metadata only (no visualization)
-    python examples/prepare_hm_metadata.py data/raw
+    python scripts/processing/prepare_hm_metadata.py data/raw
 
     # Create/update metadata with orientation visualization
-    python examples/prepare_hm_metadata.py data/raw --visualize fig/hm_orientation.png
+    python scripts/processing/prepare_hm_metadata.py data/raw --visualize fig/hm_orientation.png
 
     # Skip orientation analysis (only write voxel size)
-    python examples/prepare_hm_metadata.py data/raw --no-orientation
+    python scripts/processing/prepare_hm_metadata.py data/raw --no-orientation
 """
 
 import argparse
@@ -39,7 +39,11 @@ import numpy as np
 from skimage.measure import regionprops
 
 # Import from axonometry library
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry.io import load_volume_with_metadata, resample_to_isotropic
 
 

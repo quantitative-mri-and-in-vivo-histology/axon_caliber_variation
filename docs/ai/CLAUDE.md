@@ -75,7 +75,12 @@ fig/                        # Generated figures and plots
 │
 src/                        # Python source code for preprocessing, analysis, and visualization
 │
-examples/                   # Example scripts for batch processing and visualization
+scripts/                    # Analysis, figure generation, and exploratory scripts
+│   ├── processing/         # Data processing and preparation
+│   ├── figures/            # Manuscript figure generation
+│   ├── visualization/      # Neuroglancer and interactive visualization
+│   ├── exploratory/        # Exploratory analyses (spatial_correlations/, 2d_vs_3d/, distribution_fitting/)
+│   └── benchmarks/         # Performance benchmarks
 ```
 
 **Naming Convention**: When using `--organize-by-microscopy` flag:
@@ -157,7 +162,7 @@ Fit parametric distributions to axon radius histograms following the methodology
 
 *Reference*: Sepehrband F, et al. (2016). "Towards higher sensitivity and stability of axon diameter estimation with diffusion-weighted MRI." NMR Biomed. 29(3):293-308. PMID: 27303273
 
-**Combined Distribution Fitting** ([fit_combined_distributions.py](examples/fit_combined_distributions.py))
+**Combined Distribution Fitting** ([fit_combined_distributions.py](scripts/figures/fit_combined_distributions.py))
 
 Compares distribution fits and radius estimation bias across Human CC and Rat WM datasets:
 
@@ -174,13 +179,13 @@ Compares distribution fits and radius estimation bias across Human CC and Rat WM
 
 *Usage*:
 ```bash
-python examples/fit_combined_distributions.py \
+python scripts/figures/fit_combined_distributions.py \
     --human-data data/raw_LM \
     --rat-data data/processed/LM \
     --output fig/combined_distribution_fits.png
 
 # With EM correction for human data:
-python examples/fit_combined_distributions.py \
+python scripts/figures/fit_combined_distributions.py \
     --human-data data/raw_LM \
     --rat-data data/processed/LM \
     --output fig/combined_distribution_fits_em.png \
@@ -329,7 +334,7 @@ Opens Neuroglancer viewer with multi-resolution support.
 
 ### Plot Settings
 
-All plot scripts in `examples/` must use centralized plot settings from `config/plot_settings.yaml` via the `axonometry` module. This ensures consistent styling across all figures.
+All plot scripts in `scripts/` must use centralized plot settings from `config/plot_settings.yaml` via the `axonometry` module. This ensures consistent styling across all figures.
 
 **IMPORTANT: Always respect the color scheme guidelines defined in `config/plot_settings.yaml`.**
 

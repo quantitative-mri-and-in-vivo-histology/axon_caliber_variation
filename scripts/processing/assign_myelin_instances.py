@@ -36,7 +36,11 @@ import numpy as np
 import scipy.io as sio
 
 # Add parent directory to path for axonometry import
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 
 from axonometry.morphometry import assign_myelin_to_axons
 from axonometry.io import load_mat_volume

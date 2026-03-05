@@ -7,7 +7,7 @@ Creates a 1×2 figure showing:
 - Right: 2D mid-slice distribution (single slice from center)
 
 Usage:
-    python examples/plot_2d_3d_example_histograms.py \
+    python scripts/exploratory/2d_vs_3d/plot_2d_3d_example_histograms.py \
         --data-dir data/processed/LM \
         --output fig/2d_3d_example_histograms.png
 """
@@ -21,7 +21,11 @@ from typing import Set, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry import get_plot_settings, style_axis
 
 settings = get_plot_settings()

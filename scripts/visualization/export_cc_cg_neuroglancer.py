@@ -19,12 +19,12 @@ Output structure:
 
 Example usage:
     # Single file
-    python examples/export_cc_cg_neuroglancer.py \\
+    python scripts/visualization/export_cc_cg_neuroglancer.py \\
         data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\
         data/processed/neuroglancer
 
     # Batch processing with glob
-    python examples/export_cc_cg_neuroglancer.py \\
+    python scripts/visualization/export_cc_cg_neuroglancer.py \\
         "data/raw/**/LM*_myelinated_axons.mat" \\
         data/processed/neuroglancer
 """
@@ -721,12 +721,12 @@ def main():
         epilog="""
 Examples:
     # Single file
-    python examples/export_cc_cg_neuroglancer.py \\
+    python scripts/visualization/export_cc_cg_neuroglancer.py \\
         data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\
         data/processed/neuroglancer
 
     # Batch processing with glob
-    python examples/export_cc_cg_neuroglancer.py \\
+    python scripts/visualization/export_cc_cg_neuroglancer.py \\
         "data/raw/**/LM*_myelinated_axons.mat" \\
         data/processed/neuroglancer
         """

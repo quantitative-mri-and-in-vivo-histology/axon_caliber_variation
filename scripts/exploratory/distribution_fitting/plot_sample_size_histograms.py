@@ -7,7 +7,7 @@ Creates a 1×2 figure showing:
 - Right: Subsample of 10³ axons from the same ROI
 
 Usage:
-    python examples/plot_sample_size_histograms.py \
+    python scripts/exploratory/distribution_fitting/plot_sample_size_histograms.py \
         --human-data data/raw_LM \
         --output fig/sample_size_histograms.png
 """
@@ -20,7 +20,11 @@ from typing import Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry import get_plot_settings, style_axis
 
 settings = get_plot_settings()

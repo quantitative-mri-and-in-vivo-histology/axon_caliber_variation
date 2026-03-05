@@ -7,15 +7,15 @@ via HTTP for multi-resolution visualization in Neuroglancer.
 
 Example usage:
     # View exported CC/CG populations (4-panel with 3D)
-    python examples/visualize_precomputed_neuroglancer.py \
+    python scripts/visualization/visualize_precomputed_neuroglancer.py \
         data/processed/neuroglancer/LM_25_ipsi
 
     # 3D-only view
-    python examples/visualize_precomputed_neuroglancer.py \
+    python scripts/visualization/visualize_precomputed_neuroglancer.py \
         data/processed/neuroglancer/LM_25_ipsi --layout 3d
 
     # With grayscale overlay
-    python examples/visualize_precomputed_neuroglancer.py \
+    python scripts/visualization/visualize_precomputed_neuroglancer.py \
         data/processed/neuroglancer/LM_25_ipsi \
         --grayscale data/raw/Sham_25_ipsi/LM_25_ipsi_grayscale.h5
 """
@@ -424,16 +424,16 @@ def main():
         epilog="""
 Examples:
     # View exported CC/CG populations
-    python examples/visualize_precomputed_neuroglancer.py \\
+    python scripts/visualization/visualize_precomputed_neuroglancer.py \\
         data/processed/neuroglancer/LM_25_ipsi
 
     # With grayscale overlay
-    python examples/visualize_precomputed_neuroglancer.py \\
+    python scripts/visualization/visualize_precomputed_neuroglancer.py \\
         data/processed/neuroglancer/LM_25_ipsi \\
         --grayscale data/raw/Sham_25_ipsi/LM_25_ipsi_grayscale.h5
 
     # View remote precomputed URLs
-    python examples/visualize_precomputed_neuroglancer.py \\
+    python scripts/visualization/visualize_precomputed_neuroglancer.py \\
         --url precomputed://https://open-neurodata.s3.amazonaws.com/collman/collman15v2/annotation
         """
     )

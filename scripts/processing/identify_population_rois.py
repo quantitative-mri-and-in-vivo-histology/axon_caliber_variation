@@ -12,7 +12,7 @@ The separation plane is placed at the midpoint between population centroids,
 with a configurable margin to create non-overlapping ROIs.
 
 Example usage:
-    python examples/identify_population_rois.py \\
+    python scripts/processing/identify_population_rois.py \\
         data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\
         data/processed/LM \\
         --min-length 50.0 \\
@@ -619,12 +619,12 @@ def main():
         epilog="""
 Examples:
     # Single file
-    python examples/identify_population_rois.py \\
+    python scripts/processing/identify_population_rois.py \\
         data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\
         data/processed/LM
 
     # Batch processing
-    python examples/identify_population_rois.py \\
+    python scripts/processing/identify_population_rois.py \\
         "data/raw/**/LM*_myelinated_axons.mat" \\
         data/processed/LM
 

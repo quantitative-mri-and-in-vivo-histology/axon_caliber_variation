@@ -12,7 +12,7 @@ Sample sizes: 10², 10³, 10⁴, 10⁵, 10⁶
 Subsamples: N=50 (configurable)
 
 Usage:
-    python examples/plot_sample_size_effect.py \
+    python scripts/exploratory/distribution_fitting/plot_sample_size_effect.py \
         --human-data data/raw_LM \
         --rat-data data/processed/LM \
         --output fig/sample_size_effect.png
@@ -33,7 +33,11 @@ from scipy import stats
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import OptimizeWarning
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry import get_plot_settings, add_panel_labels
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

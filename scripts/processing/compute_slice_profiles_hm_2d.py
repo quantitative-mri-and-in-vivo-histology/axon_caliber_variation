@@ -11,7 +11,7 @@ This script:
 6. Outputs per-slice histograms as NPZ file
 
 This is a refactored version of src/analyze_effective_radius_isotropic.py,
-cleaned up for the examples/ directory with:
+cleaned up for the scripts/ directory with:
 - Reusable axonometry library functions
 - Batch processing support (glob patterns)
 - Cleaner architecture for future extensibility
@@ -32,7 +32,11 @@ from skimage.measure import regionprops
 from tqdm import tqdm
 
 # Import from axonometry library
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry.io import load_volume_with_metadata, resample_to_isotropic, construct_output_path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

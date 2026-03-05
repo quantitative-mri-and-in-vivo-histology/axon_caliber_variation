@@ -18,7 +18,7 @@ are spatially correlated:
    - Identifies dominant wavelengths in the spatial pattern
 
 Usage:
-    python examples/analyze_spatial_correlation_2d.py \
+    python scripts/exploratory/spatial_correlations/analyze_spatial_correlation_2d.py \
         data/processed/LM/sham_25_ipsi_axon_profiles.npz \
         fig/spatial_correlation_2d \
         --mat-file data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \
@@ -42,7 +42,11 @@ from skimage.measure import regionprops
 from tqdm import tqdm
 
 # Import from axonometry library
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry import get_plot_settings
 from axonometry.io import load_volume_with_metadata, resample_to_isotropic
 
@@ -843,14 +847,14 @@ def main():
         epilog="""
 Examples:
     # Analyze CC population
-    python examples/analyze_spatial_correlation_2d.py \\
+    python scripts/exploratory/spatial_correlations/analyze_spatial_correlation_2d.py \\
         data/processed/LM/sham_25_ipsi_axon_profiles.npz \\
         fig/spatial_correlation_2d \\
         --mat-file data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\
         --population cc
 
     # Analyze both populations
-    python examples/analyze_spatial_correlation_2d.py \\
+    python scripts/exploratory/spatial_correlations/analyze_spatial_correlation_2d.py \\
         data/processed/LM/sham_25_ipsi_axon_profiles.npz \\
         fig/spatial_correlation_2d \\
         --mat-file data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\

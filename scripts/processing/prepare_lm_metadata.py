@@ -8,7 +8,7 @@ For each LM_*.mat file in data/raw/, creates a companion .json file with:
 
 Usage:
     # Create/update metadata files
-    python examples/prepare_lm_metadata.py data/raw
+    python scripts/processing/prepare_lm_metadata.py data/raw
 """
 
 import argparse

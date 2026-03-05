@@ -16,7 +16,7 @@ Creates a 1x2 figure showing 2D vs 3D scatter plots:
 Median and IQR are computed over Monte Carlo iterations.
 
 Usage:
-    python examples/plot_montecarlo_2d_vs_3d_correlation.py \
+    python scripts/exploratory/2d_vs_3d/plot_montecarlo_2d_vs_3d_correlation.py \
         --data-dir data/processed/LM \
         --output fig/montecarlo_2d_vs_3d_correlation.png \
         --n-iterations 100

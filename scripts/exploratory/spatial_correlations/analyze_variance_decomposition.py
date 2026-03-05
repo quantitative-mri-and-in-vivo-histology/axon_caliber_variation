@@ -12,7 +12,7 @@ This follows the standard variance decomposition:
 Results are computed per-region (CC, CG) and pooled across all data.
 
 Usage:
-    python examples/analyze_variance_decomposition.py \
+    python scripts/exploratory/spatial_correlations/analyze_variance_decomposition.py \
         --data-dir data/processed/LM \
         --output fig/variance_decomposition.svg
 """
@@ -27,7 +27,11 @@ from typing import Dict, List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Find repo root (contains pyproject.toml)
+_root = Path(__file__).resolve().parent
+while not (_root / "pyproject.toml").exists():
+    _root = _root.parent
+sys.path.insert(0, str(_root))
 from axonometry import get_plot_settings, style_axis, add_panel_labels
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -353,7 +357,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python examples/analyze_variance_decomposition.py \\
+  python scripts/exploratory/spatial_correlations/analyze_variance_decomposition.py \\
       --data-dir data/processed/LM \\
       --output fig/variance_decomposition.svg
         """
