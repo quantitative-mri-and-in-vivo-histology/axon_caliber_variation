@@ -57,7 +57,8 @@ def load_axon_cv_data(npz_file: Path, min_length: float = 20.0) -> Tuple[np.ndar
 
     Returns:
         Tuple of (mean_radii, cv_values, std_values, slowdown_factors, sample_name, profiles_dict)
-        slowdown_factor = harmonic_mean(r) / arithmetic_mean(r) for each axon
+        slowdown_factor = v_eff / v(r_bar) for each axon, where v(r) = r*sqrt(ln(1 + d_m/r)),
+        d_m = 2*r_bar/3 (constant myelin thickness with g_bar=0.6)
         profiles_dict contains 'radii_profiles', 'lengths', 'cv', 'skeleton_coords' for representative axon selection
     """
     data = np.load(npz_file, allow_pickle=True)
@@ -73,16 +74,24 @@ def load_axon_cv_data(npz_file: Path, min_length: float = 20.0) -> Tuple[np.ndar
         cv = std_radii / mean_radii
         cv = np.where(np.isfinite(cv) & (mean_radii > 0), cv, np.nan)
 
-    # Compute slowdown factor = harmonic_mean / arithmetic_mean for each axon
-    # Harmonic mean captures that conduction time is dominated by narrow regions
+    # Compute conduction velocity slowdown factor per axon
+    # v(r) ∝ r * sqrt(ln(1 + d_m/r)) where d_m = 2*r_bar/3 (constant myelin thickness, g_bar=0.6)
+    # v_eff = <1/v(r)>^{-1}  (harmonic mean of velocity along axon)
+    # slowdown = v_eff / v(r_bar)  (reduction relative to ideal uniform axon)
+    g_bar = 0.6
     slowdown = np.zeros(len(radii_profiles))
     for i, profile in enumerate(radii_profiles):
         profile = np.array(profile)
         valid = profile > 0
         if np.sum(valid) > 0:
-            harmonic_mean = len(profile[valid]) / np.sum(1.0 / profile[valid])
-            arith_mean = np.mean(profile[valid])
-            slowdown[i] = harmonic_mean / arith_mean if arith_mean > 0 else np.nan
+            r = profile[valid]
+            r_bar = np.mean(r)
+            d_m = r_bar * (1 - g_bar) / g_bar  # = 2*r_bar/3 for g_bar=0.6
+            # v(r) = r * sqrt(ln(1 + d_m/r))
+            v = r * np.sqrt(np.log(1.0 + d_m / r))
+            v_eff = len(v) / np.sum(1.0 / v)  # harmonic mean of v
+            v_ideal = r_bar * np.sqrt(np.log(1.0 + d_m / r_bar))
+            slowdown[i] = v_eff / v_ideal if v_ideal > 0 else np.nan
         else:
             slowdown[i] = np.nan
 
@@ -964,7 +973,7 @@ def plot_cv_vs_radius(
     # === (1,2): Slowdown factor vs axon size (continuous median + IQR) ===
     # Bin axons by mean radius and compute slowdown stats per bin
     # Two slowdown metrics:
-    #   1. Conduction velocity: harmonic_mean(r) / arithmetic_mean(r) - depends on radius
+    #   1. Conduction velocity: v_eff/v(r_bar) where v(r)=r*sqrt(ln(1+d_m/r))
     #   2. Axial diffusion: 1/(1+4*CV²) - depends on area (r²), so stronger effect
     n_size_bins = 30  # More bins for smoother curves
     size_bin_edges = np.linspace(0, x_max, n_size_bins + 1)
@@ -1144,23 +1153,17 @@ Examples:
     all_radii = np.concatenate([r for r, _, _, _, _, _ in all_data])
     all_slowdown = np.concatenate([s for _, _, _, s, _, _ in all_data])
 
-    # Compute conduction velocity (k=5.5, g=0.6)
-    k_velocity, g_ratio = 5.5, 0.6
-    fiber_diameter = 2 * all_radii / g_ratio
-    velocity = k_velocity * fiber_diameter
-    velocity_slow = velocity * all_slowdown
+    # Compute conduction velocity using v(r) = r*sqrt(ln(1 + d_m/r)), d_m = 2*r_bar/3
+    k_velocity, g_bar = 5.5, 0.6
 
     logger.info(f"Total axons: {len(all_cv)}")
     logger.info(f"Mean radius: {np.mean(all_radii):.3f} +/- {np.std(all_radii):.3f} um")
     logger.info(f"Mean CV: {np.mean(all_cv):.3f} +/- {np.std(all_cv):.3f}")
     logger.info(f"Median CV: {np.median(all_cv):.3f}")
-    logger.info(f"Slowdown factor (harmonic/arithmetic mean):")
+    logger.info(f"Slowdown factor (v_eff / v(r_bar), Rushton model):")
     logger.info(f"  Mean: {np.mean(all_slowdown):.4f}")
     logger.info(f"  Range: {np.min(all_slowdown):.4f} - {np.max(all_slowdown):.4f}")
-    logger.info(f"Conduction velocity (k={k_velocity}, g={g_ratio}):")
-    logger.info(f"  Ideal mean: {np.mean(velocity):.1f} +/- {np.std(velocity):.1f} m/s")
-    logger.info(f"  With slowdown: {np.mean(velocity_slow):.1f} +/- {np.std(velocity_slow):.1f} m/s")
-    logger.info(f"  Velocity reduction: {100*(1 - np.mean(velocity_slow)/np.mean(velocity)):.1f}%")
+    logger.info(f"  Mean velocity reduction: {100*(1 - np.mean(all_slowdown)):.1f}%")
     logger.info("=" * 60)
 
 
