@@ -1058,12 +1058,15 @@ def plot_cv_vs_radius(
     # Restore 3D axes position
     ax_vol.set_position([-0.42, -0.5, 0.55, 2.0])
 
-    # Save figure
+    # Save figure (SVG + PNG)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
+
+    png_file = output_file.with_suffix('.png')
+    plt.savefig(png_file, dpi=settings.figure['dpi'], bbox_inches='tight')
     plt.close()
 
-    logger.info(f"Saved plot to {output_file}")
+    logger.info(f"Saved plot to {output_file} and {png_file}")
 
 
 def main():
