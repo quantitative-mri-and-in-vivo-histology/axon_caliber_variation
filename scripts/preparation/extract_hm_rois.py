@@ -104,10 +104,11 @@ def extract_hm_volume(
     volume_aligned = np.transpose(volume, perm)
     logger.info(f"  After permutation: {volume_aligned.shape}")
 
-    # Permute voxel size accordingly (stored as Z, Y, X)
-    voxel_size_zyx = (voxel_size_xyz[2], voxel_size_xyz[1], voxel_size_xyz[0])
-    voxel_size_aligned = tuple(voxel_size_zyx[p] for p in perm)
-    logger.info(f"  Aligned voxel size (Z,Y,X): {voxel_size_aligned} um")
+    # Permute voxel size accordingly
+    # h5py reverses MATLAB axes, so the loaded array is in ~(X, Y, Z) order
+    # and voxel_size_xyz = (vx, vy, vz) already matches h5py axis order
+    voxel_size_aligned = tuple(voxel_size_xyz[p] for p in perm)
+    logger.info(f"  Aligned voxel size: {voxel_size_aligned} um")
 
     # Resample to isotropic voxels
     logger.info("\nResampling to isotropic voxels...")
@@ -141,9 +142,17 @@ def extract_hm_volume(
             else:
                 dset_name = list(f.keys())[0]
             grayscale = f[dset_name][:]
-        logger.info(f"  Grayscale shape: {grayscale.shape}, dtype: {grayscale.dtype}")
+        logger.info(f"  Grayscale raw shape: {grayscale.shape}, dtype: {grayscale.dtype}")
 
-        # Apply same permutation and resampling
+        # Remove singleton channel dims (some .h5 files are 4D)
+        grayscale = grayscale.squeeze()
+        logger.info(f"  Grayscale after squeeze: {grayscale.shape}")
+
+        # Align axes with segmentation: .h5 axes are reversed relative to .mat
+        grayscale = np.transpose(grayscale, (2, 1, 0))
+        logger.info(f"  Grayscale after axis alignment: {grayscale.shape}")
+
+        # Apply same permutation and resampling as segmentation
         grayscale_aligned = np.transpose(grayscale, perm)
         grayscale_iso, _ = resample_to_isotropic(grayscale_aligned, voxel_size_aligned)
         del grayscale, grayscale_aligned

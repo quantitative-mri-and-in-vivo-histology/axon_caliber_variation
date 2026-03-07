@@ -274,6 +274,15 @@ def compute_rois(
         'max_um': cg_max,
     }
 
+    # Validate ROI extents
+    for name, roi in list(rois.items()):
+        extent = [roi['max_um'][i] - roi['min_um'][i] for i in range(3)]
+        if any(e <= 0 for e in extent):
+            logger.warning(
+                f"  {name.upper()} ROI has zero/negative extent: {extent} um "
+                f"(separation at {separation_position_um:.1f} um with {margin_um:.1f} um margin)"
+            )
+
     return rois
 
 

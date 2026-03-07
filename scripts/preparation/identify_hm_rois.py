@@ -57,9 +57,13 @@ def compute_slice_eccentricity(slice_2d: np.ndarray, min_area: int = 10) -> Tupl
 def find_dominant_axis(
     volume: np.ndarray,
     min_area: int = 10,
+    n_samples: int = 10,
 ) -> Tuple[int, Dict]:
     """
     Find the dominant axis by comparing eccentricity along each axis.
+
+    Samples multiple evenly-spaced slices per axis (avoiding the edges)
+    and uses the median eccentricity for a robust estimate.
 
     The axis with the lowest eccentricity (most circular cross-sections)
     is the fiber direction.
@@ -67,6 +71,7 @@ def find_dominant_axis(
     Args:
         volume: 3D labeled volume (Z, Y, X), isotropic voxels
         min_area: Minimum area in pixels for valid axons
+        n_samples: Number of slices to sample per axis
 
     Returns:
         Tuple of (dominant_axis_index, per_axis_results)
@@ -75,21 +80,47 @@ def find_dominant_axis(
     results = {}
 
     for axis in range(3):
-        central_idx = volume.shape[axis] // 2
-        if axis == 0:
-            slice_2d = volume[central_idx, :, :]
-        elif axis == 1:
-            slice_2d = volume[:, central_idx, :]
-        else:
-            slice_2d = volume[:, :, central_idx]
+        n_slices = volume.shape[axis]
 
-        mean_ecc, n_axons = compute_slice_eccentricity(slice_2d, min_area)
+        # Sample evenly-spaced slices from the central 60% of the axis
+        margin = int(n_slices * 0.2)
+        n_actual = min(n_samples, n_slices - 2 * margin)
+        if n_actual < 1:
+            n_actual = 1
+            margin = n_slices // 2
+        indices = np.linspace(margin, n_slices - 1 - margin, n_actual, dtype=int)
+
+        slice_eccs = []
+        total_axons = 0
+        for idx in indices:
+            if axis == 0:
+                slice_2d = volume[idx, :, :]
+            elif axis == 1:
+                slice_2d = volume[:, idx, :]
+            else:
+                slice_2d = volume[:, :, idx]
+
+            mean_ecc, n_axons = compute_slice_eccentricity(slice_2d, min_area)
+            if n_axons > 0:
+                slice_eccs.append(mean_ecc)
+                total_axons += n_axons
+
+        if slice_eccs:
+            median_ecc = float(np.median(slice_eccs))
+            iqr = float(np.percentile(slice_eccs, 75) - np.percentile(slice_eccs, 25))
+        else:
+            median_ecc = 1.0
+            iqr = 0.0
+
         results[axis] = {
-            'eccentricity': mean_ecc,
-            'n_axons': n_axons,
+            'eccentricity': median_ecc,
+            'eccentricity_iqr': iqr,
+            'n_slices_sampled': len(slice_eccs),
+            'n_axons_total': total_axons,
             'axis_name': axis_names[axis],
         }
-        logger.info(f"  Axis {axis} ({axis_names[axis]}): eccentricity={mean_ecc:.3f}, n_axons={n_axons}")
+        logger.info(f"  Axis {axis} ({axis_names[axis]}): eccentricity={median_ecc:.3f} "
+                     f"(IQR={iqr:.3f}), {len(slice_eccs)} slices, {total_axons} axons")
 
     dominant = min(results, key=lambda a: results[a]['eccentricity'])
     logger.info(f"  Dominant axis: {dominant} ({axis_names[dominant]})")
@@ -120,6 +151,8 @@ def identify_hm_roi(
     logger.info(f"{'='*80}\n")
 
     # Load volume
+    # voxel_size is (X, Y, Z) from CLI, which matches h5py axis order
+    # (h5py reverses MATLAB axes, so .mat array is in ~(X, Y, Z) order)
     logger.info("Loading volume...")
     volume, voxel_size_tuple, _ = load_volume_with_metadata(
         mat_file, voxel_size_override=voxel_size,
@@ -149,7 +182,9 @@ def identify_hm_roi(
         "eccentricity_per_axis": {
             axis_names[a]: {
                 "eccentricity": r['eccentricity'],
-                "n_axons": r['n_axons'],
+                "eccentricity_iqr": r['eccentricity_iqr'],
+                "n_slices_sampled": r['n_slices_sampled'],
+                "n_axons_total": r['n_axons_total'],
             }
             for a, r in axis_results.items()
         },

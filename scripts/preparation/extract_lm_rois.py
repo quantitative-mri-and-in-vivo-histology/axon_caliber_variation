@@ -80,16 +80,8 @@ def extract_rois(
     if not mat_file.exists():
         raise FileNotFoundError(f"Source .mat file not found: {mat_file}")
 
-    # Build axis permutation: separation_axis -> axis 0 (fiber direction along z)
-    separation_axis = separation['axis']
+    populations = roi_meta['populations']
     axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
-    if separation_axis == 0:
-        perm = (0, 1, 2)
-    elif separation_axis == 1:
-        perm = (1, 0, 2)
-    else:
-        perm = (2, 0, 1)
-    logger.info(f"Axis permutation: {perm} ({axis_names[separation_axis]} -> Z)")
 
     # Load full segmentation volume
     logger.info("\nLoading full segmentation volume...")
@@ -118,13 +110,32 @@ def extract_rois(
     for pop_name, roi in rois.items():
         logger.info(f"\n--- Extracting {pop_name.upper()} ---")
 
+        # Get fiber axis for this population
+        fiber_axis = populations[pop_name]['dominant_axis']
+        if fiber_axis == 0:
+            perm = (0, 1, 2)
+        elif fiber_axis == 1:
+            perm = (1, 0, 2)
+        else:
+            perm = (2, 0, 1)
+        logger.info(f"  Fiber axis: {fiber_axis} ({axis_names[fiber_axis]}) -> permutation {perm}")
+
         # Convert ROI bounds from um to voxels
         min_vox = [max(0, int(roi['min_um'][i] / voxel_size_um)) for i in range(3)]
         max_vox = [min(volume_shape[i], int(np.ceil(roi['max_um'][i] / voxel_size_um))) for i in range(3)]
 
         slices = tuple(slice(min_vox[i], max_vox[i]) for i in range(3))
 
-        # Crop and permute segmentation
+        # Check for empty ROI (can happen when separation plane + margin exceeds volume)
+        roi_extent = [max_vox[i] - min_vox[i] for i in range(3)]
+        if any(e <= 0 for e in roi_extent):
+            logger.warning(
+                f"  Skipping {pop_name.upper()}: empty ROI "
+                f"(extent {roi_extent} voxels, bounds {min_vox} to {max_vox})"
+            )
+            continue
+
+        # Crop and permute segmentation (fiber axis -> axis 0)
         seg_cropped = volume_full[slices]
         seg_aligned = np.transpose(seg_cropped, perm)
         logger.info(f"  Segmentation: {volume_full.shape} -> {seg_cropped.shape} -> {seg_aligned.shape}")
@@ -167,6 +178,8 @@ def extract_rois(
             "size_um_zyx": roi_size_um,
             "roi_min_um": roi['min_um'],
             "roi_max_um": roi['max_um'],
+            "fiber_axis": fiber_axis,
+            "fiber_axis_name": axis_names[fiber_axis],
             "axis_permutation": list(perm),
             "num_levels": num_levels,
         }

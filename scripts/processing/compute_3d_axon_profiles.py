@@ -2,6 +2,9 @@
 """
 Compute fiber morphometry profiles by sampling perpendicular cross-sections along skeletons.
 
+Supports both OME-Zarr volumes (canonical format from preparation pipeline)
+and legacy .mat files.
+
 For each axon/fiber:
 1. Extract skeleton using fast-marching + path tracing
 2. Walk along skeleton points at regular intervals
@@ -9,6 +12,19 @@ For each axon/fiber:
 4. Compute equivalent circular radius from cross-section area
 
 Output: Per-axon arrays of (radius_profile, skeleton_coords, length)
+
+Usage:
+  # Single Zarr volume (canonical format)
+  python compute_3d_axon_profiles.py data/processed/rat/LM/sham_25_ipsi_cc_myelin.zarr \\
+      data/processed/rat/LM/sham_25_ipsi_cc_axon_profiles.npz
+
+  # Batch mode with glob pattern
+  python compute_3d_axon_profiles.py "data/processed/rat/LM/*_myelin.zarr" \\
+      data/processed/rat/LM/ --output-suffix _axon_profiles
+
+  # Legacy .mat file
+  python compute_3d_axon_profiles.py data/raw/rat/LM/LM_25_ipsi_myelinated_axons.mat \\
+      data/processed/rat/LM/sham_25_ipsi_axon_profiles.npz
 """
 
 import argparse
@@ -37,7 +53,6 @@ from axonometry import (
     skeleton_warmup,
     load_volume_with_metadata,
     resample_to_isotropic,
-    construct_output_path,
     unit_tangent_vector,
     compute_arc_length,
     resample_curve_by_arc_length,
@@ -444,7 +459,27 @@ def process_single_axon(args):
         return None
 
 
-def compute_fiber_profiles(mat_file: Path,
+def load_zarr_volume(zarr_path: Path) -> Tuple[np.ndarray, float]:
+    """Load level-0 volume and voxel size from an OME-Zarr store."""
+    import zarr
+
+    store = zarr.open_group(str(zarr_path), mode="r")
+    volume = np.asarray(store["0"])
+
+    # Read voxel size from OME-NGFF metadata
+    multiscales = store.attrs["multiscales"]
+    scale = multiscales[0]["datasets"][0]["coordinateTransformations"][0]["scale"]
+    voxel_size_z = scale[0]
+
+    if not np.allclose(scale, scale[0]):
+        logger.warning(
+            f"Zarr voxel size is not isotropic: {scale}. Using Z voxel size ({voxel_size_z})."
+        )
+
+    return volume, float(voxel_size_z)
+
+
+def compute_fiber_profiles(input_path: Path,
                            output_file: Path,
                            voxel_size_um: Optional[Union[float, Tuple[float, float, float]]] = None,
                            max_axon_radius_um: float = 5.0,
@@ -458,15 +493,16 @@ def compute_fiber_profiles(mat_file: Path,
     Compute morphometry profiles for all fibers in a labeled volume.
 
     Args:
-        mat_file: Path to .mat file with labeled axons
+        input_path: Path to .zarr directory or .mat file with labeled axons
         output_file: Path to save results (.npz)
         voxel_size_um: Voxel size in micrometers (scalar or (vz, vy, vx) tuple).
-                       If None, loads from companion JSON file.
+                       If None, auto-detected from Zarr metadata or companion JSON.
         max_axon_radius_um: Maximum expected axon radius in micrometers (sets sampling plane size)
         step_size_um: Step size along skeleton in micrometers
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
-        anisotropy_mode: 'simple' (resample to isotropic) or 'none' (use geometric mean)
+        anisotropy_mode: 'simple' (resample to isotropic) or 'none' (use geometric mean).
+                         Ignored for Zarr input (already isotropic by convention).
         path_method: 'discrete' (fast) or 'euler' (subvoxel accuracy)
         skeleton_downsample: Downsample factor for skeleton extraction
     """
@@ -477,16 +513,23 @@ def compute_fiber_profiles(mat_file: Path,
     _dummy_grid = np.zeros((1, 3), dtype=np.float64)
     _sample_and_flood_fill(_dummy_vol, _dummy_grid, 1, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0)
 
-    # Load volume and metadata (voxel size from override, JSON, or default)
-    logger.info(f"Loading {mat_file}")
-    volume, voxel_size_tuple, _ = load_volume_with_metadata(mat_file, voxel_size_um)
-
-    # Handle anisotropic voxels
-    if anisotropy_mode == 'simple':
-        volume, iso_voxel_size = resample_to_isotropic(volume, voxel_size_tuple)
+    # Load volume
+    suffix = input_path.suffix.lower()
+    if suffix == ".zarr" or input_path.is_dir():
+        logger.info(f"Loading Zarr volume: {input_path.name}")
+        volume, iso_voxel_size = load_zarr_volume(input_path)
         voxel_size_tuple = (iso_voxel_size, iso_voxel_size, iso_voxel_size)
-    elif anisotropy_mode != 'none':
-        raise ValueError(f"Unknown anisotropy_mode: {anisotropy_mode}")
+    elif suffix == ".mat":
+        logger.info(f"Loading .mat volume: {input_path.name}")
+        volume, voxel_size_tuple, _ = load_volume_with_metadata(input_path, voxel_size_um)
+        # Handle anisotropic voxels
+        if anisotropy_mode == 'simple':
+            volume, iso_voxel_size = resample_to_isotropic(volume, voxel_size_tuple)
+            voxel_size_tuple = (iso_voxel_size, iso_voxel_size, iso_voxel_size)
+        elif anisotropy_mode != 'none':
+            raise ValueError(f"Unknown anisotropy_mode: {anisotropy_mode}")
+    else:
+        raise ValueError(f"Unsupported input format: {suffix}. Use .zarr or .mat")
 
     # Convert max_axon_radius from micrometers to voxels (use geometric mean for anisotropic)
     vz, vy, vx = voxel_size_tuple
@@ -586,7 +629,7 @@ def compute_fiber_profiles(mat_file: Path,
         plane_radius_voxels=plane_radius_voxels,
         plane_resolution=plane_resolution,
         step_size_um=step_size_um,
-        source_file=str(mat_file)
+        source_file=str(input_path)
     )
 
     logger.info(f"Saved results to {output_file}")
@@ -621,15 +664,12 @@ def batch_compute_fiber_profiles(
     path_method: str,
     skeleton_downsample: int,
     output_suffix: str = '_axon_profiles',
-    organize_by_microscopy: bool = False
 ):
     """
-    Batch process multiple .mat files matched by glob pattern.
-
-    Preserves directory structure relative to common root and derives output filenames.
+    Batch process multiple .zarr/.mat files matched by glob pattern.
 
     Args:
-        matched_files: List of matched .mat file paths
+        matched_files: List of matched file paths (.zarr directories or .mat files)
         output_root: Root directory for outputs
         voxel_size_um: Voxel size (same as compute_fiber_profiles)
         max_axon_radius_um: Max axon radius in micrometers
@@ -640,7 +680,6 @@ def batch_compute_fiber_profiles(
         path_method: Skeleton path extraction method
         skeleton_downsample: Skeleton extraction downsample factor
         output_suffix: Suffix to append to output filenames (default: '_axon_profiles')
-        organize_by_microscopy: If True, organize outputs by microscopy type (HM/LM)
     """
     # Find common root directory
     if len(matched_files) == 1:
@@ -659,23 +698,21 @@ def batch_compute_fiber_profiles(
     successful = []
     failed = []
 
-    for i, mat_file in enumerate(matched_files, 1):
-        # Construct output path using helper function
-        output_file = construct_output_path(
-            input_file=mat_file,
-            output_root=output_root,
-            output_suffix=output_suffix,
-            organize_by_microscopy=organize_by_microscopy
-        )
+    for i, input_file in enumerate(matched_files, 1):
+        # Construct output filename
+        stem = input_file.stem
+        if input_file.suffix == ".zarr" or (input_file.is_dir() and ".zarr" in input_file.name):
+            stem = input_file.with_suffix("").stem if "." in input_file.stem else input_file.stem
+        output_file = output_root / f"{stem}{output_suffix}.npz"
 
         logger.info(f"\n{'='*80}")
-        logger.info(f"Processing {i}/{len(matched_files)}: {mat_file.name}")
+        logger.info(f"Processing {i}/{len(matched_files)}: {input_file.name}")
         logger.info(f"Output: {output_file.relative_to(output_root) if output_file.is_relative_to(output_root) else output_file}")
         logger.info(f"{'='*80}")
 
         try:
             compute_fiber_profiles(
-                mat_file,
+                input_file,
                 output_file,
                 voxel_size_um=voxel_size_um,
                 max_axon_radius_um=max_axon_radius_um,
@@ -686,11 +723,11 @@ def batch_compute_fiber_profiles(
                 path_method=path_method,
                 skeleton_downsample=skeleton_downsample
             )
-            successful.append(mat_file.name)
+            successful.append(input_file.name)
         except Exception as e:
             error_msg = str(e)
-            failed.append((mat_file.name, error_msg))
-            logger.error(f"Failed to process {mat_file.name}: {error_msg}")
+            failed.append((input_file.name, error_msg))
+            logger.error(f"Failed to process {input_file.name}: {error_msg}")
             traceback.print_exc()
             continue
 
@@ -721,10 +758,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Compute fiber morphometry profiles by sampling perpendicular cross-sections'
     )
-    parser.add_argument('mat_file', type=str,
-                        help="Path to .mat file or glob pattern (e.g., 'data/raw/**/*.mat')")
-    parser.add_argument('output_file', type=Path,
-                        help='Output .npz file (single file) OR output root directory (batch mode)')
+    parser.add_argument('input', type=str,
+                        help="Path to .zarr directory, .mat file, or glob pattern")
+    parser.add_argument('output', type=Path,
+                        help='Output .npz file (single file) OR output directory (batch mode)')
     parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=None,
                         help='Voxel size in μm: single value (isotropic) or vz,vy,vx. '
                              'If not specified, loads from companion .json file (default: from JSON or 0.05)')
@@ -746,27 +783,31 @@ if __name__ == '__main__':
                         help="Downsample factor for skeleton extraction (default: 1)")
     parser.add_argument('--output-suffix', type=str, default='_axon_profiles',
                         help='Suffix to append to output filenames in batch mode (default: "_axon_profiles")')
-    parser.add_argument('--organize-by-microscopy', action='store_true',
-                        help='Organize outputs by microscopy type (HM/LM folders). '
-                             'Files starting with HM_/LM_ will be placed in data/processed/HM/ or data/processed/LM/ '
-                             'with the microscopy prefix removed from the filename.')
 
     args = parser.parse_args()
 
-    # Expand glob pattern to find matching files
-    input_pattern = args.mat_file
-    output_path = Path(args.output_file)
+    # Expand glob pattern to find matching files/directories
+    input_pattern = args.input
+    output_path = args.output
 
     matched_files = sorted(glob.glob(input_pattern, recursive=True))
 
     if len(matched_files) == 0:
         parser.error(f"No files matched pattern: {input_pattern}")
     elif len(matched_files) == 1:
-        # Single file mode (existing behavior)
-        mat_path = Path(matched_files[0])
+        # Single file mode
+        input_path = Path(matched_files[0])
+
+        # If output is a directory, construct filename
+        if output_path.suffix != ".npz":
+            stem = input_path.stem
+            if input_path.suffix == ".zarr" or (input_path.is_dir() and ".zarr" in input_path.name):
+                stem = input_path.with_suffix("").stem if "." in input_path.stem else input_path.stem
+            output_path = output_path / f"{stem}{args.output_suffix}.npz"
+
         compute_fiber_profiles(
-            mat_path,
-            output_path,  # Treat as output file
+            input_path,
+            output_path,
             voxel_size_um=args.voxel_size,
             max_axon_radius_um=args.max_axon_radius,
             step_size_um=args.step_size,
@@ -779,9 +820,11 @@ if __name__ == '__main__':
     else:
         # Batch mode - multiple files matched
         matched_paths = [Path(f) for f in matched_files]
+        if output_path.suffix == ".npz":
+            parser.error("Output must be a directory in batch mode")
         batch_compute_fiber_profiles(
             matched_paths,
-            output_path,  # Treat as output root directory
+            output_path,
             voxel_size_um=args.voxel_size,
             max_axon_radius_um=args.max_axon_radius,
             step_size_um=args.step_size,
@@ -791,5 +834,4 @@ if __name__ == '__main__':
             path_method=args.path_method,
             skeleton_downsample=args.skeleton_downsample,
             output_suffix=args.output_suffix,
-            organize_by_microscopy=args.organize_by_microscopy
         )
