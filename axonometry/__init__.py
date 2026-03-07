@@ -54,6 +54,12 @@ from .morphometry import (
     compute_fiber_metrics,
 )
 
+from .zarr_io import (
+    write_ome_zarr_pyramid,
+    downsample_nearest,
+    downsample_mean,
+)
+
 from .plotting import (
     load_plot_settings,
     PlotSettings,
@@ -99,6 +105,10 @@ __all__ = [
     # Morphometry
     "assign_myelin_to_axons",
     "compute_fiber_metrics",
+    # Zarr I/O
+    "write_ome_zarr_pyramid",
+    "downsample_nearest",
+    "downsample_mean",
     # Plotting
     "load_plot_settings",
     "PlotSettings",
