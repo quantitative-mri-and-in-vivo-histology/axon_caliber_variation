@@ -107,7 +107,7 @@ def write_ome_zarr_pyramid(
     voxel_size_um: Union[float, Tuple[float, float, float]] = 0.05,
     num_levels: int = 4,
     downsample_mode: str = 'nearest',
-    chunk_size: int = 128,
+    chunk_size: int = 64,
     compression_level: int = 3,
     metadata: Optional[Dict] = None,
 ) -> Path:
