@@ -1,0 +1,496 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Preparation: Prepare HM ROIs",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/preparation/prepare_hm_rois.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Preparation: Identify LM ROIs",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/preparation/identify_lm_rois.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Preparation: Extract LM ROIs",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/preparation/extract_lm_rois.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+                {
+            "name": "Processing: 2D Slice Profiles (All LM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/processing/compute_2d_slice_profiles.py",
+            "args": [
+                "data/raw/rat/lm/*_myelin.zarr",
+                "data/processed/rat/lm/",
+                "--n-jobs", "-1"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Processing: 2D Slice Profiles (All HM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/processing/compute_2d_slice_profiles.py",
+            "args": [
+                "data/raw/rat/HM/*_myelin.zarr",
+                "data/processed/rat/HM/",
+                "--n-jobs", "-1"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Processing: 3D Axon Profiles (All LM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/processing/compute_3d_axon_profiles.py",
+            "args": [
+                "data/raw/rat/LM/*_myelin.zarr",
+                "data/processed/rat/LM/",
+                "--max-axon-radius", "5.0",
+                "--step-size", "0.1",
+                "--n-jobs", "-1",
+                "--path-method", "discrete",
+                "--skeleton-downsample", "2",
+                "--output-suffix", "_axon_profiles"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Processing: 3D Axon Profiles (All HM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/processing/compute_3d_axon_profiles.py",
+            "args": [
+                "data/raw/rat/HM/*_myelin.zarr",
+                "data/processed/rat/HM/",
+                "--max-axon-radius", "5.0",
+                "--step-size", "0.1",
+                "--n-jobs", "-1",
+                "--path-method", "discrete",
+                "--skeleton-downsample", "2",
+                "--output-suffix", "_axon_profiles"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): Individual Axon Stats",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_individual_axon_stats.py",
+            "args": [
+                "data/processed/LM/*_axon_profiles.npz",
+                "fig/main/individual_axon_stats.svg",
+                "--mat-dir",
+                "data/raw"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): 2D vs 3D Distribution Comparison (HM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_2d_vs_3d_distribution_comparison.py",
+            "args": [
+                "--data-dir", "data/processed/rat/HM",
+                "--output", "fig/main/distribution_2d_vs_3d_comparison_hm_minor.svg",
+                "--radius-type", "minor"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): 2D vs 3D Distribution Comparison (LM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_2d_vs_3d_distribution_comparison.py",
+            "args": [
+                "--data-dir", "data/processed/rat/lm",
+                "--output", "fig/main/distribution_2d_vs_3d_comparison_minor.svg",
+                "--radius-type", "minor"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): Sample Size Effect",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_sample_size_effect.py",
+            "args": [
+                "--human-data",
+                "data/raw_LM",
+                "--rat-data",
+                "data/processed/LM",
+                "--output",
+                "fig/main/sample_size_effect.svg"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): Fit Combined Distributions",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/fit_combined_distributions.py",
+            "args": [
+                "--human-data",
+                "data/raw_LM",
+                "--rat-data",
+                "data/processed/LM",
+                "--output",
+                "fig/main/combined_distribution_fits.svg"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (supp): Std vs Radius",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_std_vs_radius.py",
+            "args": [
+                "data/processed/LM/*_axon_profiles.npz",
+                "fig/supplementary/std_vs_radius.svg"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Debug: Inspect HM Zarr Slices",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/debug/inspect_zarr_slices.py",
+            "args": [
+                "data/raw/rat/hm/*_myelin.zarr",
+                "--output", "fig/debug/hm_zarr_slices.png"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Debug: Inspect LM Zarr Slices",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/debug/inspect_zarr_slices.py",
+            "args": [
+                "data/raw/rat/lm/tbi_2_*_myelin.zarr",
+                "--output", "fig/debug/lm_zarr_slices.png"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Monte Carlo 2D Sampling",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/monte_carlo_2d_sampling.py",
+            "args": [
+                "data/processed/LM/*_slice_profiles.npz",
+                "fig/monte_carlo_2d_sampling.png",
+                "--n-iterations",
+                "1000",
+                "--n-permutations",
+                "1000"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Spatial Correlation Ensemble (LM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_spatial_correlation_ensemble.py",
+            "args": [
+                "data/raw/**/HM_2*_contra_myelinated_axons.mat",
+                "fig/spatial_correlation_pooled.png",
+                "--max-distance",
+                "50",
+                "--bin-width",
+                "2",
+                "--metric",
+                "relative"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Analyze Radius vs Nucleus Distance (Single LM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_radius_vs_nucleus_distance.py",
+            "args": [
+                "data/processed/LM/sham_25_ipsi_axon_profiles.npz",
+                "fig/sham_25_ipsi_radius_vs_nucleus.png",
+                "--nucleus-dir",
+                "data/raw",
+                "--distance-bin-size",
+                "0.5"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Analyze Radius vs Nucleus Distance (All LM - Pooled)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_radius_vs_nucleus_distance.py",
+            "args": [
+                "data/processed/LM/*_axon_profiles.npz",
+                "fig/lm_radius_vs_nucleus_pooled.png",
+                "--nucleus-dir",
+                "data/raw",
+                "--distance-bin-size",
+                "0.5",
+                "--pool"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Neighbor Profile Correlation (All LM - Pooled)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_neighbor_profile_correlation.py",
+            "args": [
+                "data/processed/LM/*_axon_profiles.npz",
+                "fig/neighbor_profile_correlation_LM_pooled.png",
+                "--d-max",
+                "10.0",
+                "--min-segment-length",
+                "5.0",
+                "--max-distance",
+                "20.0",
+                "--distance-bin-width",
+                "0.2"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Local Area Correlation (LM Single)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_local_area_correlation.py",
+            "args": [
+                "data/processed/LM/sham_25_ipsi_axon_profiles.npz",
+                "fig/local_area_correlation_LM_sham25.png",
+                "--max-points",
+                "100000"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Visualization: Original Volumes (LM, 4x ds)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/visualization/visualize_original_volumes_3d.py",
+            "args": [
+                "data/source/rat/Sham_25_contra/LM_25_contra.h5",
+                "--downsample", "4",
+                "--voxel-size", "0.05"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Visualization: ROI BBoxes (LM tbi_49_contra org)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/visualization/visualize_3d.py",
+            "args": [
+                "--grayscale", "data/source/rat/TBI_28_contra/LM_28_contra.h5",
+                "--bbox",
+                "data/masks/rat/lm/tbi_28_contra_cc_roi.json",
+                "data/masks/rat/lm/tbi_28_contra_cg_roi.json"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Visualization: ROI BBoxes (LM tbi_28_contra org + label)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/visualization/visualize_3d.py",
+            "args": [
+                "--grayscale", "data/source/rat/TBI_28_contra/LM_28_contra.h5",
+                "--label",
+                "data/source/rat/TBI_28_contra/LM_28_contra_myelinated_axons.mat"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Visualization: ROI BBoxes (LM tbi_28_contra extracted)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/visualization/visualize_3d.py",
+            "args": [
+                "--grayscale", "data/raw/rat/lm/tbi_28_contra_cg_grayscale.zarr",
+                "--label",
+                "data/raw/rat/lm/tbi_28_contra_cg_myelin.zarr"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot Sample Size Histograms",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/distribution_fitting/plot_sample_size_histograms.py",
+            "args": [
+                "--human-data",
+                "data/raw_LM",
+                "--output",
+                "fig/sample_size_histograms.svg",
+                "--seed",
+                "42"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Analyze Variance Decomposition",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_variance_decomposition.py",
+            "args": [
+                "--data-dir",
+                "data/processed/LM",
+                "--output",
+                "fig/variance_decomposition.svg",
+                "--min-length",
+                "50.0"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+    ]
+}
