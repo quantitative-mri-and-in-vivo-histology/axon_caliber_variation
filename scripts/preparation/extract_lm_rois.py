@@ -183,8 +183,12 @@ Outputs per ROI:
         help='Root directory containing source .mat files (default: data/source/rat)'
     )
     parser.add_argument(
-        '--roi-dir', type=Path, default=Path('data/raw/rat/lm'),
-        help='Directory containing *_roi.json files and output (default: data/raw/rat/lm)'
+        '--mask-dir', type=Path, default=Path('data/masks/rat/lm'),
+        help='Directory containing *_roi.json files (default: data/masks/rat/lm)'
+    )
+    parser.add_argument(
+        '--output-dir', type=Path, default=Path('data/raw/rat/lm'),
+        help='Output directory for Zarr volumes (default: data/raw/rat/lm)'
     )
     parser.add_argument(
         '--num-levels', type=int, default=4,
@@ -194,9 +198,9 @@ Outputs per ROI:
     args = parser.parse_args()
 
     # Find all ROI JSONs
-    roi_files = sorted(args.roi_dir.glob('*_roi.json'))
+    roi_files = sorted(args.mask_dir.glob('*_roi.json'))
     if not roi_files:
-        logger.error(f"No *_roi.json files found in {args.roi_dir}")
+        logger.error(f"No *_roi.json files found in {args.mask_dir}")
         return
 
     logger.info(f"Found {len(roi_files)} ROI file(s)")
@@ -206,7 +210,7 @@ Outputs per ROI:
             mat_file = find_source_mat(roi_file, args.source_dir)
             extract_roi(
                 mat_file, roi_file,
-                output_dir=args.roi_dir,
+                output_dir=args.output_dir,
                 num_levels=args.num_levels,
             )
         except Exception as e:
