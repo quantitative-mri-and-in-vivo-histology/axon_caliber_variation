@@ -332,10 +332,7 @@ def load_human_cc_data(
 def load_radii_from_npz(npz_file: Path) -> np.ndarray:
     """Load all_radii_um from NPZ file."""
     data = np.load(npz_file, allow_pickle=True)
-    if 'all_radii_um' in data:
-        return data['all_radii_um']
-    else:
-        raise ValueError(f"NPZ file must contain 'all_radii_um'. Found: {list(data.keys())}")
+    return data['all_radii_w_branches_um']
 
 
 def radii_to_histogram(
@@ -418,8 +415,11 @@ def load_rat_data(
                     all_names.append(f"{volume_name}_{pop_name}")
                     all_radii.append(pop_radii)
         else:
-            # No population file - use all radii
-            radii = data['all_radii_um']
+            radii = data['all_radii_w_branches_um']
+            n_axons = len(data['labels'])
+            if n_axons < min_axons:
+                logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")
+                continue
             counts, _ = np.histogram(radii, bins=bin_edges)
             all_counts.append(counts)
             all_names.append(volume_name)
@@ -2234,12 +2234,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument('--human-data', type=Path, required=True,
-                        help='Directory containing human CC TSV files (data/raw_LM)')
-    parser.add_argument('--rat-data', type=Path, required=True,
-                        help='Directory containing rat NPZ files (data/processed/LM)')
-    parser.add_argument('--output', type=Path, required=True,
-                        help='Output PNG file path')
+    parser.add_argument('--human-data', type=Path, default=Path('data/raw/human/lm'),
+                        help='Directory containing human CC TSV files (default: data/raw/human/lm)')
+    parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
+                        help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
+    parser.add_argument('--output', type=Path, default=Path('fig/main/combined_distribution_fits.svg'),
+                        help='Output file path (default: fig/main/combined_distribution_fits.svg)')
     parser.add_argument('--bin-width', type=float, default=DEFAULT_BIN_WIDTH,
                         help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')
     parser.add_argument('--r-max', type=float, default=3.0,

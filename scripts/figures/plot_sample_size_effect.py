@@ -207,7 +207,11 @@ def load_rat_histograms(
                     all_counts.append(counts)
                     all_names.append(f"{volume_name}_{pop_name}")
         else:
-            radii = data['all_radii_um']
+            radii = data['all_radii_w_branches_um']
+            n_axons = len(data['labels'])
+            if n_axons < min_axons:
+                logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")
+                continue
             counts, _ = np.histogram(radii, bins=bin_edges)
             all_counts.append(counts)
             all_names.append(volume_name)
@@ -1064,12 +1068,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument('--human-data', type=Path, required=True,
-                        help='Directory containing human CC TSV files')
-    parser.add_argument('--rat-data', type=Path, required=True,
-                        help='Directory containing rat NPZ files')
-    parser.add_argument('--output', type=Path, required=True,
-                        help='Output PNG file path')
+    parser.add_argument('--human-data', type=Path, default=Path('data/raw/human/lm'),
+                        help='Directory containing human CC TSV files (default: data/raw/human/lm)')
+    parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
+                        help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
+    parser.add_argument('--output', type=Path, default=Path('fig/main/sample_size_effect.svg'),
+                        help='Output file path (default: fig/main/sample_size_effect.svg)')
     parser.add_argument('--n-subsamples', type=int, default=N_SUBSAMPLES,
                         help=f'Number of subsamples per ROI (default: {N_SUBSAMPLES})')
     parser.add_argument('--seed', type=int, default=42,

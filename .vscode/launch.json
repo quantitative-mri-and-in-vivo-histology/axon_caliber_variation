@@ -124,10 +124,10 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/figures/plot_individual_axon_stats.py",
             "args": [
-                "data/processed/LM/*_axon_profiles.npz",
+                "data/processed/rat/lm/*_axon_profiles.npz",
                 "fig/main/individual_axon_stats.svg",
                 "--mat-dir",
-                "data/raw"
+                "data/source/rat"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
@@ -142,7 +142,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/figures/plot_2d_vs_3d_distribution_comparison.py",
             "args": [
-                "--data-dir", "data/processed/rat/HM",
+                "--data-dir", "data/processed/rat/hm",
                 "--output", "fig/main/distribution_2d_vs_3d_comparison_hm_minor.svg",
                 "--radius-type", "minor"
             ],
@@ -160,7 +160,7 @@
             "program": "${workspaceFolder}/scripts/figures/plot_2d_vs_3d_distribution_comparison.py",
             "args": [
                 "--data-dir", "data/processed/rat/lm",
-                "--output", "fig/main/distribution_2d_vs_3d_comparison_minor.svg",
+                "--output", "fig/main/distribution_2d_vs_3d_comparison.svg",
                 "--radius-type", "minor"
             ],
             "console": "integratedTerminal",
@@ -175,14 +175,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/figures/plot_sample_size_effect.py",
-            "args": [
-                "--human-data",
-                "data/raw_LM",
-                "--rat-data",
-                "data/processed/LM",
-                "--output",
-                "fig/main/sample_size_effect.svg"
-            ],
+            "args": [],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
@@ -195,14 +188,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/figures/fit_combined_distributions.py",
-            "args": [
-                "--human-data",
-                "data/raw_LM",
-                "--rat-data",
-                "data/processed/LM",
-                "--output",
-                "fig/main/combined_distribution_fits.svg"
-            ],
+            "args": [],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
@@ -215,10 +201,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/figures/plot_std_vs_radius.py",
-            "args": [
-                "data/processed/LM/*_axon_profiles.npz",
-                "fig/supplementary/std_vs_radius.svg"
-            ],
+            "args": [],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",

@@ -148,12 +148,16 @@ def main():
     parser.add_argument(
         'input_files',
         type=str,
-        help='Input NPZ file(s) with axon profiles (glob pattern supported)'
+        nargs='?',
+        default='data/processed/rat/lm/*_axon_profiles.npz',
+        help='Input NPZ file(s) with axon profiles (glob pattern supported, default: data/processed/rat/lm/*_axon_profiles.npz)'
     )
     parser.add_argument(
         'output_file',
         type=Path,
-        help='Output PNG file path'
+        nargs='?',
+        default=Path('fig/supplementary/std_vs_radius.svg'),
+        help='Output file path (default: fig/supplementary/std_vs_radius.svg)'
     )
     parser.add_argument(
         '--min-length',
