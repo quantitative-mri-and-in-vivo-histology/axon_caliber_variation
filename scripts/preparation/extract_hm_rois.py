@@ -1,35 +1,28 @@
 #!/usr/bin/env python3
 """
-Extract HM volumes as OME-Zarr with axis alignment and isotropic resampling.
+Extract all HM volumes as OME-Zarr with axis alignment and isotropic resampling.
 
-Reads ROI definitions from *_roi.json (produced by identify_hm_rois.py)
-and extracts the full volume with:
-1. Axis permutation so the fiber direction (dominant axis) becomes Z
-2. Resampling to isotropic voxels (nearest-neighbor for labels)
-3. Multi-resolution OME-Zarr pyramid output
+Finds all *_roi.json files in roi_dir, matches each to its source .mat file
+in source_dir, and extracts axis-aligned, isotropically resampled volumes.
 
 Example usage:
-    # Single file
-    python scripts/preparation/extract_hm_rois.py \
-        data/raw/rat/HM/HM_25_ipsi_roi.json
+    # Use defaults (data/source/rat, data/raw/rat/hm)
+    python scripts/preparation/extract_hm_rois.py
 
-    # Batch processing
+    # Custom directories
     python scripts/preparation/extract_hm_rois.py \
-        "data/raw/rat/HM/*_roi.json"
-
-    # Custom output directory
-    python scripts/preparation/extract_hm_rois.py \
-        data/raw/rat/HM/HM_25_ipsi_roi.json \
-        --output-dir data/processed/rat/HM
+        --source-dir data/source/rat \
+        --roi-dir data/raw/rat/hm
 """
 
 import argparse
 import json
 import logging
-from glob import glob
+import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
+import h5py
 import numpy as np
 from axonometry.io import load_volume_with_metadata, resample_to_isotropic
 from axonometry.zarr_io import write_ome_zarr_pyramid
@@ -38,80 +31,103 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def find_source_mat(roi_json: Path, source_dir: Path) -> Path:
+    """
+    Find the source .mat file for a given ROI JSON.
+
+    ROI JSON name: hm_25_ipsi_roi.json
+    Source .mat:   data/source/rat/Sham_25_ipsi/HM_25_ipsi_myelinated_axons.mat
+
+    Extracts {id}_{hemisphere} (e.g. "25_ipsi") from the ROI name and searches
+    for the matching HM_*_myelinated_axons.mat in source_dir.
+    """
+    stem = roi_json.stem.replace('_roi', '')  # e.g. "hm_25_ipsi"
+    # Remove "hm_" prefix to get id_hemisphere
+    match = re.match(r'hm_(.+)$', stem)
+    if not match:
+        raise ValueError(f"Cannot parse ROI JSON name: {roi_json.name}")
+
+    id_hemi = match.group(1)  # e.g. "25_ipsi"
+
+    # Search for matching .mat file
+    pattern = f"HM_{id_hemi}_myelinated_axons.mat"
+    matches = list(source_dir.rglob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"No source .mat found for {pattern} under {source_dir}")
+    return matches[0]
+
+
 def extract_hm_volume(
+    mat_file: Path,
     roi_json: Path,
-    output_dir: Path = None,
+    output_dir: Path,
+    voxel_size: Tuple[float, float, float] = (0.015, 0.015, 0.05),
     num_levels: int = 4,
 ) -> Dict:
     """
     Extract an HM volume with axis alignment and isotropic resampling.
 
     Args:
-        roi_json: Path to *_roi.json from identify_hm_rois.py
-        output_dir: Output directory (default: same directory as roi_json)
-        num_levels: Number of pyramid levels for OME-Zarr output
+        mat_file: Source .mat file with labeled volume
+        roi_json: Path to *_roi.json (fiber_dir_axis, min, max)
+        output_dir: Output directory
+        voxel_size: Voxel size (X, Y, Z) matching h5py axis order
+        num_levels: Number of pyramid levels
 
     Returns:
         Dictionary with output file paths
     """
     with open(roi_json) as f:
-        roi_meta = json.load(f)
+        roi = json.load(f)
 
-    mat_file = Path(roi_meta['source_file'])
-    voxel_size_xyz = tuple(roi_meta['voxel_size_xyz_um'])
-    volume_shape = tuple(roi_meta['volume_shape_zyx'])
-    dominant_axis = roi_meta['dominant_axis']
-    dominant_axis_name = roi_meta['dominant_axis_name']
-
-    if output_dir is None:
-        output_dir = roi_json.parent
+    fiber_dir_axis = roi['fiber_dir_axis']
+    roi_min = roi['min']
+    roi_max = roi['max']
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Derive sample name from JSON filename
+    # Derive sample name from ROI JSON filename
     sample_name = roi_json.stem.replace('_roi', '')
 
-    logger.info(f"\n{'='*80}")
-    logger.info(f"Extracting HM volume: {sample_name}")
-    logger.info(f"  Source: {mat_file}")
-    logger.info(f"  Volume shape: {volume_shape}")
-    logger.info(f"  Voxel size (X,Y,Z): {voxel_size_xyz} um")
-    logger.info(f"  Dominant axis: {dominant_axis} ({dominant_axis_name})")
-    logger.info(f"{'='*80}\n")
-
-    if not mat_file.exists():
-        raise FileNotFoundError(f"Source .mat file not found: {mat_file}")
-
-    # Build axis permutation: dominant_axis -> axis 0 (fiber direction along Z)
-    if dominant_axis == 0:
+    # Axis permutation: fiber_dir_axis -> axis 0
+    if fiber_dir_axis == 0:
         perm = (0, 1, 2)
-    elif dominant_axis == 1:
+    elif fiber_dir_axis == 1:
         perm = (1, 0, 2)
     else:
         perm = (2, 0, 1)
 
-    axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
-    logger.info(f"Axis permutation: {perm} ({axis_names[dominant_axis]} -> Z)")
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Extracting HM volume: {sample_name}")
+    logger.info(f"  Source: {mat_file}")
+    logger.info(f"  ROI: {roi_min} -> {roi_max}")
+    logger.info(f"  fiber_dir_axis: {fiber_dir_axis} -> permutation {perm}")
+    logger.info(f"{'='*80}\n")
 
-    # Load full segmentation volume
-    logger.info("\nLoading full segmentation volume...")
+    # Load segmentation volume
+    # voxel_size is (X, Y, Z) from CLI, which matches h5py axis order
+    # (h5py reverses MATLAB axes, so .mat array is in ~(X, Y, Z) order)
+    logger.info("Loading segmentation volume...")
     volume, voxel_size_tuple, _ = load_volume_with_metadata(
-        mat_file, voxel_size_override=voxel_size_xyz,
+        mat_file, voxel_size_override=voxel_size,
     )
     logger.info(f"  Shape: {volume.shape}, dtype: {volume.dtype}")
+
+    # Crop to ROI
+    slices = tuple(slice(roi_min[i], roi_max[i]) for i in range(3))
+    volume = volume[slices]
+    logger.info(f"  After crop: {volume.shape}")
 
     # Permute axes so fiber direction is Z
     volume_aligned = np.transpose(volume, perm)
     logger.info(f"  After permutation: {volume_aligned.shape}")
 
     # Permute voxel size accordingly
-    # h5py reverses MATLAB axes, so the loaded array is in ~(X, Y, Z) order
-    # and voxel_size_xyz = (vx, vy, vz) already matches h5py axis order
-    voxel_size_aligned = tuple(voxel_size_xyz[p] for p in perm)
+    voxel_size_aligned = tuple(voxel_size[p] for p in perm)
     logger.info(f"  Aligned voxel size: {voxel_size_aligned} um")
 
     # Resample to isotropic voxels
-    logger.info("\nResampling to isotropic voxels...")
+    logger.info("Resampling to isotropic voxels...")
     volume_iso, iso_voxel_size = resample_to_isotropic(volume_aligned, voxel_size_aligned)
     logger.info(f"  Isotropic shape: {volume_iso.shape}, voxel size: {iso_voxel_size:.4f} um")
 
@@ -119,21 +135,19 @@ def extract_hm_volume(
 
     # Write segmentation as OME-Zarr
     seg_path = output_dir / f"{sample_name}_myelin.zarr"
-    logger.info(f"\nWriting segmentation: {seg_path}")
+    logger.info(f"Writing segmentation: {seg_path}")
     write_ome_zarr_pyramid(
         volume_iso, seg_path,
         voxel_size_um=iso_voxel_size,
         num_levels=num_levels,
         downsample_mode='nearest',
     )
-
     output_paths = {'segmentation': str(seg_path)}
 
     # Find companion grayscale .h5 file
     grayscale_name = mat_file.stem.replace('_myelinated_axons', '') + '.h5'
     grayscale_file = mat_file.parent / grayscale_name
     if grayscale_file.exists():
-        import h5py
         logger.info(f"\nLoading grayscale: {grayscale_file.name}")
         with h5py.File(str(grayscale_file), 'r') as f:
             for dset_name in ['raw', 'data', 'image']:
@@ -151,6 +165,9 @@ def extract_hm_volume(
         # Align axes with segmentation: .h5 axes are reversed relative to .mat
         grayscale = np.transpose(grayscale, (2, 1, 0))
         logger.info(f"  Grayscale after axis alignment: {grayscale.shape}")
+
+        # Crop to ROI
+        grayscale = grayscale[slices]
 
         # Apply same permutation and resampling as segmentation
         grayscale_aligned = np.transpose(grayscale, perm)
@@ -170,27 +187,6 @@ def extract_hm_volume(
     else:
         logger.warning(f"No grayscale file found: {grayscale_file}")
 
-    # Write per-volume metadata JSON
-    meta_path = output_dir / f"{sample_name}_myelin.json"
-    vol_meta = {
-        "voxel_size": [iso_voxel_size] * 3,
-        "unit": "micrometer",
-        "source_file": str(mat_file),
-        "roi_json": str(roi_json),
-        "original_voxel_size_xyz_um": list(voxel_size_xyz),
-        "shape_zyx": list(volume_iso.shape),
-        "size_um_zyx": [s * iso_voxel_size for s in volume_iso.shape],
-        "dominant_axis": dominant_axis,
-        "dominant_axis_name": dominant_axis_name,
-        "axis_permutation": list(perm),
-        "isotropic_voxel_size_um": iso_voxel_size,
-        "num_levels": num_levels,
-    }
-    with open(meta_path, 'w') as f:
-        json.dump(vol_meta, f, indent=2)
-
-    output_paths['metadata'] = str(meta_path)
-
     del volume_iso
 
     logger.info(f"\n{'='*80}")
@@ -203,41 +199,30 @@ def extract_hm_volume(
 
 
 def main():
-    """Main entry point with CLI argument parsing."""
     parser = argparse.ArgumentParser(
-        description='Extract HM volumes as OME-Zarr with axis alignment and isotropic resampling.',
+        description='Extract all HM volumes as OME-Zarr with axis alignment and isotropic resampling.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-    # Single ROI file
-    python scripts/preparation/extract_hm_rois.py \\
-        data/raw/rat/HM/HM_25_ipsi_roi.json
+Finds all *_roi.json files in roi_dir, matches to source .mat files,
+and extracts axis-aligned, isotropically resampled OME-Zarr volumes.
 
-    # Batch processing
-    python scripts/preparation/extract_hm_rois.py \\
-        "data/raw/rat/HM/*_roi.json"
-
-    # Custom output directory
-    python scripts/preparation/extract_hm_rois.py \\
-        data/raw/rat/HM/HM_25_ipsi_roi.json \\
-        --output-dir data/processed/rat/HM
-
-Inputs:
-    *_roi.json from identify_hm_rois.py
-
-Outputs:
+Outputs per ROI:
     - <sample>_myelin.zarr:      Segmentation (OME-Zarr, isotropic, axis-aligned)
-    - <sample>_grayscale.zarr:   Grayscale image (OME-Zarr, if companion .h5 exists)
-    - <sample>_myelin.json:      Per-volume metadata (shape, voxel size, etc.)
+    - <sample>_grayscale.zarr:   Grayscale image (if companion .h5 exists)
         """
     )
     parser.add_argument(
-        'input_files', type=str,
-        help='*_roi.json file(s) (glob pattern supported)'
+        '--source-dir', type=Path, default=Path('data/source/rat'),
+        help='Root directory containing source .mat files (default: data/source/rat)'
     )
     parser.add_argument(
-        '--output-dir', type=Path, default=None,
-        help='Output directory (default: same as input JSON)'
+        '--roi-dir', type=Path, default=Path('data/raw/rat/hm'),
+        help='Directory containing *_roi.json files and output (default: data/raw/rat/hm)'
+    )
+    parser.add_argument(
+        '--voxel-size', type=float, nargs=3, default=[0.015, 0.015, 0.05],
+        metavar=('X', 'Y', 'Z'),
+        help='Voxel size in um (default: 0.015 0.015 0.05)'
     )
     parser.add_argument(
         '--num-levels', type=int, default=4,
@@ -246,33 +231,25 @@ Outputs:
 
     args = parser.parse_args()
 
-    # Expand glob pattern
-    input_pattern = args.input_files
-    if '*' in input_pattern:
-        input_files = sorted(glob(input_pattern, recursive=True))
-    else:
-        input_files = [input_pattern]
-
-    if not input_files:
-        logger.error(f"No files found matching: {args.input_files}")
+    # Find all ROI JSONs
+    roi_files = sorted(args.roi_dir.glob('*_roi.json'))
+    if not roi_files:
+        logger.error(f"No *_roi.json files found in {args.roi_dir}")
         return
 
-    logger.info(f"Found {len(input_files)} input file(s)")
+    logger.info(f"Found {len(roi_files)} ROI file(s)")
 
-    for json_file in input_files:
-        json_path = Path(json_file)
-        if not json_path.exists():
-            logger.warning(f"File not found: {json_file}")
-            continue
-
+    for roi_file in roi_files:
         try:
+            mat_file = find_source_mat(roi_file, args.source_dir)
             extract_hm_volume(
-                json_path,
-                output_dir=args.output_dir,
+                mat_file, roi_file,
+                output_dir=args.roi_dir,
+                voxel_size=tuple(args.voxel_size),
                 num_levels=args.num_levels,
             )
         except Exception as e:
-            logger.error(f"Failed to process {json_file}: {e}")
+            logger.error(f"Failed to process {roi_file}: {e}")
             import traceback
             traceback.print_exc()
 

@@ -1,244 +1,190 @@
 #!/usr/bin/env python3
 """
-Extract LM ROI sub-volumes as OME-Zarr with multi-resolution pyramids.
+Extract all LM ROI sub-volumes as OME-Zarr with multi-resolution pyramids.
 
-Reads ROI definitions from *_population_rois.json (produced by
-identify_lm_rois.py) and extracts axis-aligned, cropped sub-volumes
-for each population (CC, CG) with companion grayscale if available.
+Finds all *_roi.json files in roi_dir, matches each to its source .mat file
+in source_dir, and extracts cropped, axis-aligned volumes.
 
 Example usage:
-    # Single ROI file
-    python scripts/preparation/extract_lm_rois.py \
-        data/raw/rat/LM/sham_25_ipsi_population_rois.json
+    # Use defaults (data/source/rat, data/raw/rat/lm)
+    python scripts/preparation/extract_lm_rois.py
 
-    # Batch processing
+    # Custom directories
     python scripts/preparation/extract_lm_rois.py \
-        "data/raw/rat/LM/*_population_rois.json"
-
-    # Custom output directory and pyramid levels
-    python scripts/preparation/extract_lm_rois.py \
-        data/raw/rat/LM/sham_25_ipsi_population_rois.json \
-        --output-dir data/processed/rat/LM \
-        --num-levels 5
+        --source-dir data/source/rat \
+        --roi-dir data/raw/rat/lm
 """
 
 import argparse
 import json
 import logging
-from glob import glob
+import re
 from pathlib import Path
 from typing import Dict
 
+import h5py
 import numpy as np
-from axonometry.io import load_volume_with_metadata
 from axonometry.zarr_io import write_ome_zarr_pyramid
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+VOXEL_SIZE_UM = 0.05  # LM data is isotropic
 
-def extract_rois(
+
+def find_source_mat(roi_json: Path, source_dir: Path) -> Path:
+    """
+    Find the source .mat file for a given ROI JSON.
+
+    ROI JSON name: sham_25_ipsi_cc_roi.json
+    Source .mat:   data/source/rat/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat
+
+    Extracts {id}_{hemisphere} (e.g. "25_ipsi") from the ROI name and searches
+    for the matching LM_*_myelinated_axons.mat in source_dir.
+    """
+    stem = roi_json.stem.replace('_roi', '')  # e.g. "sham_25_ipsi_cc"
+    # Remove condition prefix and population suffix to get id_hemisphere
+    # Pattern: {condition}_{id}_{hemisphere}_{pop} or {condition}_{id}_{hemisphere}
+    match = re.match(r'[a-z]+_(\d+_\w+?)(?:_(?:cc|cg))?$', stem)
+    if not match:
+        raise ValueError(f"Cannot parse ROI JSON name: {roi_json.name}")
+
+    id_hemi = match.group(1)  # e.g. "25_ipsi"
+
+    # Search for matching .mat file
+    pattern = f"LM_{id_hemi}_myelinated_axons.mat"
+    matches = list(source_dir.rglob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"No source .mat found for {pattern} under {source_dir}")
+    return matches[0]
+
+
+def extract_roi(
+    mat_file: Path,
     roi_json: Path,
-    output_dir: Path = None,
+    output_dir: Path,
     num_levels: int = 4,
 ) -> Dict:
     """
-    Extract ROI sub-volumes from a *_population_rois.json file.
+    Extract a single ROI sub-volume.
 
     Args:
-        roi_json: Path to *_population_rois.json from identify_lm_rois.py
-        output_dir: Output directory (default: same directory as roi_json)
-        num_levels: Number of pyramid levels for OME-Zarr output
+        mat_file: Source .mat file with labeled volume
+        roi_json: Path to *_roi.json (fiber_dir_axis, min, max)
+        output_dir: Output directory
+        num_levels: Number of pyramid levels
 
     Returns:
-        Dictionary with output file paths per population
+        Dictionary with output file paths
     """
     with open(roi_json) as f:
-        roi_meta = json.load(f)
+        roi = json.load(f)
 
-    mat_file = Path(roi_meta['source_file'])
-    voxel_size_um = roi_meta['voxel_size_um']
-    volume_shape = tuple(roi_meta['volume_shape_zyx'])
-    rois = roi_meta['rois']
-    separation = roi_meta['separation']
-
-    if output_dir is None:
-        output_dir = roi_json.parent
+    fiber_dir_axis = roi['fiber_dir_axis']
+    roi_min = roi['min']
+    roi_max = roi['max']
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Derive sample name from JSON filename
-    sample_name = roi_json.stem.replace('_population_rois', '')
+    # Derive name from ROI JSON filename (e.g. sham_25_ipsi_cc_roi.json -> sham_25_ipsi_cc)
+    sample_name = roi_json.stem.replace('_roi', '')
 
-    logger.info(f"\n{'='*80}")
-    logger.info(f"Extracting ROIs: {sample_name}")
+    # Axis permutation: fiber_dir_axis -> axis 0
+    if fiber_dir_axis == 0:
+        perm = (0, 1, 2)
+    elif fiber_dir_axis == 1:
+        perm = (1, 0, 2)
+    else:
+        perm = (2, 0, 1)
+
+    logger.info(f"\n--- Extracting {sample_name} ---")
     logger.info(f"  Source: {mat_file}")
-    logger.info(f"  Volume shape: {volume_shape}")
-    logger.info(f"  Separation: axis {separation['axis_name']} at {separation['position_um']:.1f} um")
-    logger.info(f"{'='*80}\n")
+    logger.info(f"  ROI: {roi_min} -> {roi_max}")
+    logger.info(f"  fiber_dir_axis: {fiber_dir_axis} -> permutation {perm}")
 
-    if not mat_file.exists():
-        raise FileNotFoundError(f"Source .mat file not found: {mat_file}")
+    slices = tuple(slice(roi_min[i], roi_max[i]) for i in range(3))
 
-    populations = roi_meta['populations']
-    axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
+    # Check for empty ROI
+    extent = [roi_max[i] - roi_min[i] for i in range(3)]
+    if any(e <= 0 for e in extent):
+        logger.warning(f"  Skipping: empty ROI (extent {extent})")
+        return {}
 
-    # Load full segmentation volume
-    logger.info("\nLoading full segmentation volume...")
-    volume_full, _, _ = load_volume_with_metadata(mat_file, voxel_size_override=None)
+    # Load segmentation (cropped)
+    logger.info(f"  Loading segmentation...")
+    with h5py.File(str(mat_file), 'r') as f:
+        for key in f.keys():
+            if not key.startswith('#') and not key.startswith('_'):
+                seg_cropped = f[key][slices]
+                break
+        else:
+            raise ValueError(f"No data found in {mat_file}")
 
-    # Find companion grayscale .h5 file
+    seg_aligned = np.transpose(seg_cropped, perm)
+    logger.info(f"  Segmentation: {seg_cropped.shape} -> {seg_aligned.shape}")
+
+    seg_path = output_dir / f"{sample_name}_myelin.zarr"
+    write_ome_zarr_pyramid(
+        seg_aligned, seg_path,
+        voxel_size_um=VOXEL_SIZE_UM,
+        num_levels=num_levels,
+        downsample_mode='nearest',
+    )
+    output_paths = {'segmentation': str(seg_path)}
+
+    del seg_cropped, seg_aligned
+
+    # Try companion grayscale .h5
     grayscale_name = mat_file.stem.replace('_myelinated_axons', '') + '.h5'
     grayscale_file = mat_file.parent / grayscale_name
-    grayscale_full = None
     if grayscale_file.exists():
-        import h5py
-        logger.info(f"Loading grayscale: {grayscale_file.name}")
+        logger.info(f"  Loading grayscale: {grayscale_file.name}")
         with h5py.File(str(grayscale_file), 'r') as f:
             for dset_name in ['raw', 'data', 'image']:
                 if dset_name in f:
                     break
             else:
                 dset_name = list(f.keys())[0]
-            grayscale_full = f[dset_name][:]
-        logger.info(f"  Grayscale shape: {grayscale_full.shape}, dtype: {grayscale_full.dtype}")
-    else:
-        logger.warning(f"No grayscale file found: {grayscale_file}")
+            gray_cropped = f[dset_name][slices]
 
-    # Extract each ROI
-    output_paths = {}
-    for pop_name, roi in rois.items():
-        logger.info(f"\n--- Extracting {pop_name.upper()} ---")
+        gray_aligned = np.transpose(gray_cropped, perm)
 
-        # Get fiber axis for this population
-        fiber_axis = populations[pop_name]['dominant_axis']
-        if fiber_axis == 0:
-            perm = (0, 1, 2)
-        elif fiber_axis == 1:
-            perm = (1, 0, 2)
-        else:
-            perm = (2, 0, 1)
-        logger.info(f"  Fiber axis: {fiber_axis} ({axis_names[fiber_axis]}) -> permutation {perm}")
-
-        # Convert ROI bounds from um to voxels
-        min_vox = [max(0, int(roi['min_um'][i] / voxel_size_um)) for i in range(3)]
-        max_vox = [min(volume_shape[i], int(np.ceil(roi['max_um'][i] / voxel_size_um))) for i in range(3)]
-
-        slices = tuple(slice(min_vox[i], max_vox[i]) for i in range(3))
-
-        # Check for empty ROI (can happen when separation plane + margin exceeds volume)
-        roi_extent = [max_vox[i] - min_vox[i] for i in range(3)]
-        if any(e <= 0 for e in roi_extent):
-            logger.warning(
-                f"  Skipping {pop_name.upper()}: empty ROI "
-                f"(extent {roi_extent} voxels, bounds {min_vox} to {max_vox})"
-            )
-            continue
-
-        # Crop and permute segmentation (fiber axis -> axis 0)
-        seg_cropped = volume_full[slices]
-        seg_aligned = np.transpose(seg_cropped, perm)
-        logger.info(f"  Segmentation: {volume_full.shape} -> {seg_cropped.shape} -> {seg_aligned.shape}")
-
-        seg_path = output_dir / f"{sample_name}_{pop_name}_myelin.zarr"
+        gray_path = output_dir / f"{sample_name}_grayscale.zarr"
         write_ome_zarr_pyramid(
-            seg_aligned, seg_path,
-            voxel_size_um=voxel_size_um,
+            gray_aligned, gray_path,
+            voxel_size_um=VOXEL_SIZE_UM,
             num_levels=num_levels,
-            downsample_mode='nearest',
+            downsample_mode='mean',
         )
-        output_paths[pop_name] = {'segmentation': str(seg_path)}
+        output_paths['grayscale'] = str(gray_path)
+        del gray_cropped, gray_aligned
+    else:
+        logger.warning(f"  No grayscale file found: {grayscale_file}")
 
-        # Crop and permute grayscale
-        if grayscale_full is not None:
-            gray_cropped = grayscale_full[slices]
-            gray_aligned = np.transpose(gray_cropped, perm)
-
-            gray_path = output_dir / f"{sample_name}_{pop_name}_grayscale.zarr"
-            write_ome_zarr_pyramid(
-                gray_aligned, gray_path,
-                voxel_size_um=voxel_size_um,
-                num_levels=num_levels,
-                downsample_mode='mean',
-            )
-            output_paths[pop_name]['grayscale'] = str(gray_path)
-
-        # Write per-ROI metadata JSON
-        roi_shape_aligned = list(seg_aligned.shape)
-        roi_size_um = [s * voxel_size_um for s in roi_shape_aligned]
-
-        meta_path = output_dir / f"{sample_name}_{pop_name}_myelin.json"
-        pop_meta = {
-            "voxel_size": [voxel_size_um] * 3,
-            "unit": "micrometer",
-            "source_file": str(mat_file),
-            "roi_json": str(roi_json),
-            "population": pop_name,
-            "shape_zyx": roi_shape_aligned,
-            "size_um_zyx": roi_size_um,
-            "roi_min_um": roi['min_um'],
-            "roi_max_um": roi['max_um'],
-            "fiber_axis": fiber_axis,
-            "fiber_axis_name": axis_names[fiber_axis],
-            "axis_permutation": list(perm),
-            "num_levels": num_levels,
-        }
-        with open(meta_path, 'w') as f:
-            json.dump(pop_meta, f, indent=2)
-
-        output_paths[pop_name]['metadata'] = str(meta_path)
-        logger.info(f"  Metadata: {meta_path}")
-
-    del volume_full
-    if grayscale_full is not None:
-        del grayscale_full
-
-    logger.info(f"\n{'='*80}")
-    logger.info("Extraction complete!")
-    for pop_name, paths in output_paths.items():
-        for kind, path in paths.items():
-            logger.info(f"  {pop_name.upper()} {kind}: {path}")
-    logger.info(f"{'='*80}\n")
-
+    logger.info(f"  Done: {sample_name}")
     return output_paths
 
 
 def main():
-    """Main entry point with CLI argument parsing."""
     parser = argparse.ArgumentParser(
-        description='Extract LM ROI sub-volumes as OME-Zarr with multi-resolution pyramids.',
+        description='Extract all LM ROI sub-volumes as OME-Zarr.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-    # Single ROI file
-    python scripts/preparation/extract_lm_rois.py \\
-        data/raw/rat/LM/sham_25_ipsi_population_rois.json
+Finds all *_roi.json files in roi_dir, matches to source .mat files,
+and extracts cropped, axis-aligned OME-Zarr volumes.
 
-    # Batch processing
-    python scripts/preparation/extract_lm_rois.py \\
-        "data/raw/rat/LM/*_population_rois.json"
-
-    # Custom output directory
-    python scripts/preparation/extract_lm_rois.py \\
-        data/raw/rat/LM/sham_25_ipsi_population_rois.json \\
-        --output-dir data/processed/rat/LM
-
-Inputs:
-    *_population_rois.json from identify_lm_rois.py
-
-Outputs per population (CC, CG):
-    - <sample>_<pop>_myelin.zarr:     Segmentation (OME-Zarr, multi-resolution)
-    - <sample>_<pop>_grayscale.zarr:  Grayscale image (OME-Zarr, multi-resolution)
-    - <sample>_<pop>_myelin.json:     Per-ROI metadata (shape, voxel size, etc.)
+Outputs per ROI:
+    - <sample>_myelin.zarr:     Segmentation (OME-Zarr, multi-resolution)
+    - <sample>_grayscale.zarr:  Grayscale image (if companion .h5 exists)
         """
     )
     parser.add_argument(
-        'input_files', type=str,
-        help='*_population_rois.json file(s) (glob pattern supported)'
+        '--source-dir', type=Path, default=Path('data/source/rat'),
+        help='Root directory containing source .mat files (default: data/source/rat)'
     )
     parser.add_argument(
-        '--output-dir', type=Path, default=None,
-        help='Output directory (default: same as input JSON)'
+        '--roi-dir', type=Path, default=Path('data/raw/rat/lm'),
+        help='Directory containing *_roi.json files and output (default: data/raw/rat/lm)'
     )
     parser.add_argument(
         '--num-levels', type=int, default=4,
@@ -247,33 +193,24 @@ Outputs per population (CC, CG):
 
     args = parser.parse_args()
 
-    # Expand glob pattern
-    input_pattern = args.input_files
-    if '*' in input_pattern:
-        input_files = sorted(glob(input_pattern, recursive=True))
-    else:
-        input_files = [input_pattern]
-
-    if not input_files:
-        logger.error(f"No files found matching: {args.input_files}")
+    # Find all ROI JSONs
+    roi_files = sorted(args.roi_dir.glob('*_roi.json'))
+    if not roi_files:
+        logger.error(f"No *_roi.json files found in {args.roi_dir}")
         return
 
-    logger.info(f"Found {len(input_files)} input file(s)")
+    logger.info(f"Found {len(roi_files)} ROI file(s)")
 
-    for json_file in input_files:
-        json_path = Path(json_file)
-        if not json_path.exists():
-            logger.warning(f"File not found: {json_file}")
-            continue
-
+    for roi_file in roi_files:
         try:
-            extract_rois(
-                json_path,
-                output_dir=args.output_dir,
+            mat_file = find_source_mat(roi_file, args.source_dir)
+            extract_roi(
+                mat_file, roi_file,
+                output_dir=args.roi_dir,
                 num_levels=args.num_levels,
             )
         except Exception as e:
-            logger.error(f"Failed to process {json_file}: {e}")
+            logger.error(f"Failed to process {roi_file}: {e}")
             import traceback
             traceback.print_exc()
 

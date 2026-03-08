@@ -76,7 +76,8 @@ fig/                        # Generated figures and plots
 src/                        # Python source code for preprocessing, analysis, and visualization
 │
 scripts/                    # Analysis, figure generation, and exploratory scripts
-│   ├── processing/         # Data processing and preparation
+│   ├── preparation/        # Data preparation (ROI identification, volume extraction)
+│   ├── processing/         # Data processing (slice profiles, axon profiles)
 │   ├── figures/            # Manuscript figure generation
 │   ├── visualization/      # Neuroglancer and interactive visualization
 │   ├── exploratory/        # Exploratory analyses (spatial_correlations/, 2d_vs_3d/, distribution_fitting/)
@@ -98,6 +99,35 @@ scripts/                    # Analysis, figure generation, and exploratory scrip
 **Rationale**: This structure enables easy comparison between different imaging modalities (HM/LM) for the same biological sample, while preserving critical experimental metadata (condition, subject ID, hemisphere) in filenames for analysis and filtering.
 
 ## Main Components
+
+### Preparation Pipeline (`scripts/preparation/`)
+
+The preparation scripts convert raw heterogeneous data into a **unified canonical format** so that all downstream processing scripts can work with the same assumptions.
+
+**Canonical output format:**
+- OME-Zarr volumes with multi-resolution pyramids
+- **Isotropic voxels** (resampled if source is anisotropic, e.g. HM 0.015×0.015×0.05 → isotropic)
+- **Z axis = along-axon (fiber) direction** — axes are permuted so the dominant/fiber axis maps to axis 0 (Z)
+- XY planes = cross-sections perpendicular to fibers
+
+This means **processing scripts can always assume `slice_axis=0`** to get cross-sections, regardless of the original fiber orientation in the raw data.
+
+**Step 1: Identify ROIs**
+
+- **LM** (`identify_lm_rois.py`): Identifies CC and CG populations via PCA-based orientation classification. Finds an optimal spatial separation plane between the two populations. Outputs `*_population_rois.json` with ROI bounds, dominant axes, and separation metadata.
+- **HM** (`identify_hm_rois.py`): Determines the single fiber direction by comparing cross-section eccentricity along each axis (lowest eccentricity = perpendicular to fibers). Outputs `*_roi.json` with dominant axis.
+
+**Step 2: Extract volumes**
+
+- **LM** (`extract_lm_rois.py`): Reads `*_population_rois.json`, crops each population's ROI, permutes the **separation axis → Z**, and writes OME-Zarr. LM data is already isotropic (0.05 μm). Outputs per-population: `*_cc_myelin.zarr`, `*_cg_myelin.zarr` (+ grayscale companions).
+- **HM** (`extract_hm_rois.py`): Reads `*_roi.json`, permutes the **dominant axis → Z**, resamples anisotropic voxels to isotropic, and writes OME-Zarr. Outputs: `*_myelin.zarr` (+ grayscale companion).
+
+**Axis permutation logic** (same in both):
+```
+dominant/separation axis 0 → (0,1,2)  — already Z, no change
+dominant/separation axis 1 → (1,0,2)  — swap Y↔Z
+dominant/separation axis 2 → (2,0,1)  — move X to Z
+```
 
 ### Preprocessing Pipeline (3 steps)
 

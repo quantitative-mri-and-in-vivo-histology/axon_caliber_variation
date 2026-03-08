@@ -25,7 +25,6 @@ Example usage:
 import argparse
 import json
 import logging
-from glob import glob
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -166,69 +165,55 @@ def identify_hm_roi(
 
     # Find dominant axis
     logger.info("Analyzing eccentricity per axis...")
-    dominant_axis, axis_results = find_dominant_axis(volume_iso, min_area)
+    dominant_axis, _axis_results = find_dominant_axis(volume_iso, min_area)
 
-    # Derive sample name
-    sample_name = mat_file.stem.replace('_myelinated_axons', '')
+    # Derive sample name: HM_25_ipsi_myelinated_axons -> hm_25_ipsi
+    sample_name = mat_file.stem.replace('_myelinated_axons', '').lower()
 
-    # Build output metadata
-    axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
-    metadata = {
-        "source_file": str(mat_file),
-        "voxel_size_xyz_um": list(voxel_size),
-        "volume_shape_zyx": list(volume.shape),
-        "dominant_axis": dominant_axis,
-        "dominant_axis_name": axis_names[dominant_axis],
-        "eccentricity_per_axis": {
-            axis_names[a]: {
-                "eccentricity": r['eccentricity'],
-                "eccentricity_iqr": r['eccentricity_iqr'],
-                "n_slices_sampled": r['n_slices_sampled'],
-                "n_axons_total": r['n_axons_total'],
-            }
-            for a, r in axis_results.items()
-        },
+    # Build simplified ROI JSON (full volume, just fiber direction)
+    roi_data = {
+        "fiber_dir_axis": dominant_axis,
+        "min": [0, 0, 0],
+        "max": list(volume.shape),
     }
 
     # Write JSON
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{sample_name}_roi.json"
     with open(json_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(roi_data, f, indent=2)
 
+    axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
     logger.info(f"\n{'='*80}")
     logger.info(f"Saved: {json_path}")
-    logger.info(f"  Dominant axis: {dominant_axis} ({axis_names[dominant_axis]})")
+    logger.info(f"  fiber_dir_axis: {dominant_axis} ({axis_names[dominant_axis]})")
+    logger.info(f"  min: [0, 0, 0], max: {list(volume.shape)}")
     logger.info(f"{'='*80}\n")
 
-    return metadata
+    return roi_data
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Identify fiber direction in HM volumes via eccentricity analysis.',
+        description='Identify fiber direction in all HM volumes under a source directory.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
+Example:
     python scripts/preparation/identify_hm_rois.py \\
-        data/raw/Sham_25_ipsi/HM_25_ipsi_myelinated_axons.mat \\
+        data/source/rat \\
         data/raw/rat/HM
 
-    python scripts/preparation/identify_hm_rois.py \\
-        "data/raw/**/HM*_myelinated_axons.mat" \\
-        data/raw/rat/HM
-
-Outputs:
-    - <sample>_roi.json: Dominant axis, eccentricity analysis, volume metadata
+Finds all HM_*_myelinated_axons.mat files under source_dir and writes
+ROI JSONs to output_dir.
         """
     )
     parser.add_argument(
-        'input_files', type=str,
-        help='Input .mat file(s) (glob pattern supported)'
+        'source_dir', type=Path, nargs='?', default=Path('data/source/rat'),
+        help='Root directory containing HM source .mat files (default: data/source/rat)'
     )
     parser.add_argument(
-        'output_dir', type=Path,
-        help='Output directory for JSON results'
+        'output_dir', type=Path, nargs='?', default=Path('data/raw/rat/hm'),
+        help='Output directory for ROI JSONs (default: data/raw/rat/hm)'
     )
     parser.add_argument(
         '--voxel-size', type=float, nargs=3, default=[0.015, 0.015, 0.05],
@@ -242,24 +227,16 @@ Outputs:
 
     args = parser.parse_args()
 
-    # Expand glob pattern
-    if '*' in args.input_files:
-        input_files = sorted(glob(args.input_files, recursive=True))
-    else:
-        input_files = [args.input_files]
+    # Find all HM .mat files under source_dir
+    input_files = sorted(args.source_dir.rglob('HM_*_myelinated_axons.mat'))
 
     if not input_files:
-        logger.error(f"No files found matching: {args.input_files}")
+        logger.error(f"No HM_*_myelinated_axons.mat files found under {args.source_dir}")
         return
 
-    logger.info(f"Found {len(input_files)} input file(s)")
+    logger.info(f"Found {len(input_files)} HM volume(s)")
 
-    for mat_file in input_files:
-        mat_path = Path(mat_file)
-        if not mat_path.exists():
-            logger.warning(f"File not found: {mat_file}")
-            continue
-
+    for mat_path in input_files:
         try:
             identify_hm_roi(
                 mat_path,
@@ -268,7 +245,7 @@ Outputs:
                 min_area=args.min_area,
             )
         except Exception as e:
-            logger.error(f"Failed to process {mat_file}: {e}")
+            logger.error(f"Failed to process {mat_path}: {e}")
             import traceback
             traceback.print_exc()
 

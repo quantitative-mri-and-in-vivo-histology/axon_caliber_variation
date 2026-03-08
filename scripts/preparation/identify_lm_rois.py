@@ -22,21 +22,16 @@ Example usage:
 import argparse
 import json
 import logging
-from glob import glob
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
-from tqdm import tqdm
 
-from axonometry.io import construct_output_path
-from axonometry.populations import (
-    load_volume_downsampled,
-    precompute_axon_voxels,
-    compute_all_orientations,
-    classify_by_dominant_axis,
-    create_populations,
-)
+from axonometry.populations import (classify_by_dominant_axis,
+                                    compute_all_orientations,
+                                    create_populations,
+                                    load_volume_downsampled,
+                                    precompute_axon_voxels)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -286,175 +281,6 @@ def compute_rois(
     return rois
 
 
-def create_roi_volume(
-    volume_shape: Tuple[int, int, int],
-    separation_axis: int,
-    separation_position_um: float,
-    margin_um: float,
-    voxel_size_um: float,
-    centroids: Dict[str, np.ndarray],
-) -> np.ndarray:
-    """
-    Create a labeled volume with ROI masks.
-
-    Labels:
-        0 = margin/excluded zone
-        1 = CC ROI
-        2 = CG ROI
-
-    Args:
-        volume_shape: Shape of output volume (z, y, x)
-        separation_axis: Axis index for separation
-        separation_position_um: Position of separation plane in um
-        margin_um: Margin on each side
-        voxel_size_um: Voxel size in micrometers
-        centroids: Population centroids
-
-    Returns:
-        Labeled volume array (uint8)
-    """
-    roi_volume = np.zeros(volume_shape, dtype=np.uint8)
-
-    # Convert positions to voxel indices
-    sep_pos_voxels = separation_position_um / voxel_size_um
-    margin_voxels = margin_um / voxel_size_um
-
-    # Determine CC/CG sides
-    cc_pos = centroids['cc'][separation_axis]
-    cc_on_negative = cc_pos < separation_position_um
-
-    # Create coordinate array for the separation axis
-    coords = np.arange(volume_shape[separation_axis])
-
-    # Create masks for each region
-    negative_mask = coords < (sep_pos_voxels - margin_voxels)
-    positive_mask = coords >= (sep_pos_voxels + margin_voxels)
-
-    # Assign labels based on which side each population is on
-    if cc_on_negative:
-        cc_mask = negative_mask
-        cg_mask = positive_mask
-    else:
-        cc_mask = positive_mask
-        cg_mask = negative_mask
-
-    # Apply masks along the separation axis
-    if separation_axis == 0:  # Z
-        for z in range(volume_shape[0]):
-            if cc_mask[z]:
-                roi_volume[z, :, :] = 1
-            elif cg_mask[z]:
-                roi_volume[z, :, :] = 2
-    elif separation_axis == 1:  # Y
-        for y in range(volume_shape[1]):
-            if cc_mask[y]:
-                roi_volume[:, y, :] = 1
-            elif cg_mask[y]:
-                roi_volume[:, y, :] = 2
-    else:  # X (axis 2)
-        for x in range(volume_shape[2]):
-            if cc_mask[x]:
-                roi_volume[:, :, x] = 1
-            elif cg_mask[x]:
-                roi_volume[:, :, x] = 2
-
-    # Count voxels per region
-    n_cc = np.sum(roi_volume == 1)
-    n_cg = np.sum(roi_volume == 2)
-    n_margin = np.sum(roi_volume == 0)
-    total = roi_volume.size
-
-    logger.info(f"  ROI volume: CC={n_cc/total*100:.1f}%, CG={n_cg/total*100:.1f}%, margin={n_margin/total*100:.1f}%")
-
-    return roi_volume
-
-
-def write_neuroglancer_volume(
-    roi_volume: np.ndarray,
-    output_dir: Path,
-    voxel_size_um: float,
-    chunk_size: int = 64,
-    target_resolution_um: float = 0.8,
-) -> None:
-    """
-    Write ROI volume as Neuroglancer Precomputed format (single low-res level).
-
-    For simple ROI masks, we only need one coarse resolution level to save
-    memory and disk space.
-
-    Args:
-        roi_volume: Labeled volume (z, y, x order)
-        output_dir: Output directory
-        voxel_size_um: Original voxel size in micrometers
-        chunk_size: Chunk size for Neuroglancer
-        target_resolution_um: Target resolution in micrometers (default: 0.8)
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Downsample to target resolution
-    downsample_factor = max(1, int(target_resolution_um / voxel_size_um))
-    if downsample_factor > 1:
-        downsampled = roi_volume[::downsample_factor, ::downsample_factor, ::downsample_factor]
-        actual_resolution_um = voxel_size_um * downsample_factor
-    else:
-        downsampled = roi_volume
-        actual_resolution_um = voxel_size_um
-
-    logger.info(f"  ROI volume downsampled {downsample_factor}x: {roi_volume.shape} -> {downsampled.shape}")
-
-    # Create info with single scale
-    voxel_size_nm = actual_resolution_um * 1000
-    size_xyz = [int(downsampled.shape[2]), int(downsampled.shape[1]), int(downsampled.shape[0])]
-    adjusted_chunk = [min(chunk_size, size_xyz[i]) for i in range(3)]
-
-    info = {
-        "@type": "neuroglancer_multiscale_volume",
-        "type": "segmentation",
-        "data_type": "uint8",
-        "num_channels": 1,
-        "scales": [{
-            "key": f"{int(voxel_size_nm)}_{int(voxel_size_nm)}_{int(voxel_size_nm)}",
-            "size": size_xyz,
-            "resolution": [voxel_size_nm, voxel_size_nm, voxel_size_nm],
-            "chunk_sizes": [adjusted_chunk],
-            "encoding": "raw",
-        }],
-    }
-
-    # Write info file
-    with open(output_dir / "info", 'w') as f:
-        json.dump(info, f, indent=2)
-
-    # Write chunks for single scale
-    scale = info["scales"][0]
-    scale_dir = output_dir / scale["key"]
-    scale_dir.mkdir(parents=True, exist_ok=True)
-
-    vol_size = scale["size"]
-    chunk_sizes = scale["chunk_sizes"][0]
-    n_chunks = [(vol_size[i] + chunk_sizes[i] - 1) // chunk_sizes[i] for i in range(3)]
-
-    for cz in range(n_chunks[2]):
-        z_start = cz * chunk_sizes[2]
-        z_end = min(z_start + chunk_sizes[2], vol_size[2])
-
-        for cy in range(n_chunks[1]):
-            y_start = cy * chunk_sizes[1]
-            y_end = min(y_start + chunk_sizes[1], vol_size[1])
-
-            for cx in range(n_chunks[0]):
-                x_start = cx * chunk_sizes[0]
-                x_end = min(x_start + chunk_sizes[0], vol_size[0])
-
-                chunk_data = downsampled[z_start:z_end, y_start:y_end, x_start:x_end]
-                chunk_data = chunk_data.transpose(2, 1, 0).astype(np.uint8)
-
-                chunk_filename = f"{x_start}-{x_end}_{y_start}-{y_end}_{z_start}-{z_end}"
-                with open(scale_dir / chunk_filename, 'wb') as f:
-                    f.write(chunk_data.tobytes(order='F'))
-
-    logger.info(f"  Wrote Neuroglancer volume to {output_dir}")
-
 
 def identify_population_rois(
     mat_file: Path,
@@ -466,11 +292,9 @@ def identify_population_rois(
     k_neighbors: int = 10,
     max_neighbor_distance_um: float = 30.0,
     margin_um: float = 10.0,
-    chunk_size: int = 64,
-    organize_by_microscopy: bool = False,
 ) -> Dict:
     """
-    Identify CC and CG population ROIs and export for visualization.
+    Identify CC and CG population ROIs.
 
     Args:
         mat_file: Input .mat file with labeled volume
@@ -482,8 +306,6 @@ def identify_population_rois(
         k_neighbors: K for KNN sparse filtering
         max_neighbor_distance_um: Max distance for KNN
         margin_um: Margin on each side of separation plane
-        chunk_size: Chunk size for Neuroglancer output
-        organize_by_microscopy: Organize output by HM/LM subdirectories
 
     Returns:
         Dictionary with ROI metadata
@@ -525,7 +347,7 @@ def identify_population_rois(
     # Step 3: Find separation plane
     logger.info("\nStep 3: Finding optimal separation plane...")
     volume_shape = vol_metadata['original_shape']
-    separation_axis, separation_position, separation_stats = find_separation_plane(
+    separation_axis, separation_position, _separation_stats = find_separation_plane(
         populations, axon_data, centroids
     )
 
@@ -536,119 +358,81 @@ def identify_population_rois(
         volume_shape, voxel_size_um, centroids
     )
 
-    axis_names = {0: 'Z', 1: 'Y', 2: 'X'}
     for name, roi in rois.items():
         logger.info(f"  {name.upper()} ROI: {roi['min_um']} to {roi['max_um']}")
 
-    # Step 5: Create and export ROI volume
-    logger.info("\nStep 5: Creating ROI volume for Neuroglancer...")
-    roi_volume = create_roi_volume(
-        volume_shape, separation_axis, separation_position, margin_um,
-        voxel_size_um, centroids
-    )
-
     # Construct output path
-    if organize_by_microscopy:
-        base_output_path = construct_output_path(
-            mat_file, output_dir,
-            output_suffix="_population_rois",
-            organize_by_microscopy=True
-        )
-        sample_output_dir = base_output_path.parent
-        sample_name = base_output_path.stem.replace('_population_rois', '')
-        # Neuroglancer dir matches the JSON name (without extension)
-        neuroglancer_dir = base_output_path.with_suffix('')
-    else:
-        sample_name = mat_file.stem.replace('_myelinated_axons', '')
-        sample_output_dir = output_dir / sample_name
-        neuroglancer_dir = sample_output_dir / "population_rois"
+    # Derive sample name: LM_25_ipsi_myelinated_axons -> lm_25_ipsi
+    # Parent dir encodes condition: Sham_25_ipsi -> sham
+    parent_name = mat_file.parent.name.lower()  # e.g. "sham_25_ipsi"
+    condition = parent_name.split('_')[0]  # e.g. "sham"
+    stem = mat_file.stem.replace('_myelinated_axons', '')  # e.g. "LM_25_ipsi"
+    parts = stem.split('_', 1)  # ["LM", "25_ipsi"]
+    sample_name = f"{condition}_{parts[1]}" if len(parts) > 1 else stem.lower()
+    sample_output_dir = output_dir
 
-    # Write Neuroglancer volume
-    write_neuroglancer_volume(
-        roi_volume, neuroglancer_dir, voxel_size_um, chunk_size
-    )
+    # Step 5: Save per-population ROI JSONs (simplified format)
+    logger.info("\nStep 6: Saving ROI JSONs...")
 
-    # Step 6: Save JSON metadata
-    logger.info("\nStep 6: Saving ROI metadata...")
-
-    metadata = {
-        "source_file": str(mat_file),
-        "voxel_size_um": voxel_size_um,
-        "volume_shape_zyx": list(volume_shape),
-        "parameters": {
-            "downsample": downsample,
-            "max_angle_deg": max_angle_deg,
-            "min_length_um": min_length_um,
-            "k_neighbors": k_neighbors,
-            "max_neighbor_distance_um": max_neighbor_distance_um,
-        },
-        "separation": {
-            "axis": separation_axis,
-            "axis_name": axis_names[separation_axis],
-            "position_um": float(separation_position),
-            "margin_um": margin_um,
-            "cc_accuracy_pct": separation_stats['cc_accuracy'],
-            "cg_accuracy_pct": separation_stats['cg_accuracy'],
-        },
-        "populations": {
-            pop['name']: {
-                "n_axons": pop['n_axons'],
-                "centroid_um": centroids[pop['name']].tolist(),
-                "mean_orientation": pop['mean_orientation'],
-                "dominant_axis": pop['dominant_axis'],
-                "dominant_axis_name": pop['dominant_axis_name'],
-            }
-            for pop in populations[:2]
-        },
-        "rois": rois,
-        "neuroglancer_path": str(neuroglancer_dir),
+    # Build a lookup for dominant_axis per population
+    pop_dominant_axis = {
+        pop['name']: pop['dominant_axis']
+        for pop in populations[:2]
     }
 
-    json_path = sample_output_dir / f"{sample_name}_population_rois.json"
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(json_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
+    roi_jsons = {}
+    for pop_name, roi in rois.items():
+        # Convert um bounds to voxel coordinates
+        min_vox = [max(0, int(roi['min_um'][i] / voxel_size_um)) for i in range(3)]
+        max_vox = [min(volume_shape[i], int(np.ceil(roi['max_um'][i] / voxel_size_um))) for i in range(3)]
 
-    logger.info(f"  Saved: {json_path}")
+        roi_data = {
+            "fiber_dir_axis": pop_dominant_axis[pop_name],
+            "min": min_vox,
+            "max": max_vox,
+        }
+
+        json_path = sample_output_dir / f"{sample_name}_{pop_name}_roi.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(json_path, 'w') as f:
+            json.dump(roi_data, f, indent=2)
+
+        roi_jsons[pop_name] = str(json_path)
+        logger.info(f"  {pop_name.upper()}: {json_path}")
+        logger.info(f"    fiber_dir_axis={pop_dominant_axis[pop_name]}, "
+                     f"min={min_vox}, max={max_vox}")
 
     logger.info(f"\n{'='*80}")
     logger.info("ROI identification complete!")
-    logger.info(f"  JSON: {json_path}")
-    logger.info(f"  Neuroglancer: {neuroglancer_dir}")
+    for pop_name, path in roi_jsons.items():
+        logger.info(f"  {pop_name.upper()}: {path}")
     logger.info(f"{'='*80}\n")
 
-    return metadata
+    return roi_jsons
 
 
 def main():
     """Main entry point with CLI argument parsing."""
     parser = argparse.ArgumentParser(
-        description='Identify CC and CG population ROIs using spatial separation.',
+        description='Identify CC and CG population ROIs for all LM volumes in a source directory.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-    # Single file
-    python scripts/processing/identify_population_rois.py \\
-        data/raw/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat \\
-        data/processed/LM
+Example:
+    python scripts/preparation/identify_lm_rois.py \\
+        data/source/rat \\
+        data/raw/rat/LM
 
-    # Batch processing
-    python scripts/processing/identify_population_rois.py \\
-        "data/raw/**/LM*_myelinated_axons.mat" \\
-        data/processed/LM
-
-Outputs:
-    - <sample>_population_rois.json: ROI bounding boxes and metadata
-    - <sample>/population_rois/: Neuroglancer precomputed volume (1=CC, 2=CG)
+Finds all LM_*_myelinated_axons.mat files under source_dir and writes
+per-population ROI JSONs to output_dir.
         """
     )
     parser.add_argument(
-        'input_files', type=str,
-        help='Input .mat file(s) with labeled volumes (glob pattern supported)'
+        'source_dir', type=Path, nargs='?', default=Path('data/source/rat'),
+        help='Root directory containing LM source .mat files (default: data/source/rat)'
     )
     parser.add_argument(
-        'output_dir', type=Path,
-        help='Output directory for results'
+        'output_dir', type=Path, nargs='?', default=Path('data/raw/rat/lm'),
+        help='Output directory for ROI JSONs and Neuroglancer volumes (default: data/raw/rat/lm)'
     )
     parser.add_argument(
         '--voxel-size', type=float, default=0.05,
@@ -678,37 +462,18 @@ Outputs:
         '--margin', type=float, default=10.0,
         help='Margin on each side of separation plane in um (default: 10.0)'
     )
-    parser.add_argument(
-        '--chunk-size', type=int, default=64,
-        help='Chunk size for Neuroglancer output (default: 64)'
-    )
-    parser.add_argument(
-        '--organize-by-microscopy', action='store_true',
-        help='Organize output by HM/LM subdirectories'
-    )
-
     args = parser.parse_args()
 
-    # Expand glob pattern
-    input_pattern = args.input_files
-    if '*' in input_pattern:
-        input_files = sorted(glob(input_pattern, recursive=True))
-    else:
-        input_files = [input_pattern]
+    # Find all LM .mat files under source_dir
+    input_files = sorted(args.source_dir.rglob('LM_*_myelinated_axons.mat'))
 
     if not input_files:
-        logger.error(f"No files found matching: {args.input_files}")
+        logger.error(f"No LM_*_myelinated_axons.mat files found under {args.source_dir}")
         return
 
-    logger.info(f"Found {len(input_files)} input file(s)")
+    logger.info(f"Found {len(input_files)} LM volume(s)")
 
-    # Process each file
-    for mat_file in input_files:
-        mat_path = Path(mat_file)
-        if not mat_path.exists():
-            logger.warning(f"File not found: {mat_file}")
-            continue
-
+    for mat_path in input_files:
         try:
             identify_population_rois(
                 mat_path,
@@ -720,11 +485,9 @@ Outputs:
                 k_neighbors=args.k_neighbors,
                 max_neighbor_distance_um=args.max_neighbor_distance,
                 margin_um=args.margin,
-                chunk_size=args.chunk_size,
-                organize_by_microscopy=args.organize_by_microscopy,
             )
         except Exception as e:
-            logger.error(f"Failed to process {mat_file}: {e}")
+            logger.error(f"Failed to process {mat_path}: {e}")
             import traceback
             traceback.print_exc()
 
