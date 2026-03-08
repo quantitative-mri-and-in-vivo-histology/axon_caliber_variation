@@ -73,8 +73,6 @@ data/
 │
 fig/                        # Generated figures and plots
 │
-src/                        # Python source code for preprocessing, analysis, and visualization
-│
 scripts/                    # Analysis, figure generation, and exploratory scripts
 │   ├── preparation/        # Data preparation (ROI identification, volume extraction)
 │   ├── processing/         # Data processing (slice profiles, axon profiles)
@@ -129,39 +127,7 @@ dominant/separation axis 1 → (1,0,2)  — swap Y↔Z
 dominant/separation axis 2 → (2,0,1)  — move X to Z
 ```
 
-### Preprocessing Pipeline (3 steps)
-
-**Step 1: Bundle Identification** ([preprocess_1_identify_bundles.py](src/preprocess_1_identify_bundles.py))
-- Discover fiber bundles using orientation-based clustering (PCA + hierarchical clustering)
-- No assumptions about specific tract identities (CC/CG)
-- Filter bundles by size (≥500 axons) and remove spatially isolated axons using KNN distance threshold
-- Save bundle metadata (axon labels, orientations, lengths) to JSON
-
-**Step 2: Bundle Volume Extraction** ([preprocess_1b_extract_bundle_volumes.py](src/preprocess_1b_extract_bundle_volumes.py))
-- Extract individual bundle volumes from bundle metadata
-- Create axis-aligned OME-Zarr volumes with 5 pyramid levels
-- Optimized for Neuroglancer visualization
-- Two-phase processing: write level 0 (streaming), then generate pyramids
-
-**Step 3: Orthogonal Slice Extraction** ([preprocess_1c_extract_orthogonal_slices.py](src/preprocess_1c_extract_orthogonal_slices.py))
-- Extract true orthogonal cross-sections perpendicular to fiber direction
-- Uses oblique sampling via `scipy.ndimage.map_coordinates`
-- Parallel extraction with ThreadPoolExecutor
-- Outputs OME-Zarr with multi-resolution pyramids
-- Filters slices to include only bundle axons
-
 ### Analysis Pipeline
-
-**Effective Radius Analysis** ([analyze_effective_radius.py](src/analyze_effective_radius.py))
-- Supports both Zarr and HDF5 input formats
-- Extract circular-equivalent radii per slice using regionprops
-- Compute radius histograms (bin edges: 0-20 μm with 0.02 μm step)
-- Calculate effective MRI-visible radius: r_eff = (⟨r⁶⟩/⟨r²⟩)^(1/4)
-- Per-slice profiles showing radius variation along tract
-- Global pooled effective radius from all slices combined
-- Parallel processing with multiprocessing Pool
-- Memory-efficient: reads slices directly from file
-- Axon count filtering (min_axon_fraction) for symmetric slice selection
 
 **Parametric Distribution Fitting** (human corpus callosum data)
 
@@ -224,20 +190,6 @@ python scripts/figures/fit_combined_distributions.py \
 
 *Key finding*: Best AIC (GEV) ≠ best r_eff predictor. Log Normal has near-zero r_eff bias for Human CC despite worse AIC.
 
-### Visualization
-
-**Neuroglancer Viewer** ([visualize_neuroglancer.py](src/visualize_neuroglancer.py))
-- Visualize bundle volumes in Neuroglancer
-- Supports both HDF5 and OME-Zarr formats
-- Multi-resolution HTTP serving for Zarr with CORS support
-- Optional grayscale image overlay
-- Auto-detection of segment IDs from stored metadata
-
-**Effective Radius Plots**
-- Per-slice effective radius vs position along tract
-- Global effective radius as reference line (dashed)
-- Axon count per slice subplot
-- Publication-ready plots (200 DPI)
 
 ## Workflow
 
@@ -258,72 +210,6 @@ Place the 10 .mat files in `data/raw/LM/`:
 - LM_49_ipsi_myelinated_axons.mat (TBI)
 - LM_49_contra_myelinated_axons.mat (TBI)
 
-### 2. Identify fiber bundles
-
-```bash
-python src/preprocess_1_identify_bundles.py \
-    data/raw/LM/LM_25_ipsi_myelinated_axons.mat \
-    data/processed/LM_25_ipsi/bundles.json \
-    --downsample 4 \
-    --min-axons 500 \
-    --min-length 50.0 \
-    --orientation-threshold 0.7 \
-    --k-neighbors 10 \
-    --max-neighbor-distance 30.0
-```
-
-Output: `data/processed/LM_25_ipsi/bundles.json`
-
-### 3. Extract bundle volumes (axis-aligned)
-
-```bash
-python src/preprocess_1b_extract_bundle_volumes.py \
-    data/raw/LM/LM_25_ipsi_myelinated_axons.mat \
-    data/processed/LM_25_ipsi/bundles.json \
-    data/processed/LM_25_ipsi/aligned \
-    --voxel-size 0.05 \
-    --n-levels 5
-```
-
-Output: `data/processed/LM_25_ipsi/aligned/bundle_01_aligned.zarr`, etc.
-
-### 4. Extract orthogonal slices
-
-```bash
-python src/preprocess_1c_extract_orthogonal_slices.py \
-    data/raw/LM/LM_25_ipsi_myelinated_axons.mat \
-    data/processed/LM_25_ipsi/bundles.json \
-    data/processed/LM_25_ipsi/orthogonal \
-    --voxel-size 0.05 \
-    --padding 0.5 \
-    --n-levels 5 \
-    --n-workers 32
-```
-
-Output: `data/processed/LM_25_ipsi/orthogonal/bundle_01_orthogonal.zarr`, etc.
-
-### 5. Analyze effective radius
-
-```bash
-python src/analyze_effective_radius.py \
-    data/processed/LM_25_ipsi/orthogonal/bundle_01_orthogonal.zarr \
-    fig/LM_25_ipsi \
-    --voxel-size 0.05 \
-    --n-jobs -1 \
-    --min-axon-fraction 0.75
-```
-
-Output: `fig/LM_25_ipsi/Bundle_01_effective_radius_profile.png`
-
-### 6. Visualize in Neuroglancer
-
-```bash
-python src/visualize_neuroglancer.py \
-    data/processed/LM_25_ipsi/orthogonal/bundle_01_orthogonal.zarr \
-    --port 9999
-```
-
-Opens Neuroglancer viewer with multi-resolution support.
 
 ## Technical Details
 
