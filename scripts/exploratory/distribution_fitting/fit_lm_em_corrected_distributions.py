@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Combined distribution fitting for Human CC and Rat white matter data.
+Distribution fitting comparing raw vs EM-corrected human CC data.
 
-Creates a 2x2 figure showing:
-- (a) Human CC: histogram with fitted PDFs (largest ROI)
-- (b) Rat: histogram with fitted PDFs (largest volume)
-- (c) Human CC: AIC comparison (summed across all ROIs)
-- (d) Rat: AIC comparison (summed across all volumes)
+Applies EM-based correction to human LM data: for small radii (below threshold),
+replaces LM counts with scaled EM counts. Compares distribution fits between
+raw and EM-corrected histograms.
 
-This script focuses purely on AIC-based model comparison. Separate scripts
-handle r_eff and r_arith evaluation.
+Creates a 2-row figure showing:
+- Top row: histograms with fitted PDFs (raw and EM-corrected)
+- Bottom row: model comparison metrics (win rate, Wasserstein, r_arith error, r_eff error)
 
 Usage:
-    python fit_combined_distributions.py \\
-        --human-data data/raw_LM \\
-        --rat-data data/processed/LM \\
-        --output fig/combined_distribution_fits.png
+    python scripts/exploratory/distribution_fitting/fit_lm_em_corrected_distributions.py \\
+        --human-data data/raw/human/lm \\
+        --em-data data/raw/human/em \\
+        --output fig/exploratory/lm_em_corrected_distribution_fits.svg
 """
 
 import argparse
@@ -37,7 +36,7 @@ _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
-from axonometry import get_plot_settings
+from axonometry import add_panel_labels, get_plot_settings, style_axis
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -60,8 +59,10 @@ def load_em_radii(em_dir: Path, radius_column: str = 'r_circular_equivalent') ->
     """
     Load EM (electron microscopy) radii from CSV files.
 
+    Looks for *_axon_radii_rp.csv files directly in em_dir.
+
     Args:
-        em_dir: Directory containing ROI subdirectories with *_axon_radii_rp.csv files
+        em_dir: Directory containing *_axon_radii_rp.csv files
         radius_column: Column name for radius measure (default: r_circular_equivalent)
 
     Returns:
@@ -70,13 +71,11 @@ def load_em_radii(em_dir: Path, radius_column: str = 'r_circular_equivalent') ->
     import pandas as pd
 
     radii = []
-    for roi_dir in em_dir.iterdir():
-        if roi_dir.is_dir():
-            csv_file = roi_dir / f'{roi_dir.name}_axon_radii_rp.csv'
-            if csv_file.exists():
-                df = pd.read_csv(csv_file)
-                if radius_column in df.columns:
-                    radii.extend(df[radius_column].values)
+    for csv_file in sorted(em_dir.glob('*_axon_radii_rp.csv')):
+        df = pd.read_csv(csv_file)
+        if radius_column in df.columns:
+            radii.extend(df[radius_column].values)
+            logger.info(f"  Loaded {len(df)} radii from {csv_file.name}")
     return np.array(radii)
 
 
@@ -102,16 +101,14 @@ def apply_em_correction(
         bin_edges: Histogram bin edges
         lm_counts: Original LM counts
         em_radii: Array of EM radii (raw measurements)
-        threshold: Radius threshold for correction (default: 0.4 μm)
-        scale_range: (r_min, r_max) range for computing scale factor (default: 0.5-1.0 μm)
+        threshold: Radius threshold for correction (default: 0.4 um)
+        scale_range: (r_min, r_max) range for computing scale factor (default: 0.5-1.0 um)
 
     Returns:
         Corrected counts array
     """
-    # Create EM histogram with same bins
     em_counts, _ = np.histogram(em_radii, bins=bin_edges)
 
-    # Compute scale factor in reliable range
     scale_mask = (bin_centers >= scale_range[0]) & (bin_centers <= scale_range[1])
     em_in_range = em_counts[scale_mask].sum()
     lm_in_range = lm_counts[scale_mask].sum()
@@ -121,15 +118,9 @@ def apply_em_correction(
         return lm_counts
 
     scale_factor = lm_in_range / em_in_range
-    logger.info(f"EM correction: scale factor = {scale_factor:.1f} (matched at {scale_range[0]}-{scale_range[1]} μm)")
 
-    # Apply correction
     em_scaled = em_counts * scale_factor
     corrected = np.where(bin_centers < threshold, em_scaled, lm_counts)
-
-    # Log summary
-    n_added = corrected.sum() - lm_counts.sum()
-    logger.info(f"EM correction: threshold = {threshold} μm, added {n_added:.0f} counts ({100*n_added/lm_counts.sum():.1f}%)")
 
     return corrected.astype(lm_counts.dtype)
 
@@ -235,10 +226,7 @@ def rediscretize_histogram(
 
 def load_human_cc_data(
     data_dir: Path,
-    bin_width: float = DEFAULT_BIN_WIDTH,
-    em_correction_dir: Optional[Path] = None,
-    em_correction_threshold: float = 0.4,
-    em_correction_scale_range: Tuple[float, float] = (0.5, 1.0)
+    bin_width: float = DEFAULT_BIN_WIDTH
 ) -> Tuple[HistogramData, PerSampleHistogramData]:
     """
     Load human corpus callosum histogram data (MinorAxis).
@@ -246,9 +234,6 @@ def load_human_cc_data(
     Args:
         data_dir: Directory containing human LM histogram files
         bin_width: Target bin width in μm for rediscretization
-        em_correction_dir: If provided, apply EM-based correction using data from this directory
-        em_correction_threshold: Radius threshold for EM correction (default: 0.4 μm)
-        em_correction_scale_range: Range for computing scale factor (default: 0.5-1.0 μm)
 
     Returns:
         Tuple of (pooled HistogramData, per-ROI PerSampleHistogramData)
@@ -283,27 +268,6 @@ def load_human_cc_data(
 
     logger.info(f"Human CC: {total_count:,} total axons, {n_bins} bins")
 
-    # Apply EM correction if requested (to pooled counts only for display)
-    if em_correction_dir is not None:
-        logger.info(f"Loading EM data from {em_correction_dir}")
-        em_radii = load_em_radii(em_correction_dir)
-        logger.info(f"Loaded {len(em_radii)} EM radii")
-        pooled_counts = apply_em_correction(
-            first_centers, first_edges, pooled_counts, em_radii,
-            threshold=em_correction_threshold,
-            scale_range=em_correction_scale_range
-        )
-        total_count = int(pooled_counts.sum())
-
-        # Also apply to per-ROI counts (for r_eff computation)
-        for i in range(n_rois):
-            counts_matrix[i] = apply_em_correction(
-                first_centers, first_edges, counts_matrix[i], em_radii,
-                threshold=em_correction_threshold,
-                scale_range=em_correction_scale_range
-            )
-        sample_counts = counts_matrix.sum(axis=1)
-
     pooled = HistogramData(
         bin_edges=first_edges,
         bin_centers=first_centers,
@@ -325,76 +289,43 @@ def load_human_cc_data(
     return pooled, per_sample
 
 
-# =============================================================================
-# Data Loading - Rat (NPZ files)
-# =============================================================================
-
-def load_rat_data(
-    data_dir: Path,
-    bin_width: float = DEFAULT_BIN_WIDTH,
-    r_max: float = 3.0,
-    min_axons: int = 1000
+def create_em_corrected_human_data(
+    human_per_sample: PerSampleHistogramData,
+    em_radii: np.ndarray,
+    threshold: float = 0.4,
+    scale_range: Tuple[float, float] = (0.5, 1.0)
 ) -> Tuple[HistogramData, PerSampleHistogramData]:
-    """
-    Load rat LM data from all NPZ files.
+    """Apply EM correction to all human ROIs."""
+    n_rois = human_per_sample.n_samples
+    corrected_matrix = np.zeros_like(human_per_sample.counts_matrix)
 
-    Each volume contributes one sample. Only includes volumes with at least
-    min_axons axons.
+    for i in range(n_rois):
+        corrected_matrix[i] = apply_em_correction(
+            human_per_sample.bin_centers, human_per_sample.bin_edges,
+            human_per_sample.counts_matrix[i], em_radii,
+            threshold=threshold, scale_range=scale_range
+        )
 
-    Returns:
-        Tuple of (pooled HistogramData, per-volume PerSampleHistogramData)
-    """
-    npz_files = sorted(data_dir.glob('*_axon_profiles.npz'))
-    if not npz_files:
-        raise ValueError(f"No *_axon_profiles.npz files found in {data_dir}")
-
-    n_volumes = len(npz_files)
-    logger.info(f"Rat: found {n_volumes} NPZ files")
-
-    # Determine bin structure
-    bin_edges = np.arange(0, r_max + bin_width, bin_width)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    n_bins = len(bin_centers)
-
-    all_counts = []
-    all_names = []
-
-    for npz_file in npz_files:
-        volume_name = npz_file.stem.replace('_axon_profiles', '')
-        data = np.load(npz_file, allow_pickle=True)
-        radii = data['all_radii_w_branches_um']
-        n_axons = len(data['labels'])
-        if n_axons < min_axons:
-            logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")
-            continue
-        counts, _ = np.histogram(radii, bins=bin_edges)
-        all_counts.append(counts)
-        all_names.append(volume_name)
-
-    n_samples = len(all_counts)
-    counts_matrix = np.array(all_counts, dtype=float)
-    sample_counts = counts_matrix.sum(axis=1)
-    pooled_counts = counts_matrix.sum(axis=0)
+    sample_counts = corrected_matrix.sum(axis=1)
+    pooled_counts = corrected_matrix.sum(axis=0)
     total_count = int(pooled_counts.sum())
 
-    logger.info(f"Rat: {n_samples} volumes with ≥{min_axons} axons, {total_count:,} total radii, {n_bins} bins")
-
     pooled = HistogramData(
-        bin_edges=bin_edges,
-        bin_centers=bin_centers,
+        bin_edges=human_per_sample.bin_edges,
+        bin_centers=human_per_sample.bin_centers,
         counts=pooled_counts,
-        n_samples=n_samples,
+        n_samples=n_rois,
         total_count=total_count,
-        name="Rat WM"
+        name="Human CC (corrected)"
     )
 
     per_sample = PerSampleHistogramData(
-        bin_edges=bin_edges,
-        bin_centers=bin_centers,
-        counts_matrix=counts_matrix,
-        n_samples=n_samples,
+        bin_edges=human_per_sample.bin_edges,
+        bin_centers=human_per_sample.bin_centers,
+        counts_matrix=corrected_matrix,
+        n_samples=n_rois,
         sample_counts=sample_counts,
-        sample_names=all_names
+        sample_names=[f"ROI_{i+1}_corrected" for i in range(n_rois)]
     )
 
     return pooled, per_sample
@@ -875,19 +806,19 @@ def create_combined_figure(
     human_pooled: HistogramData,
     human_largest: HistogramData,
     human_metrics: AggregatedMetrics,
-    rat_pooled: HistogramData,
-    rat_largest: HistogramData,
-    rat_metrics: AggregatedMetrics,
+    corrected_pooled: HistogramData,
+    corrected_largest: HistogramData,
+    corrected_metrics: AggregatedMetrics,
     human_per_sample: PerSampleHistogramData,
-    rat_per_sample: PerSampleHistogramData,
+    corrected_per_sample: PerSampleHistogramData,
     output_file: Path,
     top_n: int = 5
 ) -> None:
     """Create 6-panel figure with 2 rows.
 
     Row 1 (top): Pooled PDFs with all fitted distributions
-        (a) Human pooled PDF with fits
-        (b) Rat pooled PDF with fits
+        (a) Human CC raw pooled PDF with fits
+        (b) Human CC corrected pooled PDF with fits
 
     Row 2 (bottom): Model comparison metrics
         (c) Win rate
@@ -897,17 +828,17 @@ def create_combined_figure(
     """
     from matplotlib.gridspec import GridSpec
 
-    # Species colors from settings
-    HUMAN_COLOR = settings.colors['human']
-    RAT_COLOR = settings.colors['rat']
+    # Species colors from settings (raw = human blue, corrected = rat red)
+    RAW_COLOR = settings.colors['human']
+    CORRECTED_COLOR = settings.colors['rat']
 
     # Create figure with GridSpec: 2 rows, top row has 2 panels, bottom has 4
     fig = plt.figure(figsize=(17, 9.5))
     gs = GridSpec(2, 4, figure=fig, height_ratios=[1, 1], hspace=0.35, wspace=0.35)
 
     # Top row: 2 panels spanning 2 columns each
-    ax_a = fig.add_subplot(gs[0, 0:2])  # Rat PDF
-    ax_b = fig.add_subplot(gs[0, 2:4])  # Human PDF
+    ax_a = fig.add_subplot(gs[0, 0:2])  # Human CC (raw)
+    ax_b = fig.add_subplot(gs[0, 2:4])  # Human CC (corrected)
 
     # Bottom row: 4 panels
     ax_c = fig.add_subplot(gs[1, 0])  # Win rate
@@ -921,24 +852,24 @@ def create_combined_figure(
 
     # Compute inter-ROI Wasserstein for reference lines
     human_inter_roi_w = compute_inter_roi_wasserstein(human_per_sample)
-    rat_inter_roi_w = compute_inter_roi_wasserstein(rat_per_sample)
+    corrected_inter_roi_w = compute_inter_roi_wasserstein(corrected_per_sample)
 
     # Use human distribution order (by AIC) for consistency with bottom row
     dist_order = human_metrics.distribution_names
 
-    # (a) Rat pooled PDF with all fits
+    # (a) Human CC raw pooled PDF with all fits
     _plot_pooled_pdf_with_fits(
-        ax_a, rat_pooled, rat_metrics.pooled_results,
-        species_color=RAT_COLOR,
-        inset_xlim=(0.5, 1.2),  # Rat tail starts earlier
+        ax_a, human_pooled, human_metrics.pooled_results,
+        species_color=RAW_COLOR,
+        inset_xlim=(1.0, 3.0),
         distribution_order=dist_order
     )
 
-    # (b) Human pooled PDF with all fits
+    # (b) Human CC corrected pooled PDF with all fits
     _plot_pooled_pdf_with_fits(
-        ax_b, human_pooled, human_metrics.pooled_results,
-        species_color=HUMAN_COLOR,
-        inset_xlim=(1.0, 3.0),  # Human tail
+        ax_b, corrected_pooled, corrected_metrics.pooled_results,
+        species_color=CORRECTED_COLOR,
+        inset_xlim=(1.0, 3.0),
         distribution_order=dist_order
     )
 
@@ -954,17 +885,17 @@ def create_combined_figure(
         """Custom handler for split-color rectangle."""
         def create_artists(self, legend, orig_handle, xdescent, ydescent,
                            width, height, fontsize, trans):
-            # Create two rectangles side by side (Rat first, then Human)
+            # Create two rectangles side by side (Raw first, then Corrected)
             from matplotlib.patches import Rectangle
             half_width = width / 2
             left_rect = Rectangle(
                 (xdescent, ydescent), half_width, height,
-                facecolor=RAT_COLOR, edgecolor='white', linewidth=0.5,
+                facecolor=RAW_COLOR, edgecolor='white', linewidth=0.5,
                 alpha=0.6, transform=trans
             )
             right_rect = Rectangle(
                 (xdescent + half_width, ydescent), half_width, height,
-                facecolor=HUMAN_COLOR, edgecolor='white', linewidth=0.5,
+                facecolor=CORRECTED_COLOR, edgecolor='white', linewidth=0.5,
                 alpha=0.6, transform=trans
             )
             return [left_rect, right_rect]
@@ -993,29 +924,29 @@ def create_combined_figure(
 
     # (c) Win rate
     _plot_win_rate(
-        ax_c, human_metrics, rat_metrics,
-        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
+        ax_c, human_metrics, corrected_metrics,
+        human_color=RAW_COLOR, rat_color=CORRECTED_COLOR
     )
 
     # (d) Wasserstein distance with inter-ROI reference
     _plot_wasserstein_both_species(
-        ax_d, human_metrics, rat_metrics,
-        human_color=HUMAN_COLOR, rat_color=RAT_COLOR,
-        human_inter_roi=human_inter_roi_w, rat_inter_roi=rat_inter_roi_w
+        ax_d, human_metrics, corrected_metrics,
+        human_color=RAW_COLOR, rat_color=CORRECTED_COLOR,
+        human_inter_roi=human_inter_roi_w, rat_inter_roi=corrected_inter_roi_w
     )
 
-    # (e) r_arith error - both species
+    # (e) r_arith error - both datasets
     _plot_radius_bias_both_species(
-        ax_e, human_metrics, rat_metrics,
+        ax_e, human_metrics, corrected_metrics,
         radius_type='r_arith',
-        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
+        human_color=RAW_COLOR, rat_color=CORRECTED_COLOR
     )
 
-    # (f) r_eff error - both species
+    # (f) r_eff error - both datasets
     _plot_radius_bias_both_species(
-        ax_f, human_metrics, rat_metrics,
+        ax_f, human_metrics, corrected_metrics,
         radius_type='r_eff',
-        human_color=HUMAN_COLOR, rat_color=RAT_COLOR
+        human_color=RAW_COLOR, rat_color=CORRECTED_COLOR
     )
 
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
@@ -1117,23 +1048,23 @@ def _plot_win_rate(
     human_color: str,
     rat_color: str
 ) -> None:
-    """Plot win rate dot plot with both species on same axes."""
+    """Plot win rate dot plot with both datasets on same axes."""
     # Get distribution names (use human order)
     names = human_metrics.distribution_names
     display_names = [get_display_name(n, multiline=True) for n in names]
 
-    # Get win rates for each species (as percentages)
+    # Get win rates for each dataset (as percentages)
     human_win = np.array([human_metrics.win_rate.get(n, 0) for n in names]) * 100
     rat_win = np.array([rat_metrics.win_rate.get(n, 0) for n in names]) * 100
 
     y_spacing = 1.3  # Spacing between distributions
     y_pos = np.arange(len(names)) * y_spacing
 
-    # Plot dots (rat first so human is on top)
+    # Plot dots (corrected first so raw is on top)
     ax.scatter(rat_win, y_pos, color=rat_color, s=120, marker='s',
-               label='Rat', zorder=3, edgecolor='white', linewidth=0.5)
+               label='Corrected', zorder=3, edgecolor='white', linewidth=0.5)
     ax.scatter(human_win, y_pos, color=human_color, s=120, marker='d',
-               label='Human', zorder=4, edgecolor='white', linewidth=0.5)
+               label='Raw', zorder=4, edgecolor='white', linewidth=0.5)
 
     # Connect dots with lines
     for i in range(len(names)):
@@ -1162,7 +1093,7 @@ def _plot_wasserstein_both_species(
     human_inter_roi: float = None,
     rat_inter_roi: float = None
 ) -> None:
-    """Plot Wasserstein distance boxplots for both species on same axes.
+    """Plot Wasserstein distance boxplots for both datasets on same axes.
 
     Optionally shows inter-ROI Wasserstein as vertical dashed reference lines.
     """
@@ -1195,7 +1126,7 @@ def _plot_wasserstein_both_species(
         else:
             box_data_rat.append(np.array([]))
 
-    # Plot boxplots for human (offset down)
+    # Plot boxplots for raw (offset down)
     human_positions = [y_pos[i] - box_width/2 for i in range(len(box_data_human))]
     bp_human = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_human],
                           positions=human_positions, vert=False, widths=box_width * 0.8,
@@ -1208,7 +1139,7 @@ def _plot_wasserstein_both_species(
         patch.set_alpha(0.5)
         patch.set_edgecolor(human_color)
 
-    # Plot boxplots for rat (offset up)
+    # Plot boxplots for corrected (offset up)
     rat_positions = [y_pos[i] + box_width/2 for i in range(len(box_data_rat))]
     bp_rat = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_rat],
                         positions=rat_positions, vert=False, widths=box_width * 0.8,
@@ -1273,16 +1204,16 @@ def _plot_wasserstein_both_species(
             return [line1, line2]
 
     # With ncol=2, matplotlib fills column-wise: (0,0), (1,0), (0,1), (1,1)...
-    # To get Row1: [Rat, Human], Row2: [Anat. Var.], order must be: [Rat, Anat. Var., Human]
-    rat_handle = Patch(facecolor=rat_color, label='Rat')
-    human_handle = Patch(facecolor=human_color, label='Human')
+    # To get Row1: [Corrected, Raw], Row2: [Anat. Var.], order must be: [Corrected, Anat. Var., Raw]
+    rat_handle = Patch(facecolor=rat_color, label='Corrected')
+    human_handle = Patch(facecolor=human_color, label='Raw')
 
     if human_inter_roi is not None or rat_inter_roi is not None:
         # Placeholder handle for Anat. Var. (handler will draw the actual symbol)
         anat_var_handle = Line2D([0], [0], color='none')
-        # Single row: Rat, Human, Anat. Var.
+        # Single row: Corrected, Raw, Anat. Var.
         legend_elements = [rat_handle, human_handle, anat_var_handle]
-        labels = ['Rat', 'Human', 'Anat. Var.']
+        labels = ['Corrected', 'Raw', 'Anat. Var.']
         handler_map = {
             rat_handle: SolidPatchHandler(rat_color),
             human_handle: SolidPatchHandler(human_color),
@@ -1291,7 +1222,7 @@ def _plot_wasserstein_both_species(
         ncol = 3
     else:
         legend_elements = [rat_handle, human_handle]
-        labels = ['Rat', 'Human']
+        labels = ['Corrected', 'Raw']
         handler_map = {
             rat_handle: SolidPatchHandler(rat_color),
             human_handle: SolidPatchHandler(human_color)
@@ -1472,15 +1403,15 @@ def _plot_radius_bias_both_species(
     human_color: str,
     rat_color: str
 ) -> None:
-    """Plot radius bias for both species as violins showing spread.
+    """Plot radius bias for both datasets as violins showing spread.
 
     Args:
         ax: Matplotlib axes
-        human_metrics: Human CC aggregated metrics
-        rat_metrics: Rat WM aggregated metrics
+        human_metrics: Human CC raw aggregated metrics
+        rat_metrics: Human CC corrected aggregated metrics
         radius_type: 'r_arith' or 'r_eff'
-        human_color: Color for human data points
-        rat_color: Color for rat data points
+        human_color: Color for raw data points
+        rat_color: Color for corrected data points
     """
     # Use human distribution order (sorted by AIC)
     names = human_metrics.distribution_names
@@ -1534,7 +1465,7 @@ def _plot_radius_bias_both_species(
     violin_data_human = box_data_human
     violin_data_rat = box_data_rat
 
-    # Plot boxplots for human (offset down)
+    # Plot boxplots for raw (offset down)
     human_positions = [y_pos[i] - box_width/2 for i in range(len(box_data_human))]
     bp_human = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_human],
                           positions=human_positions, vert=False, widths=box_width * 0.8,
@@ -1547,7 +1478,7 @@ def _plot_radius_bias_both_species(
         patch.set_alpha(0.5)
         patch.set_edgecolor(human_color)
 
-    # Plot boxplots for rat (offset up)
+    # Plot boxplots for corrected (offset up)
     rat_positions = [y_pos[i] + box_width/2 for i in range(len(box_data_rat))]
     bp_rat = ax.boxplot([d if len(d) > 0 else [np.nan] for d in box_data_rat],
                         positions=rat_positions, vert=False, widths=box_width * 0.8,
@@ -1643,8 +1574,8 @@ def _plot_radius_bias_both_species(
             return [box, median, left_whisker, right_whisker, left_cap, right_cap]
 
     # Create dummy patches for legend (alpha=1.0 for solid)
-    rat_patch = Patch(facecolor=rat_color, label='Rat', alpha=1.0)
-    human_patch = Patch(facecolor=human_color, label='Human', alpha=1.0)
+    rat_patch = Patch(facecolor=rat_color, label='Corrected', alpha=1.0)
+    human_patch = Patch(facecolor=human_color, label='Raw', alpha=1.0)
 
     ax.legend(handles=[rat_patch, human_patch], loc='upper right',
               fontsize=settings.fonts['legend_size'], ncol=2,
@@ -2045,174 +1976,42 @@ def _plot_radius_scatter(
     ax.grid(True, alpha=0.3)
 
 
-def create_pooled_histogram_figure(
-    human_pooled: HistogramData,
-    human_metrics: AggregatedMetrics,
-    rat_pooled: HistogramData,
-    rat_metrics: AggregatedMetrics,
-    output_file: Path
-) -> None:
-    """Create three-panel figure: (a) human tail, (b) rat tail, (c) full distribution."""
-    from matplotlib.patches import ConnectionPatch
-
-    HUMAN_COLOR = '#1f77b4'  # Blue
-    RAT_COLOR = '#d62728'    # Red
-
-    fig = plt.figure(figsize=(7, 9))
-    gs = fig.add_gridspec(2, 2, height_ratios=[2.5, 1], hspace=0.5, wspace=0.3)
-
-    ax_full = fig.add_subplot(gs[0, :])        # Top (spans both columns)
-    ax_human_tail = fig.add_subplot(gs[1, 0])  # Bottom left
-    ax_rat_tail = fig.add_subplot(gs[1, 1])    # Bottom right
-
-    # Set 1:1 aspect ratio for all panels
-    ax_human_tail.set_box_aspect(1)
-    ax_rat_tail.set_box_aspect(1)
-    ax_full.set_box_aspect(1)
-
-    # Compute densities
-    human_bin_width = np.diff(human_pooled.bin_edges).mean()
-    human_density = human_pooled.counts / (human_pooled.total_count * human_bin_width)
-    rat_bin_width = np.diff(rat_pooled.bin_edges).mean()
-    rat_density = rat_pooled.counts / (rat_pooled.total_count * rat_bin_width)
-
-    # Get best fits
-    best_fit_human = human_metrics.pooled_results[0] if human_metrics.pooled_results else None
-    best_fit_rat = rat_metrics.pooled_results[0] if rat_metrics.pooled_results else None
-
-    tail_xmin, tail_xmax = 1.0, 3.0
-
-    # --- Top left (a): Human tail ---
-    tail_mask_human = (human_pooled.bin_centers >= tail_xmin) & (human_pooled.bin_centers <= tail_xmax)
-    ax_human_tail.bar(human_pooled.bin_centers[tail_mask_human], human_density[tail_mask_human],
-                      width=human_bin_width * 0.9, alpha=0.5, color=HUMAN_COLOR,
-                      edgecolor='white', linewidth=0.5)
-    if best_fit_human:
-        ax_human_tail.plot(human_pooled.bin_centers[tail_mask_human],
-                           best_fit_human.pdf_values[tail_mask_human], '-',
-                           color=HUMAN_COLOR, linewidth=2)
-    ax_human_tail.set_xlim(tail_xmin, tail_xmax)
-    ax_human_tail.set_ylim(0, None)
-    ax_human_tail.set_ylabel('Prob. density', fontsize=settings.fonts['label_size'])
-    ax_human_tail.set_xlabel('Radius [μm]', fontsize=settings.fonts['label_size'])
-    ax_human_tail.tick_params(labelsize=settings.fonts['tick_size'])
-    ax_human_tail.set_title('Human CC', fontsize=settings.fonts['label_size'], color=HUMAN_COLOR)
-
-    # --- Top right (b): Rat tail ---
-    tail_mask_rat = (rat_pooled.bin_centers >= tail_xmin) & (rat_pooled.bin_centers <= tail_xmax)
-    ax_rat_tail.bar(rat_pooled.bin_centers[tail_mask_rat], rat_density[tail_mask_rat],
-                    width=rat_bin_width * 0.9, alpha=0.5, color=RAT_COLOR,
-                    edgecolor='white', linewidth=0.5)
-    if best_fit_rat:
-        ax_rat_tail.plot(rat_pooled.bin_centers[tail_mask_rat],
-                         best_fit_rat.pdf_values[tail_mask_rat], '-',
-                         color=RAT_COLOR, linewidth=2)
-    ax_rat_tail.set_xlim(tail_xmin, tail_xmax)
-    ax_rat_tail.set_ylim(0, None)
-    ax_rat_tail.set_xlabel('Radius [μm]', fontsize=settings.fonts['label_size'])
-    ax_rat_tail.tick_params(labelsize=settings.fonts['tick_size'])
-    ax_rat_tail.set_title('Rat WM', fontsize=settings.fonts['label_size'], color=RAT_COLOR)
-
-    # --- Bottom (c): Full distribution ---
-    ax_full.bar(human_pooled.bin_centers, human_density, width=human_bin_width * 0.9,
-                alpha=0.5, color=HUMAN_COLOR, edgecolor='white', linewidth=0.5,
-                label=f'Human CC (n={human_pooled.total_count:,})')
-    if best_fit_human:
-        ax_full.plot(human_pooled.bin_centers, best_fit_human.pdf_values, '-',
-                     color=HUMAN_COLOR, linewidth=2.5)
-
-    ax_full.bar(rat_pooled.bin_centers, rat_density, width=rat_bin_width * 0.9,
-                alpha=0.5, color=RAT_COLOR, edgecolor='white', linewidth=0.5,
-                label=f'Rat WM (n={rat_pooled.total_count:,})')
-    if best_fit_rat:
-        ax_full.plot(rat_pooled.bin_centers, best_fit_rat.pdf_values, '-',
-                     color=RAT_COLOR, linewidth=2.5)
-
-    ax_full.set_xlim(0, PLOT_XLIM_MAX)
-    ax_full.set_xlabel('Axon radius [μm]', fontsize=settings.fonts['label_size'])
-    ax_full.set_ylabel('Probability density', fontsize=settings.fonts['label_size'])
-    ax_full.legend(loc='upper right', fontsize=settings.fonts['legend_size'])
-    ax_full.tick_params(labelsize=settings.fonts['tick_size'])
-
-    # Connection lines from full plot (top) down to tail panels (bottom)
-    # Human: from full plot bottom to human tail top
-    con_human_left = ConnectionPatch(
-        xyA=(tail_xmin, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmin, ax_human_tail.get_ylim()[1]), coordsB=ax_human_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_human_left)
-
-    con_human_right = ConnectionPatch(
-        xyA=(tail_xmax, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmax, ax_human_tail.get_ylim()[1]), coordsB=ax_human_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_human_right)
-
-    # Rat: from full plot bottom to rat tail top
-    con_rat_left = ConnectionPatch(
-        xyA=(tail_xmin, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmin, ax_rat_tail.get_ylim()[1]), coordsB=ax_rat_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_rat_left)
-
-    con_rat_right = ConnectionPatch(
-        xyA=(tail_xmax, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmax, ax_rat_tail.get_ylim()[1]), coordsB=ax_rat_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_rat_right)
-
-    plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved pooled histogram figure to {output_file}")
-
-
 # =============================================================================
 # Main
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Combined distribution fitting for Human CC and Rat data',
+        description='Distribution fitting comparing raw vs EM-corrected human CC data',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     parser.add_argument('--human-data', type=Path, default=Path('data/raw/human/lm'),
                         help='Directory containing human CC TSV files (default: data/raw/human/lm)')
-    parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
-                        help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
-    parser.add_argument('--output', type=Path, default=Path('fig/main/combined_distribution_fits.svg'),
-                        help='Output file path (default: fig/main/combined_distribution_fits.svg)')
+    parser.add_argument('--em-data', type=Path, default=Path('data/raw/human/em'),
+                        help='Directory containing EM data (default: data/raw/human/em)')
+    parser.add_argument('--output', type=Path,
+                        default=Path('fig/exploratory/lm_em_corrected_distribution_fits.svg'),
+                        help='Output file path')
     parser.add_argument('--bin-width', type=float, default=DEFAULT_BIN_WIDTH,
                         help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')
-    parser.add_argument('--r-max', type=float, default=3.0,
-                        help='Maximum radius in um (default: 3.0)')
     parser.add_argument('--top-n', type=int, default=5,
                         help='Number of top distributions to show in histograms (default: 5)')
-    parser.add_argument('--em-correction', type=Path, default=None,
-                        help='Path to EM data directory for human CC correction (e.g., data/raw_EM). '
-                             'Replaces LM counts below threshold with scaled EM counts.')
-    parser.add_argument('--em-correction-threshold', type=float, default=0.4,
+    parser.add_argument('--em-threshold', type=float, default=0.4,
                         help='Radius threshold for EM correction in um (default: 0.4)')
-    parser.add_argument('--em-correction-scale-range', type=float, nargs=2, default=[0.5, 1.0],
+    parser.add_argument('--em-scale-range', type=float, nargs=2, default=[0.5, 1.0],
                         metavar=('MIN', 'MAX'),
                         help='Radius range for computing EM/LM scale factor (default: 0.5 1.0)')
 
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load Human CC data
+    # Load Human CC data (raw)
     logger.info("=" * 60)
-    logger.info("Loading Human CC data...")
+    logger.info("Loading Human CC data (raw)...")
     human_pooled, human_per_sample = load_human_cc_data(
         args.human_data,
-        args.bin_width,
-        em_correction_dir=args.em_correction,
-        em_correction_threshold=args.em_correction_threshold,
-        em_correction_scale_range=tuple(args.em_correction_scale_range)
+        args.bin_width
     )
 
     # Find largest ROI
@@ -2228,83 +2027,84 @@ def main():
     )
     logger.info(f"Largest ROI: #{largest_roi_idx + 1} with {human_largest.total_count:,} axons")
 
-    # Load Rat data
+    # Load EM radii
     logger.info("=" * 60)
-    logger.info("Loading Rat data...")
-    rat_pooled, rat_per_sample = load_rat_data(args.rat_data, args.bin_width, args.r_max)
+    logger.info(f"Loading EM data from {args.em_data}...")
+    em_radii = load_em_radii(args.em_data)
+    logger.info(f"EM: {len(em_radii)} radii, range [{em_radii.min():.3f}, {em_radii.max():.3f}] um")
 
-    # Find largest volume
-    largest_vol_idx = np.argmax(rat_per_sample.sample_counts)
-    largest_vol_counts = rat_per_sample.counts_matrix[largest_vol_idx]
-    rat_largest = HistogramData(
-        bin_edges=rat_per_sample.bin_edges,
-        bin_centers=rat_per_sample.bin_centers,
-        counts=largest_vol_counts,
-        n_samples=1,
-        total_count=int(largest_vol_counts.sum()),
-        name=rat_per_sample.sample_names[largest_vol_idx]
+    # Create EM-corrected data
+    logger.info("=" * 60)
+    logger.info(f"Applying EM correction (threshold={args.em_threshold} um)...")
+    corrected_pooled, corrected_per_sample = create_em_corrected_human_data(
+        human_per_sample, em_radii,
+        threshold=args.em_threshold,
+        scale_range=tuple(args.em_scale_range)
     )
-    logger.info(f"Largest volume: {rat_largest.name} with {rat_largest.total_count:,} radii")
+    logger.info(f"Corrected: {corrected_pooled.total_count:,} total axons")
+
+    # Find largest corrected ROI
+    largest_corrected_idx = np.argmax(corrected_per_sample.sample_counts)
+    largest_corrected_counts = corrected_per_sample.counts_matrix[largest_corrected_idx]
+    corrected_largest = HistogramData(
+        bin_edges=corrected_per_sample.bin_edges,
+        bin_centers=corrected_per_sample.bin_centers,
+        counts=largest_corrected_counts,
+        n_samples=1,
+        total_count=int(largest_corrected_counts.sum()),
+        name=f"Corrected ROI {largest_corrected_idx + 1}"
+    )
 
     # Fit per-sample and aggregate AIC
     logger.info("=" * 60)
-    logger.info("Fitting Human CC distributions...")
+    logger.info("Fitting Human CC distributions (raw)...")
     human_metrics = fit_all_samples(human_per_sample, human_pooled)
 
     logger.info("=" * 60)
-    logger.info("Fitting Rat distributions...")
-    rat_metrics = fit_all_samples(rat_per_sample, rat_pooled)
+    logger.info("Fitting Human CC distributions (corrected)...")
+    corrected_metrics = fit_all_samples(corrected_per_sample, corrected_pooled)
 
     # Report results
     logger.info("=" * 60)
-    logger.info("Human CC - Top 5 by summed AIC:")
+    logger.info("Human CC (raw) - Top 5 by summed AIC:")
     for i, name in enumerate(human_metrics.distribution_names[:5], 1):
         delta = human_metrics.summed_aic[i-1] - human_metrics.summed_aic[0]
         logger.info(f"  {i}. {name}: Delta AIC = {delta:.0f}")
 
-    logger.info("Rat WM - Top 5 by summed AIC:")
-    for i, name in enumerate(rat_metrics.distribution_names[:5], 1):
-        delta = rat_metrics.summed_aic[i-1] - rat_metrics.summed_aic[0]
+    logger.info("Human CC (corrected) - Top 5 by summed AIC:")
+    for i, name in enumerate(corrected_metrics.distribution_names[:5], 1):
+        delta = corrected_metrics.summed_aic[i-1] - corrected_metrics.summed_aic[0]
         logger.info(f"  {i}. {name}: Delta AIC = {delta:.0f}")
 
-    # Create main figure (4-panel)
+    # Create main figure
     logger.info("=" * 60)
     logger.info("Creating summary figure...")
     create_combined_figure(
         human_pooled, human_largest, human_metrics,
-        rat_pooled, rat_largest, rat_metrics,
-        human_per_sample, rat_per_sample,
+        corrected_pooled, corrected_largest, corrected_metrics,
+        human_per_sample, corrected_per_sample,
         args.output, args.top_n
-    )
-
-    # Create pooled histogram figure
-    pooled_hist_output = args.output.with_stem(args.output.stem + '_histograms')
-    logger.info("Creating pooled histogram figure...")
-    create_pooled_histogram_figure(
-        human_pooled, human_metrics,
-        rat_pooled, rat_metrics,
-        pooled_hist_output
     )
 
     # Subsampling analysis
     logger.info("=" * 60)
     logger.info("Running subsampling analysis...")
     human_subsampling = subsample_and_fit(human_per_sample, n_subsamples=50, subsample_size=1000)
-    rat_subsampling = subsample_and_fit(rat_per_sample, n_subsamples=50, subsample_size=1000)
+    corrected_subsampling = subsample_and_fit(corrected_per_sample, n_subsamples=50, subsample_size=1000)
 
     # Create scatter figures (one per dataset)
-    human_scatter_output = args.output.with_stem(args.output.stem + '_scatter_human')
-    logger.info("Creating Human CC scatter figure...")
-    create_scatter_figure(human_subsampling, human_scatter_output, "Human CC")
+    human_scatter_output = args.output.with_stem(args.output.stem + '_scatter_raw')
+    logger.info("Creating Human CC (raw) scatter figure...")
+    create_scatter_figure(human_subsampling, human_scatter_output, "Human CC (raw)")
 
-    rat_scatter_output = args.output.with_stem(args.output.stem + '_scatter_rat')
-    logger.info("Creating Rat WM scatter figure...")
-    create_scatter_figure(rat_subsampling, rat_scatter_output, "Rat WM")
+    corrected_scatter_output = args.output.with_stem(args.output.stem + '_scatter_corrected')
+    logger.info("Creating Human CC (corrected) scatter figure...")
+    create_scatter_figure(corrected_subsampling, corrected_scatter_output, "Human CC (corrected)")
 
     # Save JSON
     json_file = args.output.with_suffix('.json')
     output_data = {
-        'human_cc': {
+        'human_cc_raw': {
             'n_rois': human_pooled.n_samples,
             'total_count': human_pooled.total_count,
             'largest_roi_idx': int(largest_roi_idx),
@@ -2313,13 +2113,13 @@ def main():
                 for i, name in enumerate(human_metrics.distribution_names)
             ]
         },
-        'rat': {
-            'n_volumes': rat_pooled.n_samples,
-            'total_count': rat_pooled.total_count,
-            'largest_volume': rat_largest.name,
+        'human_cc_corrected': {
+            'n_rois': corrected_pooled.n_samples,
+            'total_count': corrected_pooled.total_count,
+            'largest_roi_idx': int(largest_corrected_idx),
             'distributions': [
-                {'name': name, 'summed_aic': float(rat_metrics.summed_aic[i])}
-                for i, name in enumerate(rat_metrics.distribution_names)
+                {'name': name, 'summed_aic': float(corrected_metrics.summed_aic[i])}
+                for i, name in enumerate(corrected_metrics.distribution_names)
             ]
         }
     }

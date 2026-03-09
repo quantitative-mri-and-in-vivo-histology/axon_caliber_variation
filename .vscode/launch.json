@@ -477,6 +477,19 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"
             }
+        },
+        {
+            "name": "Exploratory: Fit LM EM-Corrected Distributions",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/distribution_fitting/fit_lm_em_corrected_distributions.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
         }
     ]
 }
