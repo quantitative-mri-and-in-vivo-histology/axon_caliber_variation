@@ -431,6 +431,12 @@ def plot_scatter_panel(ax, all_metrics: List[Tuple[Dict, Dict, str]],
 
     style_axis(ax, xlabel=xlabel, ylabel=ylabel)
 
+    # Normalized mean bias: mean((2D - 3D) / 3D) * 100%
+    x_arr = np.array(x_vals)
+    y_arr = np.array(y_vals)
+    nmb = np.mean((y_arr - x_arr) / x_arr) * 100
+    bias_str = f'Bias = {nmb:+.1f}%'
+
     # Correlation annotation
     if mc_results and metric in mc_results:
         r_mean = mc_results[metric]['r_mean']
@@ -438,15 +444,15 @@ def plot_scatter_panel(ax, all_metrics: List[Tuple[Dict, Dict, str]],
         p_val = mc_results[metric].get('p_value', None)
         if p_val is not None:
             p_str = 'p < 0.001' if p_val < 0.001 else f'p = {p_val:.3f}'
-            text = f'$R$ = {r_mean:.2f} ± {r_std:.2f}\n{p_str}'
+            text = f'{bias_str}\n$R$ = {r_mean:.2f} ± {r_std:.2f}\n{p_str}'
         else:
-            text = f'$R$ = {r_mean:.2f} ± {r_std:.2f}'
+            text = f'{bias_str}\n$R$ = {r_mean:.2f} ± {r_std:.2f}'
         ax.text(0.95, 0.05, text, transform=ax.transAxes,
                 fontsize=settings.fonts['legend_size'], ha='right', va='bottom')
     else:
         r, p = stats.pearsonr(x_vals, y_vals)
         p_str = 'p < 0.001' if p < 0.001 else f'p = {p:.3f}'
-        ax.text(0.95, 0.05, f'$R$ = {r:.2f}, {p_str}', transform=ax.transAxes,
+        ax.text(0.95, 0.05, f'{bias_str}\n$R$ = {r:.2f}, {p_str}', transform=ax.transAxes,
                 fontsize=settings.fonts['legend_size'], ha='right', va='bottom')
 
 
