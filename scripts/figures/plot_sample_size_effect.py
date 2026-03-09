@@ -179,42 +179,15 @@ def load_rat_histograms(
 
     for npz_file in npz_files:
         volume_name = npz_file.stem.replace('_axon_profiles', '')
-        pop_file = npz_file.parent / f"{volume_name}_populations.json"
-
         data = np.load(npz_file, allow_pickle=True)
-        labels = data['labels']
-        radii_profiles = data['radii_profiles_um']
-
-        if pop_file.exists():
-            with open(pop_file) as f:
-                pop_data = json.load(f)
-
-            for pop in pop_data['populations']:
-                pop_name = pop['name'].upper()
-                n_axons = pop.get('n_axons', len(pop['axon_labels']))
-
-                # Skip ROIs with too few axons
-                if n_axons < min_axons:
-                    logger.debug(f"Skipping {volume_name}_{pop_name}: only {n_axons} axons (min: {min_axons})")
-                    continue
-
-                pop_labels = set(pop['axon_labels'])
-
-                mask = np.isin(labels, list(pop_labels))
-                if mask.sum() > 0:
-                    pop_radii = np.concatenate([radii_profiles[i] for i in np.where(mask)[0]])
-                    counts, _ = np.histogram(pop_radii, bins=bin_edges)
-                    all_counts.append(counts)
-                    all_names.append(f"{volume_name}_{pop_name}")
-        else:
-            radii = data['all_radii_w_branches_um']
-            n_axons = len(data['labels'])
-            if n_axons < min_axons:
-                logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")
-                continue
-            counts, _ = np.histogram(radii, bins=bin_edges)
-            all_counts.append(counts)
-            all_names.append(volume_name)
+        radii = data['all_radii_w_branches_um']
+        n_axons = len(data['labels'])
+        if n_axons < min_axons:
+            logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")
+            continue
+        counts, _ = np.histogram(radii, bins=bin_edges)
+        all_counts.append(counts)
+        all_names.append(volume_name)
 
     counts_matrix = np.array(all_counts, dtype=float)
     logger.info(f"Rat WM: {len(all_names)} ROIs with ≥{min_axons} axons, {int(counts_matrix.sum()):,} total radii")
