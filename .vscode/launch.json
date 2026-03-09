@@ -119,16 +119,37 @@
             }
         },
         {
-            "name": "Plot (main): Individual Axon Stats",
+            "name": "Processing: Create Representative Axons",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/scripts/figures/plot_individual_axon_stats.py",
-            "args": [
-                "data/processed/rat/lm/*_axon_profiles.npz",
-                "fig/main/individual_axon_stats.svg",
-                "--mat-dir",
-                "data/source/rat"
-            ],
+            "program": "${workspaceFolder}/scripts/processing/create_representative_axons.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): Individual Radius Profiles",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_individual_radius_profiles.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): Radius Variability Stats",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_radius_variability_stats.py",
+            "args": [],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
