@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 # ── Constants ──────────────────────────────────────────────────────────────
-MIN_RADIUS_UM = 0.1       # Minimum radius filter
+MIN_RADIUS_UM = 0.0       # Minimum radius filter (disabled)
 MAX_ECCENTRICITY = 0.9    # Max eccentricity (filter elongated non-axon cross-sections)
 MIN_SOLIDITY = 0.5        # Min solidity (filter irregular shapes)
 MIN_AXON_COUNT = 30       # Min axons per slice for valid statistics
@@ -213,7 +213,9 @@ class HandlerLineWithBackground(HandlerBase):
 
 
 def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
-                   radius_type: str, x_max: float) -> None:
+                   radius_type: str, x_max: float,
+                   cache_2d: Optional[Dict] = None,
+                   cache_3d: Optional[Dict] = None) -> None:
     """
     Panel (a): 3D PDF line + 2D IQR envelope + r̄/r_MRI markers.
     """
@@ -223,7 +225,7 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
                                  bin_centers + bin_width / 2])
 
     # 2D: per-slice PDFs → median + IQR
-    data_2d = load_and_filter_2d(slice_file, radius_type)
+    data_2d = cache_2d[slice_file] if cache_2d else load_and_filter_2d(slice_file, radius_type)
     pdfs = compute_per_slice_pdfs(data_2d, bin_centers)
     stats_2d = compute_per_slice_stats(data_2d)
 
@@ -236,7 +238,7 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     pdf_hi = np.percentile(pdfs, 75, axis=0)
 
     # 3D: single PDF
-    radii_3d = load_3d_radii(axon_file)
+    radii_3d = cache_3d[axon_file] if cache_3d else load_3d_radii(axon_file)
     hist_3d, _ = np.histogram(radii_3d, bins=bin_edges)
     pdf_3d = hist_3d / (hist_3d.sum() * bin_width) if hist_3d.sum() > 0 else hist_3d * 0.0
 
@@ -294,7 +296,9 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
 
 
 def plot_wasserstein_panel(ax, pairs: List[Tuple[Path, Path, str]],
-                           radius_type: str) -> None:
+                           radius_type: str,
+                           cache_2d: Optional[Dict] = None,
+                           cache_3d: Optional[Dict] = None) -> None:
     """
     Panel (b): Within-ROI vs between-ROI Wasserstein distances.
     """
@@ -308,7 +312,7 @@ def plot_wasserstein_panel(ax, pairs: List[Tuple[Path, Path, str]],
 
     for sf, af, sn in pairs:
         # 3D CDF
-        r3d = load_3d_radii(af)
+        r3d = cache_3d[af] if cache_3d else load_3d_radii(af)
         if len(r3d) == 0:
             continue
         sorted_r = np.sort(r3d)
@@ -318,7 +322,7 @@ def plot_wasserstein_panel(ax, pairs: List[Tuple[Path, Path, str]],
         roi_cdfs_3d.append(cdf_3d)
 
         # Per-slice 2D CDFs → Wasserstein vs 3D
-        data_2d = load_and_filter_2d(sf, radius_type)
+        data_2d = cache_2d[sf] if cache_2d else load_and_filter_2d(sf, radius_type)
         for z in range(data_2d['n_slices']):
             r_z = data_2d['radii'][data_2d['slice_index'] == z]
             if len(r_z) < MIN_AXON_COUNT:
@@ -450,7 +454,9 @@ def plot_scatter_panel(ax, all_metrics: List[Tuple[Dict, Dict, str]],
 
 def run_monte_carlo(pairs: List[Tuple[Path, Path, str]],
                     radius_type: str, n_iterations: int = 10000,
-                    seed: int = 42) -> Dict:
+                    seed: int = 42,
+                    cache_2d: Optional[Dict] = None,
+                    cache_3d: Optional[Dict] = None) -> Dict:
     """
     Monte Carlo correlation: randomly pick one slice per ROI, compute R.
     """
@@ -461,14 +467,14 @@ def run_monte_carlo(pairs: List[Tuple[Path, Path, str]],
     x_3d_reff = []
 
     for sf, af, sn in pairs:
-        data_2d = load_and_filter_2d(sf, radius_type)
+        data_2d = cache_2d[sf] if cache_2d else load_and_filter_2d(sf, radius_type)
         per_slice = compute_per_slice_stats(data_2d)
 
         if per_slice['n_valid'] < 1:
             logger.warning(f"  Skipping {sn} for MC - no valid slices")
             continue
 
-        r3d = load_3d_radii(af)
+        r3d = cache_3d[af] if cache_3d else load_3d_radii(af)
         if len(r3d) == 0:
             continue
 
@@ -549,8 +555,21 @@ def main():
     parser.add_argument('--representative', type=str, default=None,
                         help='Stem of representative sample for panel (a), '
                              'e.g. "sham_25_ipsi_cg_myelin" (default: auto-select)')
+    parser.add_argument('--min-radius', type=float, default=MIN_RADIUS_UM,
+                        help=f'Minimum radius filter in μm (default: {MIN_RADIUS_UM})')
+    parser.add_argument('--max-eccentricity', type=float, default=MAX_ECCENTRICITY,
+                        help=f'Max eccentricity filter (default: {MAX_ECCENTRICITY})')
+    parser.add_argument('--min-solidity', type=float, default=MIN_SOLIDITY,
+                        help=f'Min solidity filter (default: {MIN_SOLIDITY})')
 
     args = parser.parse_args()
+
+    # Override module-level constants with CLI args
+    import sys
+    mod = sys.modules[__name__]
+    mod.MIN_RADIUS_UM = args.min_radius
+    mod.MAX_ECCENTRICITY = args.max_eccentricity
+    mod.MIN_SOLIDITY = args.min_solidity
 
     logger.info("=" * 80)
     logger.info("2D vs 3D Distribution Comparison (v2 — canonical data)")
@@ -583,15 +602,21 @@ def main():
         logger.info(f"Auto-selected representative: {best_name} "
                     f"(mean {best_mean_count:.0f} instances/slice)")
 
+    # Pre-load all 2D and 3D data (avoid redundant I/O and filtering)
+    cache_2d = {}
+    cache_3d = {}
+    for sf, af, sn in all_pairs:
+        cache_2d[sf] = load_and_filter_2d(sf, args.radius_type)
+        cache_3d[af] = load_3d_radii(af)
+
     # Compute 2D/3D metrics for all pairs
     all_metrics = []
     for sf, af, sn in all_pairs:
-        data_2d = load_and_filter_2d(sf, args.radius_type)
-        per_slice = compute_per_slice_stats(data_2d)
+        per_slice = compute_per_slice_stats(cache_2d[sf])
         if per_slice['n_valid'] < 1:
             continue
 
-        r3d = load_3d_radii(af)
+        r3d = cache_3d[af]
         if len(r3d) == 0:
             continue
 
@@ -616,7 +641,8 @@ def main():
     # Monte Carlo
     logger.info(f"\nRunning Monte Carlo ({args.n_iterations} iterations)...")
     mc_results = run_monte_carlo(all_pairs, args.radius_type,
-                                  args.n_iterations, args.seed)
+                                  args.n_iterations, args.seed,
+                                  cache_2d=cache_2d, cache_3d=cache_3d)
     logger.info(f"  r̄:    R = {mc_results['r_arith']['r_mean']:.3f} ± "
                 f"{mc_results['r_arith']['r_std']:.3f}")
     logger.info(f"  r_MRI: R = {mc_results['r_eff']['r_mean']:.3f} ± "
@@ -626,10 +652,12 @@ def main():
     fig, axes = plt.subplots(2, 2, figsize=(10, 9))
 
     logger.info("\nPanel (a): PDF stability...")
-    plot_pdf_panel(axes[0, 0], rep_sf, rep_af, args.radius_type, args.x_max)
+    plot_pdf_panel(axes[0, 0], rep_sf, rep_af, args.radius_type, args.x_max,
+                   cache_2d=cache_2d, cache_3d=cache_3d)
 
     logger.info("Panel (b): Wasserstein distances...")
-    plot_wasserstein_panel(axes[0, 1], all_pairs, args.radius_type)
+    plot_wasserstein_panel(axes[0, 1], all_pairs, args.radius_type,
+                           cache_2d=cache_2d, cache_3d=cache_3d)
 
     logger.info("Panel (c): r̄ scatter...")
     plot_scatter_panel(axes[1, 0], all_metrics, 'r_arith', mc_results)
