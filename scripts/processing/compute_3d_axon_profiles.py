@@ -2,16 +2,19 @@
 """
 Compute fiber morphometry profiles by sampling perpendicular cross-sections along skeletons.
 
+Uses the DeepACSON CSD approach (Abdollahzadeh et al., 2019) for skeleton
+extraction and cross-section sampling, reimplemented here without external
+package dependency.
+
+The algorithm (per axon):
+1. Extract skeleton via FMM + Euler backtracking (step_size=0.1 voxels)
+2. Organize skeleton: break at junctions, filter by length threshold
+3. For each skeleton segment: sample perpendicular cross-sections using
+   Euler-Rodrigues rotation + trilinear interpolation + connected-component labeling
+4. Measure cross-section area via regionprops → equivalent circular radius
+
 Supports both OME-Zarr volumes (canonical format from preparation pipeline)
 and legacy .mat files.
-
-For each axon/fiber:
-1. Extract skeleton using fast-marching + path tracing
-2. Walk along skeleton points at regular intervals
-3. Sample perpendicular cross-section at each point
-4. Compute equivalent circular radius from cross-section area
-
-Output: Per-axon arrays of (radius_profile, skeleton_coords, length)
 
 Usage:
   # Single Zarr volume (canonical format)
@@ -37,209 +40,427 @@ import multiprocessing as mp
 from typing import Tuple, Union, Optional, List
 
 import numpy as np
+import skfmm
+from numba import njit
 from scipy.ndimage import find_objects, median_filter
+from scipy.interpolate import RegularGridInterpolator as rgi
+from skimage.measure import label, regionprops
 from tqdm import tqdm
 
-# Import from axonometry library
+# Import from axonometry library (for .mat loading only)
 import sys
-# Find repo root (contains pyproject.toml)
 _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
 
 from axonometry import (
-    extract_skeleton,
-    skeleton_warmup,
     load_volume_with_metadata,
     resample_to_isotropic,
-    unit_tangent_vector,
-    compute_arc_length,
-    resample_curve_by_arc_length,
-    validate_skeleton_points,
-    find_longest_contiguous_segment,
 )
-from numba import njit
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-# Global variables for worker processes
+# ---------------------------------------------------------------------------
+# Global variables for worker processes (inherited via fork)
+# ---------------------------------------------------------------------------
+
 _shared_volume = None
 _shared_bboxes = None
-_base_grid_xyz = None  # Precomputed base grid for cross-section sampling
-_grid_size = None
+_grid_xyz = None       # Precomputed sampling plane grid
+_grid_cent_ball = None  # Center mask for connected-component check
+_grid_shape = None      # Shape of the 2D grid
+_g_res = None           # Grid resolution in voxels
+_g_radius = None        # Grid radius in voxels
+_step_voxels = None     # Step size for skeleton subsampling (in voxels)
+_voxel_size_um = None   # Isotropic voxel size in micrometers
 
 
-@njit(cache=True, fastmath=True)
-def _sample_and_flood_fill(volume, base_grid, grid_size,
-                           point_0, point_1, point_2,
-                           tan_0, tan_1, tan_2,
-                           plane_resolution):
-    """
-    Fused kernel: rotation + translation + bool interpolation + flood-fill.
+# ===========================================================================
+# Skeleton extraction (from DeepACSON/CSD/skeleton3D.py)
+# ===========================================================================
 
-    Single Numba function that replaces:
-    - create_perpendicular_plane_grid (rotation)
-    - nearest_interp_3d_bool (interpolation)
-    - flood-fill (connected component at center)
+@njit(cache=True)
+def _pointmin(D):
+    sz0, sz1, sz2 = D.shape
+    max_D = np.max(D)
+    Fx = np.zeros((sz0, sz1, sz2))
+    Fy = np.zeros((sz0, sz1, sz2))
+    Fz = np.zeros((sz0, sz1, sz2))
 
-    No Python round-trips, no intermediate arrays except the 2D grid.
-    """
-    n_grid = base_grid.shape[0]
-    sz0, sz1, sz2 = volume.shape
+    # Padded volume
+    J = np.full((sz0+2, sz1+2, sz2+2), max_D)
+    J[1:sz0+1, 1:sz1+1, 1:sz2+1] = D
 
-    # Compute rotation matrix from tangent vector
-    dot_zt = tan_2
+    # 26-connected neighbor offsets
+    nx = np.array([0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1])
+    ny = np.array([0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1])
+    nz = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0])
 
-    if dot_zt > 0.9999:
-        r00 = 1.0; r01 = 0.0; r02 = 0.0
-        r10 = 0.0; r11 = 1.0; r12 = 0.0
-        r20 = 0.0; r21 = 0.0; r22 = 1.0
-    elif dot_zt < -0.9999:
-        r00 = 1.0; r01 = 0.0; r02 = 0.0
-        r10 = 0.0; r11 = 1.0; r12 = 0.0
-        r20 = 0.0; r21 = 0.0; r22 = -1.0
+    for i in range(26):
+        dx, dy, dz = nx[i], ny[i], nz[i]
+        den = (dx*dx + dy*dy + dz*dz)**0.5
+        fx = dx / den
+        fy = dy / den
+        fz = dz / den
+
+        for a in range(sz0):
+            for b in range(sz1):
+                for c in range(sz2):
+                    val = J[1+a+dx, 1+b+dy, 1+c+dz]
+                    if val < D[a, b, c]:
+                        D[a, b, c] = val
+                        Fx[a, b, c] = fx
+                        Fy[a, b, c] = fy
+                        Fz[a, b, c] = fz
+
+    return Fx, Fy, Fz
+
+
+@njit(cache=True)
+def _euler_path(Fx, Fy, Fz, start_point, step_size):
+    sz0, sz1, sz2 = Fx.shape
+
+    sp0 = start_point[0, 0]
+    sp1 = start_point[0, 1]
+    sp2 = start_point[0, 2]
+    f0 = int(np.floor(sp0))
+    f1 = int(np.floor(sp1))
+    f2 = int(np.floor(sp2))
+
+    # Trilinear weights
+    d0 = sp0 - f0
+    d1 = sp1 - f1
+    d2 = sp2 - f2
+    c0 = 1.0 - d0
+    c1 = 1.0 - d1
+    c2 = 1.0 - d2
+
+    perc = np.array([c0*c1*c2, c0*c1*d2, c0*d1*c2, c0*d1*d2,
+                     d0*c1*c2, d0*c1*d2, d0*d1*c2, d0*d1*d2])
+
+    # 8 corner offsets
+    ox = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    oy = np.array([0, 0, 1, 1, 0, 0, 1, 1])
+    oz = np.array([0, 1, 0, 1, 0, 1, 0, 1])
+
+    sum_gx = 0.0
+    sum_gy = 0.0
+    sum_gz = 0.0
+    for i in range(8):
+        ix = f0 + ox[i]
+        iy = f1 + oy[i]
+        iz = f2 + oz[i]
+        if ix < 0: ix = 0
+        if ix >= sz0: ix = sz0 - 1
+        if iy < 0: iy = 0
+        if iy >= sz1: iy = sz1 - 1
+        if iz < 0: iz = 0
+        if iz >= sz2: iz = sz2 - 1
+
+        w = perc[i]
+        sum_gx += Fx[ix, iy, iz] * w
+        sum_gy += Fy[ix, iy, iz] * w
+        sum_gz += Fz[ix, iy, iz] * w
+
+    norm = (sum_gx*sum_gx + sum_gy*sum_gy + sum_gz*sum_gz + 0.000001)**0.5
+    gx = sum_gx / norm
+    gy = sum_gy / norm
+    gz = sum_gz / norm
+
+    ep0 = sp0 - step_size * gx
+    ep1 = sp1 - step_size * gy
+    ep2 = sp2 - step_size * gz
+
+    end_point = np.zeros((1, 3))
+    if ep0 < 0 or ep1 < 0 or ep2 < 0 or ep0 > sz0 or ep1 > sz1 or ep2 > sz2:
+        return end_point
+
+    end_point[0, 0] = ep0
+    end_point[0, 1] = ep1
+    end_point[0, 2] = ep2
+    return end_point
+
+
+def _euler_shortest_path(D, source_point, start_point, step_size):
+    Fx, Fy, Fz = _pointmin(D)
+    Fx = -Fx
+    Fy = -Fy
+    Fz = -Fz
+
+    itr = 0
+    path = start_point
+    while True:
+
+        end_point = _euler_path(Fx,Fy,Fz,start_point,step_size)
+
+        dist_endpoint_to_all = np.sum((source_point-end_point)**2,axis=1)**0.5
+        distance_to_endpoint = min(dist_endpoint_to_all)
+
+        if(itr>=10):
+            Movement = np.sum((end_point-path[itr-10])**2)**0.5
+        else:
+            Movement = step_size+1
+
+        if(np.all(end_point==0) or Movement<step_size):
+            break
+
+        itr = itr+1
+
+        path = np.append(path,end_point,axis=0)
+
+        if(distance_to_endpoint<10*step_size):
+            source_inx = source_point[np.argmin(dist_endpoint_to_all)]
+            path = np.append(path,np.array(source_inx,ndmin=2),axis=0)
+            break
+
+        start_point = end_point
+    return path
+
+
+def _get_line_length(L):
+    dist = np.sum(np.sum((L[1:] - L[:-1])**2,axis=1)**0.5)
+    return dist
+
+
+def _organize_skeleton(skel_seg, length_th):
+    final_skeleton = []
+
+    n = len(skel_seg)
+    end_points = np.zeros((n*2,3))
+
+    l = 0
+    for i in range(n):
+        ss = skel_seg[i]
+        l = max(l,len(ss))
+        end_points[i*2] = ss[0]
+        end_points[i*2+1] = ss[-1]
+
+    connecting_distance = 2
+
+    for i in range(n):
+
+        ss = np.asarray(skel_seg[i])
+
+        ex = np.reshape(end_points[:,0],(-1,1)); ex = np.repeat(ex,len(ss),axis=1)
+        sx = np.reshape(ss[:,0],(1,-1)); sx = np.repeat(sx,len(end_points),axis=0)
+
+        ey = np.reshape(end_points[:,1],(-1,1)); ey = np.repeat(ey,len(ss),axis=1)
+        sy = np.reshape(ss[:,1],(1,-1)); sy = np.repeat(sy,len(end_points),axis=0)
+
+        ez = np.reshape(end_points[:,2],(-1,1)); ez = np.repeat(ez,len(ss),axis=1)
+        sz = np.reshape(ss[:,2],(1,-1)); sz = np.repeat(sz,len(end_points),axis=0)
+
+        D = (ex-sx)**2 + (ey-sy)**2 + (ez-sz)**2
+
+        check = np.amin(D, axis=1) < connecting_distance
+        check[i*2] = False
+        check[i*2+1] = False
+
+        cut_skel = [0,len(ss)]
+        if(any(check)):
+            for ii in range(len(check)):
+                if(check[ii]):
+                    line = D[ii]
+                    min_ind = np.ma.argmin(line)
+                    if((min_ind>2) and (min_ind<(len(line)-2))):
+                        cut_skel.append(min_ind)
+
+        cut_skel = sorted(cut_skel)
+        for j in range(len(cut_skel)-1):
+            skel_breaked_seg = ss[cut_skel[j]:cut_skel[j+1]]
+            length_skel_seg = _get_line_length(skel_breaked_seg)
+            if(length_skel_seg >= length_th):
+               final_skeleton.append(skel_breaked_seg)
+
+    return final_skeleton
+
+
+def _extract_skeleton(Ax):
+    """FMM + Euler backtracking skeleton extraction (DeepACSON)."""
+    boundary_dist=skfmm.distance(Ax)
+
+    source_point=np.unravel_index(np.argmax(boundary_dist), boundary_dist.shape)
+    maxD=boundary_dist[source_point]
+
+    speed_im=(boundary_dist/maxD)**1.5
+
+    Ax=np.ones(Ax.shape)
+    Ax[source_point]=0
+
+    flag=True
+    skeleton_segments=[]
+    source_point = np.array(source_point,ndmin=2)
+    while True:
+
+        D=skfmm.travel_time(Ax,speed_im)
+        end_point=np.unravel_index(np.ma.argmax(D), D.shape)
+        max_dist=D[end_point]
+        D=np.ma.MaskedArray.filled(D,max_dist)
+
+        end_point = np.array(end_point,ndmin=2)
+        shortest_line=_euler_shortest_path(D,source_point,end_point,step_size=0.1)
+
+        line_length=_get_line_length(shortest_line)
+
+        if flag:
+            length_threshold=min(40*maxD, 0.18*line_length)
+            flag=False
+
+        if(line_length<=length_threshold):
+            break
+
+
+        source_point=np.append(source_point,shortest_line,axis=0)
+
+        skeleton_segments.append(shortest_line)
+
+        shortest_line=np.floor(shortest_line).astype(int)
+
+        for i in shortest_line:
+            Ax[tuple(i)]=0
+
+    if len(skeleton_segments)!=0:
+        final_skeleton=_organize_skeleton(skeleton_segments,length_threshold)
     else:
-        rn = np.sqrt(tan_0 * tan_0 + tan_1 * tan_1)
-        rx = -tan_1 / rn
-        ry = tan_0 / rn
+        final_skeleton=[]
 
-        clamped = max(-1.0, min(1.0, dot_zt))
-        theta = np.arccos(clamped)
-
-        a = np.cos(theta * 0.5)
-        s = np.sin(theta * 0.5)
-        b = -rx * s
-        c = -ry * s
-
-        aa = a * a; bb = b * b; cc = c * c
-        bc = b * c; ac = a * c; ab = a * b
-
-        r00 = aa + bb - cc;  r01 = 2.0 * bc;       r02 = -2.0 * ac
-        r10 = 2.0 * bc;      r11 = aa + cc - bb;    r12 = 2.0 * ab
-        r20 = 2.0 * ac;      r21 = -2.0 * ab;       r22 = aa - bb - cc
-
-    bw = np.zeros((grid_size, grid_size), dtype=np.uint8)
-
-    for i in range(n_grid):
-        gx = base_grid[i, 0]
-        gy = base_grid[i, 1]
-
-        sx = r00 * gx + r01 * gy + point_0
-        sy = r10 * gx + r11 * gy + point_1
-        sz = r20 * gx + r21 * gy + point_2
-
-        ix = int(sx + 0.5)
-        iy = int(sy + 0.5)
-        iz = int(sz + 0.5)
-
-        if ix >= 0 and ix < sz0 and iy >= 0 and iy < sz1 and iz >= 0 and iz < sz2:
-            if volume[ix, iy, iz]:
-                row = i // grid_size
-                col = i % grid_size
-                bw[row, col] = 1
-
-    # Flood-fill from center
-    center = grid_size // 2
-    if not bw[center, center]:
-        return 0
-
-    queue_r = np.empty(grid_size * grid_size, dtype=np.int32)
-    queue_c = np.empty(grid_size * grid_size, dtype=np.int32)
-    visited = np.zeros((grid_size, grid_size), dtype=np.uint8)
-
-    queue_r[0] = center
-    queue_c[0] = center
-    visited[center, center] = 1
-    head = 0
-    tail = 1
-    area = 0
-
-    while head < tail:
-        r = queue_r[head]
-        c_ = queue_c[head]
-        head += 1
-        area += 1
-
-        if r > 0 and not visited[r - 1, c_] and bw[r - 1, c_]:
-            visited[r - 1, c_] = 1
-            queue_r[tail] = r - 1
-            queue_c[tail] = c_
-            tail += 1
-        if r < grid_size - 1 and not visited[r + 1, c_] and bw[r + 1, c_]:
-            visited[r + 1, c_] = 1
-            queue_r[tail] = r + 1
-            queue_c[tail] = c_
-            tail += 1
-        if c_ > 0 and not visited[r, c_ - 1] and bw[r, c_ - 1]:
-            visited[r, c_ - 1] = 1
-            queue_r[tail] = r
-            queue_c[tail] = c_ - 1
-            tail += 1
-        if c_ < grid_size - 1 and not visited[r, c_ + 1] and bw[r, c_ + 1]:
-            visited[r, c_ + 1] = 1
-            queue_r[tail] = r
-            queue_c[tail] = c_ + 1
-            tail += 1
-
-    return area
+    return final_skeleton
 
 
-def precompute_base_grid(plane_radius, plane_resolution):
-    """Precompute the XY plane grid (identical for every cross-section)."""
-    global _base_grid_xyz, _grid_size
-    coords = np.arange(-plane_radius, plane_radius + plane_resolution, plane_resolution)
-    x, y = np.meshgrid(coords, coords)
+# ===========================================================================
+# Tangent vectors (from DeepACSON/CSD/unit_tangent_vector.py)
+# ===========================================================================
+
+def _unit_tangent_vector(curve):
+    d_curve = np.gradient(curve, axis=0)
+    ds = np.expand_dims((np.sum(d_curve**2, axis=1))**0.5, axis=1)
+    ds[ds==0] = 1e-5
+    u_tang_vec = d_curve/np.repeat(ds, curve.shape[1], axis=1)
+    return u_tang_vec
+
+
+# ===========================================================================
+# Plane rotation (from DeepACSON/CSD/plane_rotation.py)
+# ===========================================================================
+
+def _unit_normal_vector(vec1, vec2):
+    n = np.cross(vec1, vec2)
+    if np.array_equal(n, np.array([0, 0, 0])):
+        n = vec1
+    s = max(np.sqrt(np.dot(n,n)), 1e-5)
+    n = n/s
+    return n
+
+
+def _angle(vec1, vec2):
+    theta=np.arccos(np.dot(vec1,vec2) / (np.sqrt(np.dot(vec1,vec1)) * np.sqrt(np.dot(vec2, vec2))))
+    return theta
+
+
+def _rotation_matrix_3D(vector, theta):
+    """Euler-Rodrigues rotation matrix."""
+    a=np.cos(theta/2.0)
+    b,c,d=-vector*np.sin(theta/2.0)
+    aa,bb,cc,dd=a**2, b**2, c**2, d**2
+    bc,ad,ac,ab,bd,cd=b*c, a*d, a*c, a*b, b*d, c*d
+
+    rot_mat=np.array([[aa+bb-cc-dd, 2*(bc+ad), 2*(bd-ac)],
+                         [2*(bc-ad), aa+cc-bb-dd, 2*(cd+ab)],
+                         [2*(bd+ac), 2*(cd-ab), aa+dd-bb-cc]])
+    return rot_mat
+
+
+def _rotate_vector(vector, rot_mat):
+    rotated_vec = np.dot(vector,rot_mat)
+    return rotated_vec
+
+
+# ===========================================================================
+# Cross-section sampling (DeepACSON approach)
+# ===========================================================================
+
+def precompute_grid(g_radius, g_res):
+    """Precompute the XY sampling grid and center mask (called once)."""
+    x, y = np.mgrid[-g_radius:g_radius:g_res, -g_radius:g_radius:g_res]
     z = np.zeros_like(x)
-    _base_grid_xyz = np.ascontiguousarray(
-        np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1)
-    )
-    _grid_size = len(coords)
+    xyz = np.array([np.ravel(x), np.ravel(y), np.ravel(z)]).T
+    cent_ball = (x**2 + y**2) < g_res * 1
+    grid_shape = x.shape
+    return xyz, cent_ball, grid_shape
 
 
-def sample_cross_section_fast(volume_bool, point, tangent_vec, plane_resolution):
+def _sample_cross_section(interpolating_func, point, tangent_vec,
+                           xyz, cent_ball, grid_shape, g_res):
     """
-    Sample perpendicular cross-section area using fused Numba kernel.
+    Sample a perpendicular cross-section using the DeepACSON approach.
 
-    Single compiled function handles rotation + interpolation + flood-fill
-    with no Python round-trips and no intermediate array allocations.
+    Uses trilinear interpolation (RegularGridInterpolator), connected-component
+    labeling at center, and regionprops for area measurement.
+
+    Returns equivalent radius in voxels, or None if invalid.
     """
-    area = _sample_and_flood_fill(
-        volume_bool, _base_grid_xyz, _grid_size,
-        point[0], point[1], point[2],
-        tangent_vec[0], tangent_vec[1], tangent_vec[2],
-        plane_resolution
-    )
-    if area == 0:
+    if np.array_equal(tangent_vec, np.array([0, 0, 0])):
         return None
-    return area * (plane_resolution ** 2)
+
+    rot_axis = _unit_normal_vector(tangent_vec, np.array([0, 0, 1]))
+    theta = _angle(tangent_vec, np.array([0, 0, 1]))
+    rot_mat = _rotation_matrix_3D(rot_axis, theta)
+    rotated_plane = np.squeeze(_rotate_vector(xyz, rot_mat))
+    cross_section_plane = rotated_plane + point
+
+    # Trilinear interpolation
+    cross_section = interpolating_func(cross_section_plane)
+    bw_cross_section = cross_section >= 0.5
+    bw_cross_section = np.reshape(bw_cross_section, grid_shape)
+
+    # Connected component at center
+    label_cross_section, nn = label(bw_cross_section, return_num=True)
+    main_lbl = np.unique(label_cross_section[cent_ball])
+    main_lbl = main_lbl[np.nonzero(main_lbl)]
+
+    if len(main_lbl) != 1:
+        return None
+
+    bw_cross_section = label_cross_section == main_lbl[0]
+
+    # Size check
+    nz_X = np.count_nonzero(np.sum(bw_cross_section, axis=0))
+    nz_Y = np.count_nonzero(np.sum(bw_cross_section, axis=1))
+    if nz_X < 4 or nz_Y < 4:
+        return None
+
+    # Measure area via regionprops
+    props = regionprops(bw_cross_section.astype(np.int32))
+    if len(props) == 0:
+        return None
+
+    area_pixels = props[0].area
+    area_voxels = area_pixels * (g_res ** 2)
+    radius_voxels = np.sqrt(area_voxels / np.pi)
+
+    return radius_voxels
 
 
-def init_worker():
-    """Initialize worker process - globals inherited via fork."""
-    skeleton_warmup()
-
+# ===========================================================================
+# Bounding boxes and outlier filtering
+# ===========================================================================
 
 def compute_bounding_boxes(volume: np.ndarray) -> dict:
-    """
-    Compute bounding boxes for all labels using scipy.ndimage.find_objects.
-
-    This is O(V) for a single pass over the volume, much faster than
-    calling np.argwhere for each label separately.
-    """
-    logger.info("Computing bounding boxes with find_objects (single pass)...")
+    """Compute bounding boxes for all labels via find_objects (single pass)."""
+    logger.info("Computing bounding boxes...")
     slices = find_objects(volume)
 
     bboxes = {}
     for label_idx, bbox_slices in enumerate(slices):
         if bbox_slices is None:
             continue
-        label = label_idx + 1  # find_objects uses 0-indexed, labels are 1-indexed
+        lbl = label_idx + 1
         min_coords = np.array([s.start for s in bbox_slices])
         max_coords = np.array([s.stop for s in bbox_slices])
-        bboxes[label] = (min_coords, max_coords)
+        bboxes[lbl] = (min_coords, max_coords)
 
     logger.info(f"Computed bounding boxes for {len(bboxes)} labels")
     return bboxes
@@ -271,25 +492,32 @@ def filter_radius_outliers(radii, window_size=5, threshold=3.0):
     return radii_filtered
 
 
+# ===========================================================================
+# Per-axon processing
+# ===========================================================================
+
+def init_worker():
+    """Initialize worker process — trigger Numba JIT compilation."""
+    # Warmup _pointmin and _euler_path with tiny arrays
+    D = np.ones((3, 3, 3))
+    _pointmin(D)
+    sp = np.array([[1.0, 1.0, 1.0]])
+    _euler_path(D, D, D, sp, 0.1)
+
+
 def process_single_axon(args):
     """
-    Process a single axon to extract radius profile along skeleton.
+    Process a single axon using the DeepACSON CSD approach.
 
     Args:
-        args: Tuple of (axon_label, voxel_size_tuple, plane_radius, plane_resolution,
-                       step_size, path_method, skeleton_downsample)
+        args: Tuple of (axon_label,)
 
     Returns:
         Dict with radius profile and skeleton coords, or None if failed
     """
-    (axon_label, voxel_size_tuple, plane_radius, plane_resolution,
-     step_size, path_method, skeleton_downsample) = args
-
-    vz, vy, vx = voxel_size_tuple
-    voxel_geom_mean = (vz * vy * vx) ** (1/3)
+    (axon_label,) = args
 
     try:
-        # Get precomputed bounding box
         bbox = _shared_bboxes.get(axon_label)
         if bbox is None:
             return None
@@ -297,128 +525,73 @@ def process_single_axon(args):
         min_coords, max_coords = bbox
         vol_shape = np.array(_shared_volume.shape)
 
-        # Tight crop for skeleton extraction (small padding for boundary distance)
-        skel_pad = 5
-        min_tight = np.maximum(min_coords - skel_pad, 0)
-        max_tight = np.minimum(max_coords + skel_pad, vol_shape)
+        pad = _g_radius + 5
+        min_padded = np.maximum(min_coords - pad, 0)
+        max_padded = np.minimum(max_coords + pad, vol_shape)
 
-        subvol_tight = _shared_volume[
-            min_tight[0]:max_tight[0],
-            min_tight[1]:max_tight[1],
-            min_tight[2]:max_tight[2]
-        ]
-        cropped_tight = (subvol_tight == axon_label)
+        subvol = _shared_volume[min_padded[0]:max_padded[0],
+                                min_padded[1]:max_padded[1],
+                                min_padded[2]:max_padded[2]]
+        binary = (subvol == axon_label).astype(np.float64)
 
-        # Use count_nonzero instead of argwhere — avoids allocating coordinate array
-        n_voxels = np.count_nonzero(cropped_tight)
+        n_voxels = np.count_nonzero(binary)
         if n_voxels < 100:
             return None
 
-        # Extract skeleton on tight crop (FMM runs on much smaller volume)
-        if skeleton_downsample > 1:
-            cropped_ds = cropped_tight[::skeleton_downsample, ::skeleton_downsample, ::skeleton_downsample]
-            skel_segments = extract_skeleton(cropped_ds, verbose=False, path_method=path_method)
-            skel_segments = [seg * skeleton_downsample for seg in skel_segments]
-        else:
-            skel_segments = extract_skeleton(cropped_tight, verbose=False, path_method=path_method)
-
-        # Wide crop for cross-section sampling (needs plane_radius padding)
-        sampling_pad = int(plane_radius) + 5
-        min_padded = np.maximum(min_coords - sampling_pad, 0)
-        max_padded = np.minimum(max_coords + sampling_pad, vol_shape)
-
-        # Offset to convert skeleton coords from tight crop to wide crop space
-        tight_to_wide_offset = min_tight - min_padded
+        # Skeleton extraction (FMM + Euler backtracking)
+        try:
+            skel_segments = _extract_skeleton(binary)
+        except Exception as e:
+            logger.debug(f"Axon {axon_label}: skeleton extraction failed - {e}")
+            return None
 
         if len(skel_segments) == 0:
             return None
 
-        # Sort segments by length (longest first = main trunk)
-        seg_lengths = [len(seg) for seg in skel_segments]
-        seg_order = np.argsort(seg_lengths)[::-1]
-        skel_segments = [skel_segments[i] for i in seg_order]
+        # Create interpolator once per axon
+        sz = binary.shape
+        interpolating_func = rgi(
+            (range(sz[0]), range(sz[1]), range(sz[2])),
+            binary,
+            bounds_error=False, fill_value=0
+        )
 
-        # Extract wide crop for cross-section sampling (shared across all segments)
-        subvol_wide = _shared_volume[
-            min_padded[0]:max_padded[0],
-            min_padded[1]:max_padded[1],
-            min_padded[2]:max_padded[2]
-        ]
-        cropped_wide = (subvol_wide == axon_label)
-
-        # Precompute constants outside the inner loop
-        voxel_scale = np.array([vz, vy, vx])
-        inv_sqrt_pi = 1.0 / np.sqrt(np.pi)
-        voxel_size_tuple_local = (vz, vy, vx)
-
-        # Process all segments (main trunk first, then branches)
-        main_result = None
-        main_sampled_skel = None  # Store main trunk skeleton for proximity filtering
-        branch_radii_list = []
-        proximity_threshold_sq = plane_radius ** 2  # squared distance in voxel space
+        # Process each skeleton segment — sample cross-sections
+        all_radii_um = []
+        all_skel_coords_um = []
+        main_length_um = 0.0
 
         for skel_seg in skel_segments:
             if len(skel_seg) < 3:
                 continue
 
-            # Validate skeleton points are inside the axon (in tight crop space)
-            valid_mask = validate_skeleton_points(skel_seg, cropped_tight)
-            if not np.any(valid_mask):
-                continue
-
-            # Keep only valid skeleton points
-            if not np.all(valid_mask):
-                segment_range = find_longest_contiguous_segment(valid_mask)
-                if segment_range is None or segment_range[1] - segment_range[0] < 3:
-                    continue
-                skel_seg = skel_seg[segment_range[0]:segment_range[1]]
-
-            if len(skel_seg) < 3:
-                continue
-
-            # Convert skeleton from tight crop to wide crop coordinate space
-            skel_seg = skel_seg.astype(np.float64) + tight_to_wide_offset
-
-            # Compute arc length and resample
-            cumulative_length = compute_arc_length(skel_seg, voxel_size_tuple_local)
-            seg_total_length = cumulative_length[-1]
-
-            if seg_total_length < step_size:
-                sampled_skel = skel_seg
-            else:
-                sampled_skel = resample_curve_by_arc_length(skel_seg, step_size, voxel_size_tuple_local)
-
-            if len(sampled_skel) < 2:
-                continue
-
-            # For branches: skip points near the main trunk (junction zone)
-            if main_sampled_skel is not None:
-                diffs = sampled_skel[:, np.newaxis, :] - main_sampled_skel[np.newaxis, :, :]
-                min_dist_sq = np.min(np.sum(diffs ** 2, axis=2), axis=1)
-                far_mask = min_dist_sq > proximity_threshold_sq
-                sampled_skel = sampled_skel[far_mask]
-                if len(sampled_skel) < 2:
+            # Subsample skeleton points to match desired step size
+            if _step_voxels is not None:
+                stride = max(1, round(_step_voxels / 0.1))
+                skel_seg = skel_seg[::stride]
+                if len(skel_seg) < 3:
                     continue
 
             # Compute tangent vectors
-            tangent_vecs = unit_tangent_vector(sampled_skel)
+            tangent_vecs = _unit_tangent_vector(skel_seg)
 
-            # Sample cross-sections and compute radii
             radii = []
-            valid_skel_points = []
+            skel_coords = []
 
-            for point, tangent in zip(sampled_skel, tangent_vecs):
-                if tangent[0] == 0 and tangent[1] == 0 and tangent[2] == 0:
+            for point, tangent in zip(skel_seg, tangent_vecs):
+                if np.array_equal(tangent, np.array([0, 0, 0])):
                     continue
 
-                area = sample_cross_section_fast(
-                    cropped_wide, point, tangent, plane_resolution
+                radius_voxels = _sample_cross_section(
+                    interpolating_func, point, tangent,
+                    _grid_xyz, _grid_cent_ball, _grid_shape, _g_res
                 )
 
-                if area is not None and area > 0:
-                    radius_um = np.sqrt(area) * inv_sqrt_pi * voxel_geom_mean
+                if radius_voxels is not None and radius_voxels > 0:
+                    radius_um = radius_voxels * _voxel_size_um
                     radii.append(radius_um)
-                    valid_skel_points.append((point + min_padded) * voxel_scale)
+                    global_coord = (point + min_padded) * _voxel_size_um
+                    skel_coords.append(global_coord)
 
             if len(radii) < 2:
                 continue
@@ -426,38 +599,38 @@ def process_single_axon(args):
             radii = np.array(radii)
             radii = filter_radius_outliers(radii, window_size=5, threshold=3.0)
 
-            if main_result is None:
-                # Main trunk (longest segment)
-                main_sampled_skel = sampled_skel
-                skel_coords = np.array(valid_skel_points)
-                main_result = {
-                    'label': axon_label,
-                    'radii_um': radii,
-                    'skeleton_um': skel_coords,
-                    'n_points': len(radii),
-                    'mean_radius_um': np.mean(radii),
-                    'std_radius_um': np.std(radii),
-                    'length_um': seg_total_length,
-                }
-            else:
-                # Branch segment — cap at main trunk max to catch residual junction artifacts
-                max_main_r = np.max(main_result['radii_um'])
-                radii = radii[radii <= max_main_r]
-                if len(radii) >= 2:
-                    branch_radii_list.append(radii)
+            # Track main trunk length (longest segment)
+            seg_length = np.sum(np.sqrt(np.sum(np.diff(skel_seg, axis=0)**2, axis=1))) * _voxel_size_um
+            if seg_length > main_length_um:
+                main_length_um = seg_length
 
-        if main_result is None:
+            all_radii_um.extend(radii)
+            all_skel_coords_um.extend(skel_coords)
+
+        if len(all_radii_um) < 2:
             return None
 
-        # Attach branch radii to main result
-        main_result['branch_radii_um'] = branch_radii_list
+        all_radii_um = np.array(all_radii_um)
 
-        return main_result
+        return {
+            'label': axon_label,
+            'radii_um': all_radii_um,
+            'skeleton_um': np.array(all_skel_coords_um),
+            'n_points': len(all_radii_um),
+            'n_segments': len(skel_segments),
+            'mean_radius_um': np.mean(all_radii_um),
+            'std_radius_um': np.std(all_radii_um),
+            'length_um': main_length_um,
+        }
 
     except Exception as e:
         logger.error(f"Axon {axon_label}: Processing failed - {e}\n{traceback.format_exc()}")
         return None
 
+
+# ===========================================================================
+# Volume loading
+# ===========================================================================
 
 def load_zarr_volume(zarr_path: Path) -> Tuple[np.ndarray, float]:
     """Load level-0 volume and voxel size from an OME-Zarr store."""
@@ -466,7 +639,6 @@ def load_zarr_volume(zarr_path: Path) -> Tuple[np.ndarray, float]:
     store = zarr.open_group(str(zarr_path), mode="r")
     volume = np.asarray(store["0"])
 
-    # Read voxel size from OME-NGFF metadata
     multiscales = store.attrs["multiscales"]
     scale = multiscales[0]["datasets"][0]["coordinateTransformations"][0]["scale"]
     voxel_size_z = scale[0]
@@ -479,16 +651,19 @@ def load_zarr_volume(zarr_path: Path) -> Tuple[np.ndarray, float]:
     return volume, float(voxel_size_z)
 
 
+# ===========================================================================
+# Main orchestration
+# ===========================================================================
+
 def compute_fiber_profiles(input_path: Path,
                            output_file: Path,
                            voxel_size_um: Optional[Union[float, Tuple[float, float, float]]] = None,
-                           max_axon_radius_um: float = 5.0,
+                           g_radius: int = 15,
+                           g_res: float = 0.25,
                            step_size_um: float = 0.1,
                            n_jobs: int = -1,
                            max_axons: int = 0,
-                           anisotropy_mode: str = 'simple',
-                           path_method: str = 'discrete',
-                           skeleton_downsample: int = 1):
+                           anisotropy_mode: str = 'simple'):
     """
     Compute morphometry profiles for all fibers in a labeled volume.
 
@@ -497,21 +672,20 @@ def compute_fiber_profiles(input_path: Path,
         output_file: Path to save results (.npz)
         voxel_size_um: Voxel size in micrometers (scalar or (vz, vy, vx) tuple).
                        If None, auto-detected from Zarr metadata or companion JSON.
-        max_axon_radius_um: Maximum expected axon radius in micrometers (sets sampling plane size)
+        g_radius: Grid radius for cross-section sampling in voxels (default: 15)
+        g_res: Grid resolution for cross-section sampling in voxels (default: 0.25)
         step_size_um: Step size along skeleton in micrometers
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
         anisotropy_mode: 'simple' (resample to isotropic) or 'none' (use geometric mean).
                          Ignored for Zarr input (already isotropic by convention).
-        path_method: 'discrete' (fast) or 'euler' (subvoxel accuracy)
-        skeleton_downsample: Downsample factor for skeleton extraction
     """
+    # Warmup Numba JIT
     logger.info("Warming up Numba JIT compilation...")
-    skeleton_warmup()
-    # Warmup fused kernel JIT
-    _dummy_vol = np.ones((3, 3, 3), dtype=np.bool_)
-    _dummy_grid = np.zeros((1, 3), dtype=np.float64)
-    _sample_and_flood_fill(_dummy_vol, _dummy_grid, 1, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0)
+    D_warmup = np.ones((3, 3, 3))
+    _pointmin(D_warmup)
+    sp_warmup = np.array([[1.0, 1.0, 1.0]])
+    _euler_path(D_warmup, D_warmup, D_warmup, sp_warmup, 0.1)
 
     # Load volume
     suffix = input_path.suffix.lower()
@@ -522,7 +696,6 @@ def compute_fiber_profiles(input_path: Path,
     elif suffix == ".mat":
         logger.info(f"Loading .mat volume: {input_path.name}")
         volume, voxel_size_tuple, _ = load_volume_with_metadata(input_path, voxel_size_um)
-        # Handle anisotropic voxels
         if anisotropy_mode == 'simple':
             volume, iso_voxel_size = resample_to_isotropic(volume, voxel_size_tuple)
             voxel_size_tuple = (iso_voxel_size, iso_voxel_size, iso_voxel_size)
@@ -531,21 +704,11 @@ def compute_fiber_profiles(input_path: Path,
     else:
         raise ValueError(f"Unsupported input format: {suffix}. Use .zarr or .mat")
 
-    # Convert max_axon_radius from micrometers to voxels (use geometric mean for anisotropic)
     vz, vy, vx = voxel_size_tuple
-    voxel_size_geom_mean = (vz * vy * vx) ** (1/3)
-    plane_radius_voxels = int(np.ceil(max_axon_radius_um / voxel_size_geom_mean))
-    plane_resolution = 1.0  # Always sample at voxel resolution
+    voxel_size = (vz * vy * vx) ** (1/3)  # geometric mean for isotropic equiv
 
-    logger.info(f"Max axon radius: {max_axon_radius_um:.2f} μm = {plane_radius_voxels} voxels")
-
-    # Precompute base grid for cross-section sampling (reused for every sample point)
-    precompute_base_grid(plane_radius_voxels, plane_resolution)
-
-    # Compute bounding boxes (also gives us all labels — no need for np.unique)
+    # Compute bounding boxes
     bboxes = compute_bounding_boxes(volume)
-
-    # Get axon labels from bounding boxes (avoids expensive np.unique on full volume)
     axon_labels = np.array(sorted(bboxes.keys()))
 
     logger.info(f"Found {len(axon_labels)} axons")
@@ -557,24 +720,32 @@ def compute_fiber_profiles(input_path: Path,
     if n_jobs == -1:
         n_jobs = mp.cpu_count()
 
-    args_list = [
-        (label, voxel_size_tuple, plane_radius_voxels, plane_resolution,
-         step_size_um, path_method, skeleton_downsample)
-        for label in axon_labels
-    ]
+    # Precompute sampling grid
+    xyz, cent_ball, grid_shape = precompute_grid(g_radius, g_res)
 
-    if vz == vy == vx:
-        logger.info(f"Voxel size (isotropic): {vz:.4f} μm")
-    else:
-        logger.info(f"Voxel size (anisotropic, Z,Y,X): vz={vz:.4f}, vy={vy:.4f}, vx={vx:.4f} μm")
-
-    logger.info(f"Processing {len(args_list)} axons with {n_jobs} workers")
-    logger.info(f"Parameters: plane_radius={plane_radius_voxels} voxels ({max_axon_radius_um:.2f} μm), step={step_size_um} μm")
+    step_voxels = step_size_um / voxel_size if step_size_um is not None else None
 
     # Set globals for workers
     global _shared_volume, _shared_bboxes
+    global _grid_xyz, _grid_cent_ball, _grid_shape
+    global _g_res, _g_radius, _step_voxels, _voxel_size_um
     _shared_volume = volume
     _shared_bboxes = bboxes
+    _grid_xyz = xyz
+    _grid_cent_ball = cent_ball
+    _grid_shape = grid_shape
+    _g_res = g_res
+    _g_radius = g_radius
+    _step_voxels = step_voxels
+    _voxel_size_um = voxel_size
+
+    args_list = [(lbl,) for lbl in axon_labels]
+
+    logger.info(f"Voxel size: {voxel_size:.4f} μm")
+    logger.info(f"Processing {len(args_list)} axons with {n_jobs} workers")
+    logger.info(f"Parameters: g_radius={g_radius} voxels, g_res={g_res}, "
+                f"step={step_size_um} μm = {step_voxels:.1f} voxels "
+                f"(stride ~{max(1, round(step_voxels / 0.1))})")
 
     results = []
     if n_jobs == 1:
@@ -606,12 +777,7 @@ def compute_fiber_profiles(input_path: Path,
     radii_profiles = np.array([r['radii_um'] for r in results], dtype=object)
     skeleton_coords = np.array([r['skeleton_um'] for r in results], dtype=object)
 
-    # Pool radii: main trunk only (wo branches) and all segments (w branches)
-    all_radii_wo = np.concatenate([r['radii_um'] for r in results])
-    all_radii_w_parts = [r['radii_um'] for r in results]
-    for r in results:
-        all_radii_w_parts.extend(r['branch_radii_um'])
-    all_radii_w = np.concatenate(all_radii_w_parts)
+    all_radii = np.concatenate([r['radii_um'] for r in results])
 
     np.savez(
         output_file,
@@ -622,66 +788,41 @@ def compute_fiber_profiles(input_path: Path,
         lengths_um=lengths,
         radii_profiles_um=radii_profiles,
         skeleton_coords_um=skeleton_coords,
-        all_radii_wo_branches_um=all_radii_wo,
-        all_radii_w_branches_um=all_radii_w,
-        voxel_size_um=np.array(voxel_size_tuple),
-        max_axon_radius_um=max_axon_radius_um,
-        plane_radius_voxels=plane_radius_voxels,
-        plane_resolution=plane_resolution,
+        all_radii_um=all_radii,
+        voxel_size_um=voxel_size,
+        g_radius=g_radius,
+        g_res=g_res,
         step_size_um=step_size_um,
-        source_file=str(input_path)
+        source_file=str(input_path),
+        method='deepacson_csd',
     )
 
     logger.info(f"Saved results to {output_file}")
 
     # Summary statistics
-    n_branch_radii = len(all_radii_w) - len(all_radii_wo)
+    r_eff = (np.mean(all_radii**6) / np.mean(all_radii**2)) ** 0.25
     logger.info("\nSummary Statistics:")
     logger.info(f"  Total axons processed: {len(results)}")
-    logger.info(f"  Radius samples (main trunk): {len(all_radii_wo)}")
-    logger.info(f"  Radius samples (branches): {n_branch_radii}")
-    logger.info(f"  Radius samples (total): {len(all_radii_w)}")
+    logger.info(f"  Total radius samples: {len(all_radii)}")
     logger.info(f"  Mean axon length: {np.mean(lengths):.2f} ± {np.std(lengths):.2f} μm")
     logger.info(f"  Mean points per axon: {np.mean(n_points):.1f}")
-
-    r_eff_wo = (np.mean(all_radii_wo**6) / np.mean(all_radii_wo**2)) ** 0.25
-    r_eff_w = (np.mean(all_radii_w**6) / np.mean(all_radii_w**2)) ** 0.25
-    logger.info(f"  r_eff (wo branches): {r_eff_wo:.3f} μm")
-    logger.info(f"  r_eff (w branches):  {r_eff_w:.3f} μm")
-    logger.info(f"  r̄ (wo branches): {np.mean(all_radii_wo):.3f} μm")
-    logger.info(f"  r̄ (w branches):  {np.mean(all_radii_w):.3f} μm")
+    logger.info(f"  r̄: {np.mean(all_radii):.4f} μm")
+    logger.info(f"  r_eff: {r_eff:.4f} μm")
 
 
 def batch_compute_fiber_profiles(
     matched_files: List[Path],
     output_root: Path,
     voxel_size_um: Optional[Union[float, Tuple[float, float, float]]],
-    max_axon_radius_um: float,
+    g_radius: int,
+    g_res: float,
     step_size_um: float,
     n_jobs: int,
     max_axons: int,
     anisotropy_mode: str,
-    path_method: str,
-    skeleton_downsample: int,
     output_suffix: str = '_axon_profiles',
 ):
-    """
-    Batch process multiple .zarr/.mat files matched by glob pattern.
-
-    Args:
-        matched_files: List of matched file paths (.zarr directories or .mat files)
-        output_root: Root directory for outputs
-        voxel_size_um: Voxel size (same as compute_fiber_profiles)
-        max_axon_radius_um: Max axon radius in micrometers
-        step_size_um: Step size along skeleton in micrometers
-        n_jobs: Number of parallel jobs
-        max_axons: Max number of axons to process per file
-        anisotropy_mode: Anisotropy handling mode
-        path_method: Skeleton path extraction method
-        skeleton_downsample: Skeleton extraction downsample factor
-        output_suffix: Suffix to append to output filenames (default: '_axon_profiles')
-    """
-    # Find common root directory
+    """Batch process multiple .zarr/.mat files matched by glob pattern."""
     if len(matched_files) == 1:
         common_root = matched_files[0].parent
     else:
@@ -699,7 +840,6 @@ def batch_compute_fiber_profiles(
     failed = []
 
     for i, input_file in enumerate(matched_files, 1):
-        # Construct output filename
         stem = input_file.stem
         if input_file.suffix == ".zarr" or (input_file.is_dir() and ".zarr" in input_file.name):
             stem = input_file.with_suffix("").stem if "." in input_file.stem else input_file.stem
@@ -715,13 +855,12 @@ def batch_compute_fiber_profiles(
                 input_file,
                 output_file,
                 voxel_size_um=voxel_size_um,
-                max_axon_radius_um=max_axon_radius_um,
+                g_radius=g_radius,
+                g_res=g_res,
                 step_size_um=step_size_um,
                 n_jobs=n_jobs,
                 max_axons=max_axons,
                 anisotropy_mode=anisotropy_mode,
-                path_method=path_method,
-                skeleton_downsample=skeleton_downsample
             )
             successful.append(input_file.name)
         except Exception as e:
@@ -731,7 +870,6 @@ def batch_compute_fiber_profiles(
             traceback.print_exc()
             continue
 
-    # Print summary
     logger.info(f"\n{'='*80}")
     logger.info("Batch Processing Complete")
     logger.info(f"{'='*80}")
@@ -756,7 +894,7 @@ def parse_voxel_size_arg(value: str) -> Union[float, Tuple[float, float, float]]
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Compute fiber morphometry profiles by sampling perpendicular cross-sections'
+        description='Compute fiber morphometry profiles using DeepACSON CSD approach'
     )
     parser.add_argument('input', type=str,
                         help="Path to .zarr directory, .mat file, or glob pattern")
@@ -765,8 +903,10 @@ if __name__ == '__main__':
     parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=None,
                         help='Voxel size in μm: single value (isotropic) or vz,vy,vx. '
                              'If not specified, loads from companion .json file (default: from JSON or 0.05)')
-    parser.add_argument('--max-axon-radius', type=float, default=5.0,
-                        help='Maximum expected axon radius in μm (sets sampling plane size, default: 5.0)')
+    parser.add_argument('--g-radius', type=int, default=15,
+                        help='Grid radius for cross-section sampling in voxels (default: 15)')
+    parser.add_argument('--g-res', type=float, default=0.25,
+                        help='Grid resolution for cross-section sampling in voxels (default: 0.25)')
     parser.add_argument('--step-size', type=float, default=0.1,
                         help='Step size along skeleton in μm (default: 0.1)')
     parser.add_argument('--n-jobs', type=int, default=-1,
@@ -776,17 +916,11 @@ if __name__ == '__main__':
     parser.add_argument('--anisotropy-mode', type=str, default='simple',
                         choices=['simple', 'none'],
                         help="'simple' resamples to isotropic, 'none' uses geometric mean")
-    parser.add_argument('--path-method', type=str, default='discrete',
-                        choices=['discrete', 'euler'],
-                        help="Skeleton path method: 'discrete' (fast) or 'euler' (subvoxel)")
-    parser.add_argument('--skeleton-downsample', type=int, default=1,
-                        help="Downsample factor for skeleton extraction (default: 1)")
     parser.add_argument('--output-suffix', type=str, default='_axon_profiles',
                         help='Suffix to append to output filenames in batch mode (default: "_axon_profiles")')
 
     args = parser.parse_args()
 
-    # Expand glob pattern to find matching files/directories
     input_pattern = args.input
     output_path = args.output
 
@@ -795,10 +929,8 @@ if __name__ == '__main__':
     if len(matched_files) == 0:
         parser.error(f"No files matched pattern: {input_pattern}")
     elif len(matched_files) == 1:
-        # Single file mode
         input_path = Path(matched_files[0])
 
-        # If output is a directory, construct filename
         if output_path.suffix != ".npz":
             stem = input_path.stem
             if input_path.suffix == ".zarr" or (input_path.is_dir() and ".zarr" in input_path.name):
@@ -809,16 +941,14 @@ if __name__ == '__main__':
             input_path,
             output_path,
             voxel_size_um=args.voxel_size,
-            max_axon_radius_um=args.max_axon_radius,
+            g_radius=args.g_radius,
+            g_res=args.g_res,
             step_size_um=args.step_size,
             n_jobs=args.n_jobs,
             max_axons=args.max_axons,
             anisotropy_mode=args.anisotropy_mode,
-            path_method=args.path_method,
-            skeleton_downsample=args.skeleton_downsample
         )
     else:
-        # Batch mode - multiple files matched
         matched_paths = [Path(f) for f in matched_files]
         if output_path.suffix == ".npz":
             parser.error("Output must be a directory in batch mode")
@@ -826,12 +956,11 @@ if __name__ == '__main__':
             matched_paths,
             output_path,
             voxel_size_um=args.voxel_size,
-            max_axon_radius_um=args.max_axon_radius,
+            g_radius=args.g_radius,
+            g_res=args.g_res,
             step_size_um=args.step_size,
             n_jobs=args.n_jobs,
             max_axons=args.max_axons,
             anisotropy_mode=args.anisotropy_mode,
-            path_method=args.path_method,
-            skeleton_downsample=args.skeleton_downsample,
             output_suffix=args.output_suffix,
         )
