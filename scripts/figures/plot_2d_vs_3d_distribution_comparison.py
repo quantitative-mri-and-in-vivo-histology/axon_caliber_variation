@@ -26,7 +26,6 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
-from matplotlib.legend_handler import HandlerBase
 from scipy import stats
 
 from axonometry import get_plot_settings, style_axis, add_panel_labels
@@ -193,51 +192,32 @@ def make_bin_centers() -> np.ndarray:
     return np.arange(BIN_WIDTH_UM / 2, MAX_RADIUS_UM, BIN_WIDTH_UM)
 
 
-class HandlerLineWithBackground(HandlerBase):
-    """Custom legend handler: line over shaded rectangle."""
-    def __init__(self, line_color, bg_color, bg_alpha=0.3):
-        self.line_color = line_color
-        self.bg_color = bg_color
-        self.bg_alpha = bg_alpha
-        super().__init__()
-
-    def create_artists(self, legend, orig_handle, xdescent, ydescent,
-                      width, height, fontsize, trans):
-        rect = plt.Rectangle([xdescent, ydescent], width, height,
-                              facecolor=self.bg_color, alpha=self.bg_alpha,
-                              edgecolor='none', transform=trans)
-        line = plt.Line2D([xdescent, xdescent + width],
-                          [ydescent + height/2, ydescent + height/2],
-                          color=self.line_color, linewidth=1.5, transform=trans)
-        return [rect, line]
-
 
 def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
                    radius_type: str, x_max: float,
                    cache_2d: Optional[Dict] = None,
                    cache_3d: Optional[Dict] = None) -> None:
     """
-    Panel (a): 3D PDF line + 2D IQR envelope + r̄/r_MRI markers.
+    Panel (a): 3D and 2D pooled PDFs + r̄/r_MRI vertical markers.
     """
     bin_centers = make_bin_centers()
     bin_width = bin_centers[1] - bin_centers[0]
     bin_edges = np.concatenate([[bin_centers[0] - bin_width / 2],
                                  bin_centers + bin_width / 2])
 
-    # 2D: per-slice PDFs → median + IQR
+    # 2D: pooled PDF from all radii
     data_2d = cache_2d[slice_file] if cache_2d else load_and_filter_2d(slice_file, radius_type)
-    pdfs = compute_per_slice_pdfs(data_2d, bin_centers)
-    stats_2d = compute_per_slice_stats(data_2d)
+    radii_2d = data_2d['radii']
 
-    if len(pdfs) == 0:
+    if len(radii_2d) == 0:
         ax.text(0.5, 0.5, 'No valid 2D data', ha='center', va='center',
                 transform=ax.transAxes)
         return
 
-    pdf_lo = np.percentile(pdfs, 25, axis=0)
-    pdf_hi = np.percentile(pdfs, 75, axis=0)
+    hist_2d, _ = np.histogram(radii_2d, bins=bin_edges)
+    pdf_2d = hist_2d / (hist_2d.sum() * bin_width) if hist_2d.sum() > 0 else hist_2d * 0.0
 
-    # 3D: single PDF
+    # 3D: pooled PDF
     radii_3d = cache_3d[axon_file] if cache_3d else load_3d_radii(axon_file)
     hist_3d, _ = np.histogram(radii_3d, bins=bin_edges)
     pdf_3d = hist_3d / (hist_3d.sum() * bin_width) if hist_3d.sum() > 0 else hist_3d * 0.0
@@ -246,50 +226,54 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     mask = bin_centers <= x_max
     x = bin_centers[mask]
 
-    # Colors
-    pdf_color = settings.colors['single_line']
-    r_arith_color = settings.colors['example_2']  # Orange
-    r_eff_color = settings.colors['example_3']     # Purple
+    # Colors: one per dimensionality (matching binary_a/b from variability stats)
+    color_2d = settings.colors['binary_a']   # Sand/tan
+    color_3d = settings.colors['binary_b']   # Dusty teal
+    vline_lw = 2.0
 
-    # Plot
-    ax.plot(x, pdf_3d[mask], color=pdf_color, linewidth=settings.line['linewidth'])
-    ax.fill_between(x, pdf_lo[mask], pdf_hi[mask], alpha=0.3, color=pdf_color)
+    # PDF lines (solid)
+    ax.plot(x, pdf_3d[mask], color=color_3d, linewidth=settings.line['linewidth'],
+            linestyle='-')
+    ax.plot(x, pdf_2d[mask], color=color_2d, linewidth=settings.line['linewidth'],
+            linestyle='-')
 
-    # r̄ markers (2D IQR)
-    r_arith_med = np.median(stats_2d['r_arith'])
-    r_arith_lo = np.percentile(stats_2d['r_arith'], 25)
-    r_arith_hi = np.percentile(stats_2d['r_arith'], 75)
-    ax.axvspan(r_arith_lo, r_arith_hi, alpha=0.3, color=r_arith_color, zorder=0)
-    ax.axvline(r_arith_med, color=r_arith_color, linewidth=1.2, alpha=0.9)
+    # Summary statistics from pooled radii
+    r_arith_3d = np.mean(radii_3d)
+    r_eff_3d = compute_r_eff(radii_3d)
+    r_arith_2d = np.mean(radii_2d)
+    r_eff_2d = compute_r_eff(radii_2d)
 
-    # r_MRI markers (2D IQR)
-    valid_reff = stats_2d['r_eff'][~np.isnan(stats_2d['r_eff'])]
-    if len(valid_reff) > 0:
-        r_eff_med = np.median(valid_reff)
-        r_eff_lo = np.percentile(valid_reff, 25)
-        r_eff_hi = np.percentile(valid_reff, 75)
-        ax.axvspan(r_eff_lo, r_eff_hi, alpha=0.3, color=r_eff_color, zorder=0)
-        ax.axvline(r_eff_med, color=r_eff_color, linewidth=1.2, alpha=0.9)
+    # r̄ markers (dotted)
+    ax.axvline(r_arith_3d, color=color_3d, linewidth=vline_lw, linestyle=':', alpha=0.9)
+    ax.axvline(r_arith_2d, color=color_2d, linewidth=vline_lw, linestyle=':', alpha=0.9)
+
+    # r_MRI markers (dashed)
+    ax.axvline(r_eff_3d, color=color_3d, linewidth=vline_lw, linestyle='--', alpha=0.9)
+    ax.axvline(r_eff_2d, color=color_2d, linewidth=vline_lw, linestyle='--', alpha=0.9)
 
     # Legend
-    handles, labels, handler_map = [], [], {}
+    handles, labels = [], []
 
-    d1 = Line2D([0], [0])
-    handles.append(d1); labels.append('PDF (3D ref. + 2D IQR)')
-    handler_map[d1] = HandlerLineWithBackground(pdf_color, pdf_color, 0.3)
+    # 3D entries
+    handles.append(Line2D([0], [0], color=color_3d, linewidth=1.5, linestyle='-'))
+    labels.append('3D PDF')
+    handles.append(Line2D([0], [0], color=color_3d, linewidth=vline_lw, linestyle=':'))
+    labels.append(r'3D $\bar{r}$')
+    handles.append(Line2D([0], [0], color=color_3d, linewidth=vline_lw, linestyle='--'))
+    labels.append(r'3D $r_{\mathrm{MRI}}$')
 
-    d2 = Line2D([0], [0])
-    handles.append(d2); labels.append(r'$\bar{r}$ (2D median + IQR)')
-    handler_map[d2] = HandlerLineWithBackground(r_arith_color, r_arith_color, 0.3)
-
-    d3 = Line2D([0], [0])
-    handles.append(d3); labels.append(r'$r_{\mathrm{MRI}}$ (2D median + IQR)')
-    handler_map[d3] = HandlerLineWithBackground(r_eff_color, r_eff_color, 0.3)
+    # 2D entries
+    handles.append(Line2D([0], [0], color=color_2d, linewidth=1.5, linestyle='-'))
+    labels.append('2D PDF')
+    handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle=':'))
+    labels.append(r'2D $\bar{r}$')
+    handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle='--'))
+    labels.append(r'2D $r_{\mathrm{MRI}}$')
 
     style_axis(ax, xlabel='Axon radius [μm]', ylabel='Probability density [μm⁻¹]')
     ax.legend(handles, labels, loc='upper right',
               fontsize=settings.fonts['legend_size'] - 1,
-              framealpha=0.9, handler_map=handler_map)
+              framealpha=0.9)
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
     ax.set_box_aspect(1)
