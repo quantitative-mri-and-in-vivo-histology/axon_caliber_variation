@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Compute 3D axon profiles reproducing the DeepACSON cross-section approach.
+Compute 3D axon profiles reproducing DeepACSON cross-section results, fast.
 
-Uses our skeleton extraction (FMM + discrete path tracing) but switches to
-DeepACSON's cross-section sampling method:
-- Trilinear interpolation (RegularGridInterpolator)
-- Connected-component labeling at center
-- regionprops for area measurement
+Uses our skeleton extraction (FMM + Euler path tracing) with a Numba-fused
+cross-section kernel that matches DeepACSON's approach:
+- DeepACSON Euler-Rodrigues rotation (row_vector @ rot_mat)
+- Trilinear interpolation (threshold >= 0.5)
+- Flood-fill connected component at center
 - Sub-voxel grid resolution (g_res=0.25, g_radius=15 voxels)
-
-This isolates the effect of the cross-section method from the skeleton method.
 
 Usage:
     python compute_3d_axon_profiles_ours.py \
@@ -24,9 +22,8 @@ import traceback
 from pathlib import Path
 
 import numpy as np
+from numba import njit
 from scipy.ndimage import find_objects
-from scipy.interpolate import RegularGridInterpolator as rgi
-from skimage.measure import label, regionprops
 from tqdm import tqdm
 
 # axonometry library
@@ -48,6 +45,171 @@ from axonometry import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Module-level grid state
+_base_grid_xy = None
+_grid_size = None
+
+
+def precompute_base_grid(g_radius, g_res):
+    """Precompute the XY plane grid (identical for every cross-section)."""
+    global _base_grid_xy, _grid_size
+    coords = np.arange(-g_radius, g_radius, g_res)
+    x, y = np.meshgrid(coords, coords)
+    _base_grid_xy = np.ascontiguousarray(
+        np.stack([x.ravel(), y.ravel()], axis=1)
+    )
+    _grid_size = len(coords)
+
+
+@njit(cache=True, fastmath=True)
+def _sample_trilinear_flood_fill(volume, base_grid, grid_size,
+                                  point_0, point_1, point_2,
+                                  tan_0, tan_1, tan_2):
+    """
+    Fused kernel: DeepACSON rotation + trilinear interpolation + flood-fill.
+
+    Matches DeepACSON's cross-section sampling:
+    - Euler-Rodrigues rotation with row_vector @ rot_mat convention
+    - Trilinear interpolation (threshold >= 0.5) on binary volume
+    - Flood-fill from center for connected component
+    """
+    n_grid = base_grid.shape[0]
+    sz0, sz1, sz2 = volume.shape
+
+    # DeepACSON rotation: rot_axis = cross(tangent, z_axis) = (tan_1, -tan_0, 0)
+    dot_zt = tan_2
+
+    if dot_zt > 0.9999:
+        r00 = 1.0; r01 = 0.0; r02 = 0.0
+        r10 = 0.0; r11 = 1.0; r12 = 0.0
+    elif dot_zt < -0.9999:
+        r00 = 1.0; r01 = 0.0; r02 = 0.0
+        r10 = 0.0; r11 = 1.0; r12 = 0.0
+    else:
+        rn = np.sqrt(tan_0 * tan_0 + tan_1 * tan_1)
+        rx = tan_1 / rn
+        ry = -tan_0 / rn
+
+        clamped = max(-1.0, min(1.0, dot_zt))
+        theta = np.arccos(clamped)
+
+        a = np.cos(theta * 0.5)
+        s = np.sin(theta * 0.5)
+        b = -rx * s
+        c = -ry * s
+
+        aa = a * a; bb = b * b; cc = c * c
+        bc = b * c; ac = a * c; ab = a * b
+
+        # DeepACSON rot_mat (d=0):
+        r00 = aa + bb - cc;  r01 = 2.0 * bc;       r02 = -2.0 * ac
+        r10 = 2.0 * bc;      r11 = aa + cc - bb;    r12 = 2.0 * ab
+        r20 = 2.0 * ac;      r21 = -2.0 * ab;       r22 = aa - bb - cc
+
+    bw = np.zeros((grid_size, grid_size), dtype=np.uint8)
+
+    for i in range(n_grid):
+        gx = base_grid[i, 0]
+        gy = base_grid[i, 1]
+
+        # row_vector @ rot_mat: out_k = gx*R[0,k] + gy*R[1,k]
+        sx = gx * r00 + gy * r10 + point_0
+        sy = gx * r01 + gy * r11 + point_1
+        sz = gx * r02 + gy * r12 + point_2
+
+        # Trilinear interpolation
+        ix0 = int(np.floor(sx))
+        iy0 = int(np.floor(sy))
+        iz0 = int(np.floor(sz))
+        ix1 = ix0 + 1
+        iy1 = iy0 + 1
+        iz1 = iz0 + 1
+
+        # Treat out-of-bounds corners as 0 (matches DeepACSON fill_value=0)
+        dx = sx - ix0
+        dy = sy - iy0
+        dz = sz - iz0
+
+        val = 0.0
+        if 0 <= ix0 < sz0 and 0 <= iy0 < sz1 and 0 <= iz0 < sz2:
+            val += volume[ix0, iy0, iz0] * (1-dx)*(1-dy)*(1-dz)
+        if 0 <= ix0 < sz0 and 0 <= iy0 < sz1 and 0 <= iz1 < sz2:
+            val += volume[ix0, iy0, iz1] * (1-dx)*(1-dy)*dz
+        if 0 <= ix0 < sz0 and 0 <= iy1 < sz1 and 0 <= iz0 < sz2:
+            val += volume[ix0, iy1, iz0] * (1-dx)*dy*(1-dz)
+        if 0 <= ix0 < sz0 and 0 <= iy1 < sz1 and 0 <= iz1 < sz2:
+            val += volume[ix0, iy1, iz1] * (1-dx)*dy*dz
+        if 0 <= ix1 < sz0 and 0 <= iy0 < sz1 and 0 <= iz0 < sz2:
+            val += volume[ix1, iy0, iz0] * dx*(1-dy)*(1-dz)
+        if 0 <= ix1 < sz0 and 0 <= iy0 < sz1 and 0 <= iz1 < sz2:
+            val += volume[ix1, iy0, iz1] * dx*(1-dy)*dz
+        if 0 <= ix1 < sz0 and 0 <= iy1 < sz1 and 0 <= iz0 < sz2:
+            val += volume[ix1, iy1, iz0] * dx*dy*(1-dz)
+        if 0 <= ix1 < sz0 and 0 <= iy1 < sz1 and 0 <= iz1 < sz2:
+            val += volume[ix1, iy1, iz1] * dx*dy*dz
+
+        if val >= 0.5:
+            row = i // grid_size
+            col = i % grid_size
+            bw[row, col] = 1
+
+    # Flood-fill from center
+    center = grid_size // 2
+    if not bw[center, center]:
+        return 0
+
+    queue_r = np.empty(grid_size * grid_size, dtype=np.int32)
+    queue_c = np.empty(grid_size * grid_size, dtype=np.int32)
+    visited = np.zeros((grid_size, grid_size), dtype=np.uint8)
+
+    queue_r[0] = center
+    queue_c[0] = center
+    visited[center, center] = 1
+    head = 0
+    tail = 1
+    area = 0
+
+    while head < tail:
+        r = queue_r[head]
+        c_ = queue_c[head]
+        head += 1
+        area += 1
+
+        if r > 0 and not visited[r - 1, c_] and bw[r - 1, c_]:
+            visited[r - 1, c_] = 1
+            queue_r[tail] = r - 1
+            queue_c[tail] = c_
+            tail += 1
+        if r < grid_size - 1 and not visited[r + 1, c_] and bw[r + 1, c_]:
+            visited[r + 1, c_] = 1
+            queue_r[tail] = r + 1
+            queue_c[tail] = c_
+            tail += 1
+        if c_ > 0 and not visited[r, c_ - 1] and bw[r, c_ - 1]:
+            visited[r, c_ - 1] = 1
+            queue_r[tail] = r
+            queue_c[tail] = c_ - 1
+            tail += 1
+        if c_ < grid_size - 1 and not visited[r, c_ + 1] and bw[r, c_ + 1]:
+            visited[r, c_ + 1] = 1
+            queue_r[tail] = r
+            queue_c[tail] = c_ + 1
+            tail += 1
+
+    return area
+
+
+def sample_cross_section_fast(volume_bool, point, tangent_vec, g_res):
+    """Sample cross-section area using fused Numba kernel."""
+    area = _sample_trilinear_flood_fill(
+        volume_bool, _base_grid_xy, _grid_size,
+        point[0], point[1], point[2],
+        tangent_vec[0], tangent_vec[1], tangent_vec[2],
+    )
+    if area == 0:
+        return None
+    return area * (g_res ** 2)
+
 
 def load_zarr_volume(zarr_path: Path):
     """Load level-0 volume and voxel size from an OME-Zarr store."""
@@ -59,100 +221,9 @@ def load_zarr_volume(zarr_path: Path):
     return volume, float(scale[0])
 
 
-def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
-    """
-    Sample a perpendicular cross-section using the DeepACSON approach.
-
-    Trilinear interpolation + connected-component labeling + regionprops area.
-
-    Returns equivalent radius in voxels, or None if invalid.
-    """
-    sz = binary_vol.shape
-
-    # Build the sampling plane grid
-    x, y = np.mgrid[-g_radius:g_radius:g_res, -g_radius:g_radius:g_res]
-    z = np.zeros_like(x)
-    xyz = np.array([np.ravel(x), np.ravel(y), np.ravel(z)]).T
-
-    c_mesh = int((2 * g_radius) / (2 * g_res))
-    cent_ball = (x**2 + y**2) < g_res * 1
-
-    # Rotate plane to be perpendicular to tangent (DeepACSON rotation)
-    t = tangent_vec
-    z_axis = np.array([0.0, 0.0, 1.0])
-
-    if np.array_equal(t, np.array([0, 0, 0])):
-        return None
-
-    # unit_normal_vector (cross product axis)
-    rot_axis = np.cross(t, z_axis)
-    rot_norm = np.sqrt(np.dot(rot_axis, rot_axis))
-    if rot_norm < 1e-5:
-        rot_axis = t
-    else:
-        rot_axis = rot_axis / max(rot_norm, 1e-5)
-
-    # angle between tangent and z-axis
-    theta = np.arccos(np.dot(t, z_axis) / (np.sqrt(np.dot(t, t)) * np.sqrt(np.dot(z_axis, z_axis))))
-
-    # Euler-Rodrigues rotation matrix
-    a = np.cos(theta / 2.0)
-    b, c, d = -rot_axis * np.sin(theta / 2.0)
-    aa, bb, cc, dd = a**2, b**2, c**2, d**2
-    bc, ad, ac, ab, bd, cd = b*c, a*d, a*c, a*b, b*d, c*d
-    rot_mat = np.array([
-        [aa+bb-cc-dd, 2*(bc+ad), 2*(bd-ac)],
-        [2*(bc-ad), aa+cc-bb-dd, 2*(cd+ab)],
-        [2*(bd+ac), 2*(cd-ab), aa+dd-bb-cc],
-    ])
-
-    # DeepACSON applies as row_vector @ rot_mat
-    rotated_plane = np.dot(xyz, rot_mat)
-    cross_section_plane = rotated_plane + point
-
-    # Trilinear interpolation
-    interpolating_func = rgi(
-        (range(sz[0]), range(sz[1]), range(sz[2])),
-        binary_vol.astype(np.float64),
-        bounds_error=False, fill_value=0
-    )
-    cross_section = interpolating_func(cross_section_plane)
-    bw_cross_section = cross_section >= 0.5
-    bw_cross_section = np.reshape(bw_cross_section, x.shape)
-
-    # Connected component at center
-    label_cross_section, nn = label(bw_cross_section, return_num=True)
-    main_lbl = np.unique(label_cross_section[cent_ball])
-    main_lbl = main_lbl[np.nonzero(main_lbl)]
-
-    if len(main_lbl) != 1:
-        return None
-
-    bw_cross_section = label_cross_section == main_lbl[0]
-
-    # Size check
-    nz_X = np.count_nonzero(np.sum(bw_cross_section, axis=0))
-    nz_Y = np.count_nonzero(np.sum(bw_cross_section, axis=1))
-    if nz_X < 4 or nz_Y < 4:
-        return None
-
-    # Measure area via regionprops
-    props = regionprops(bw_cross_section.astype(np.int32))
-    if len(props) == 0:
-        return None
-
-    area_pixels = props[0].area
-    area_voxels = area_pixels * (g_res ** 2)
-    radius_voxels = np.sqrt(area_voxels / np.pi)
-
-    return radius_voxels
-
-
 def process_single_axon(volume, axon_label, bboxes, voxel_size_um,
                         step_size_um, g_radius, g_res):
-    """
-    Process one axon: our skeleton + DeepACSON cross-sections.
-    """
+    """Process one axon: our skeleton + fast DeepACSON-style cross-sections."""
     bbox = bboxes.get(axon_label)
     if bbox is None:
         return None
@@ -188,7 +259,7 @@ def process_single_axon(volume, axon_label, bboxes, voxel_size_um,
     subvol_wide = volume[min_padded[0]:max_padded[0],
                          min_padded[1]:max_padded[1],
                          min_padded[2]:max_padded[2]]
-    binary_wide = (subvol_wide == axon_label).astype(np.float64)
+    binary_wide = (subvol_wide == axon_label)
 
     # Sort segments by length (longest first)
     seg_lengths_px = [len(seg) for seg in skel_segments]
@@ -196,6 +267,7 @@ def process_single_axon(volume, axon_label, bboxes, voxel_size_um,
     skel_segments = [skel_segments[i] for i in seg_order]
 
     voxel_size_tuple = (voxel_size_um, voxel_size_um, voxel_size_um)
+    inv_sqrt_pi = 1.0 / np.sqrt(np.pi)
     all_radii_um = []
     all_skel_coords_um = []
     main_length_um = 0.0
@@ -240,12 +312,10 @@ def process_single_axon(volume, axon_label, bboxes, voxel_size_um,
             if tangent[0] == 0 and tangent[1] == 0 and tangent[2] == 0:
                 continue
 
-            radius_voxels = sample_cross_section(
-                binary_wide, point, tangent, g_radius, g_res
-            )
+            area = sample_cross_section_fast(binary_wide, point, tangent, g_res)
 
-            if radius_voxels is not None and radius_voxels > 0:
-                radius_um = radius_voxels * voxel_size_um
+            if area is not None and area > 0:
+                radius_um = np.sqrt(area) * inv_sqrt_pi * voxel_size_um
                 radii.append(radius_um)
                 global_coord = (point + min_padded) * voxel_size_um
                 skel_coords.append(global_coord)
@@ -280,7 +350,7 @@ def process_single_axon(volume, axon_label, bboxes, voxel_size_um,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Compute 3D axon profiles: our skeleton + DeepACSON cross-sections'
+        description='Compute 3D axon profiles: our skeleton + fast DeepACSON cross-sections'
     )
     parser.add_argument('input', type=Path, help='Path to .zarr volume')
     parser.add_argument('output', type=Path, help='Output .npz file')
@@ -299,10 +369,19 @@ def main():
     logger.info("Warming up Numba JIT compilation...")
     skeleton_warmup()
 
+    # Warmup fused kernel
+    _dummy_vol = np.ones((3, 3, 3), dtype=np.bool_)
+    _dummy_grid = np.zeros((1, 2), dtype=np.float64)
+    _sample_trilinear_flood_fill(_dummy_vol, _dummy_grid, 1, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0)
+
     # Load volume
     logger.info(f"Loading Zarr volume: {args.input.name}")
     volume, voxel_size_um = load_zarr_volume(args.input)
     logger.info(f"Volume shape: {volume.shape}, voxel size: {voxel_size_um} μm")
+
+    # Precompute grid
+    precompute_base_grid(args.g_radius, args.g_res)
+    logger.info(f"Grid: {_grid_size}×{_grid_size} = {_grid_size**2} points")
 
     # Bounding boxes
     logger.info("Computing bounding boxes...")
@@ -369,7 +448,7 @@ def main():
         all_radii_um=all_radii,
         voxel_size_um=voxel_size_um,
         source_file=str(args.input),
-        method='ours_trilinear',
+        method='ours_fast_trilinear',
     )
 
     logger.info(f"Saved results to {args.output}")

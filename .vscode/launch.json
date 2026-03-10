@@ -208,11 +208,27 @@
             }
         },
         {
-            "name": "Plot (main): Fit Combined Distributions",
+            "name": "Plot (main): Distribution Fits",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/scripts/figures/fit_combined_distributions.py",
+            "program": "${workspaceFolder}/scripts/figures/plot_distribution_fits.py",
             "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (main): Distribution Fits (old data)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_distribution_fits.py",
+            "args": [
+                "--rat-data", "data_old/processed/LM_split",
+                "--output", "fig/main/combined_distribution_fits_old_split.png"
+            ],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
@@ -226,6 +242,26 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/figures/plot_std_vs_radius.py",
             "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Plot (supp): 2D vs 3D Distribution Comparison (LM circular)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/figures/plot_2d_vs_3d_distribution_comparison.py",
+            "args": [
+                "--data-dir", "data/processed/rat/lm",
+                "--output", "fig/supplementary/distribution_2d_vs_3d_comparison_circular.svg",
+                "--radius-type", "circular",
+                "--min-radius", "0.0",
+                "--max-eccentricity", "1.0",
+                "--min-solidity", "0.5"
+            ],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
@@ -505,6 +541,38 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/exploratory/distribution_fitting/fit_lm_em_corrected_distributions.py",
             "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Exploratory: DeepACSON 3D Axon Profiles (debug small)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/exploratory/3d_axon_profiles/compute_3d_axon_profiles_deepacson.py",
+            "args": [
+                "data/debug/sham_25_ipsi_cg_myelin_small.zarr",
+                "data/debug/sham_25_ipsi_cg_deepacson_profiles.npz"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Exploratory: Our 3D Axon Profiles (debug small)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/processing/compute_3d_axon_profiles.py",
+            "args": [
+                "data/debug/sham_25_ipsi_cg_myelin_small.zarr",
+                "data/debug/sham_25_ipsi_cg_our_profiles.npz"
+            ],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
