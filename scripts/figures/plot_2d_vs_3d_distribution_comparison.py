@@ -205,17 +205,19 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     bin_edges = np.concatenate([[bin_centers[0] - bin_width / 2],
                                  bin_centers + bin_width / 2])
 
-    # 2D: pooled PDF from all radii
+    # 2D: per-slice PDFs → median + IQR envelope
     data_2d = cache_2d[slice_file] if cache_2d else load_and_filter_2d(slice_file, radius_type)
-    radii_2d = data_2d['radii']
+    pdfs_2d = compute_per_slice_pdfs(data_2d, bin_centers)
+    stats_2d = compute_per_slice_stats(data_2d)
 
-    if len(radii_2d) == 0:
+    if len(pdfs_2d) == 0:
         ax.text(0.5, 0.5, 'No valid 2D data', ha='center', va='center',
                 transform=ax.transAxes)
         return
 
-    hist_2d, _ = np.histogram(radii_2d, bins=bin_edges)
-    pdf_2d = hist_2d / (hist_2d.sum() * bin_width) if hist_2d.sum() > 0 else hist_2d * 0.0
+    pdf_2d_median = np.median(pdfs_2d, axis=0)
+    pdf_2d_lo = np.percentile(pdfs_2d, 25, axis=0)
+    pdf_2d_hi = np.percentile(pdfs_2d, 75, axis=0)
 
     # 3D: pooled PDF
     radii_3d = cache_3d[axon_file] if cache_3d else load_3d_radii(axon_file)
@@ -231,25 +233,37 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     color_3d = settings.colors['binary_b']   # Dusty teal
     vline_lw = 2.0
 
-    # PDF lines (solid)
+    # 3D: solid PDF line
     ax.plot(x, pdf_3d[mask], color=color_3d, linewidth=settings.line['linewidth'],
             linestyle='-')
-    ax.plot(x, pdf_2d[mask], color=color_2d, linewidth=settings.line['linewidth'],
+    # 2D: median line + IQR shaded envelope
+    ax.plot(x, pdf_2d_median[mask], color=color_2d, linewidth=settings.line['linewidth'],
             linestyle='-')
+    ax.fill_between(x, pdf_2d_lo[mask], pdf_2d_hi[mask], alpha=0.3, color=color_2d)
 
-    # Summary statistics from pooled radii
+    # 3D summary statistics (pooled)
     r_arith_3d = np.mean(radii_3d)
     r_eff_3d = compute_r_eff(radii_3d)
-    r_arith_2d = np.mean(radii_2d)
-    r_eff_2d = compute_r_eff(radii_2d)
 
-    # r̄ markers (dotted)
+    # 2D summary statistics (per-slice median + IQR)
+    r_arith_2d_med = np.median(stats_2d['r_arith'])
+    r_arith_2d_lo = np.percentile(stats_2d['r_arith'], 25)
+    r_arith_2d_hi = np.percentile(stats_2d['r_arith'], 75)
+    valid_reff = stats_2d['r_eff'][~np.isnan(stats_2d['r_eff'])]
+    r_eff_2d_med = np.median(valid_reff) if len(valid_reff) else np.nan
+    r_eff_2d_lo = np.percentile(valid_reff, 25) if len(valid_reff) else np.nan
+    r_eff_2d_hi = np.percentile(valid_reff, 75) if len(valid_reff) else np.nan
+
+    # r̄ markers (dotted): 3D line + 2D median line with IQR shaded
     ax.axvline(r_arith_3d, color=color_3d, linewidth=vline_lw, linestyle=':', alpha=0.9)
-    ax.axvline(r_arith_2d, color=color_2d, linewidth=vline_lw, linestyle=':', alpha=0.9)
+    ax.axvline(r_arith_2d_med, color=color_2d, linewidth=vline_lw, linestyle=':', alpha=0.9)
+    ax.axvspan(r_arith_2d_lo, r_arith_2d_hi, alpha=0.15, color=color_2d, zorder=0)
 
-    # r_MRI markers (dashed)
+    # r_MRI markers (dashed): 3D line + 2D median line with IQR shaded
     ax.axvline(r_eff_3d, color=color_3d, linewidth=vline_lw, linestyle='--', alpha=0.9)
-    ax.axvline(r_eff_2d, color=color_2d, linewidth=vline_lw, linestyle='--', alpha=0.9)
+    if not np.isnan(r_eff_2d_med):
+        ax.axvline(r_eff_2d_med, color=color_2d, linewidth=vline_lw, linestyle='--', alpha=0.9)
+        ax.axvspan(r_eff_2d_lo, r_eff_2d_hi, alpha=0.15, color=color_2d, zorder=0)
 
     # Legend
     handles, labels = [], []
@@ -264,11 +278,11 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
 
     # 2D entries
     handles.append(Line2D([0], [0], color=color_2d, linewidth=1.5, linestyle='-'))
-    labels.append('2D PDF')
+    labels.append('2D median PDF (+ IQR)')
     handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle=':'))
-    labels.append(r'2D $\bar{r}$')
+    labels.append(r'2D $\bar{r}$ median (+ IQR)')
     handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle='--'))
-    labels.append(r'2D $r_{\mathrm{MRI}}$')
+    labels.append(r'2D $r_{\mathrm{MRI}}$ median (+ IQR)')
 
     style_axis(ax, xlabel='Axon radius [μm]', ylabel='Probability density [μm⁻¹]')
     ax.legend(handles, labels, loc='upper right',
