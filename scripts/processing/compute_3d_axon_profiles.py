@@ -72,8 +72,7 @@ _shared_bboxes = None
 _grid_xyz = None       # Precomputed sampling plane grid
 _grid_cent_ball = None  # Center mask for connected-component check
 _grid_shape = None      # Shape of the 2D grid
-_g_res = None           # Grid resolution in voxels
-_g_radius = None        # Grid radius in voxels
+_g_radius = None        # Grid radius in voxels (computed from max_radius_um / voxel_size)
 _step_voxels = None     # Step size for skeleton subsampling (in voxels)
 _voxel_size_um = None   # Isotropic voxel size in micrometers
 
@@ -382,18 +381,19 @@ def _rotate_vector(vector, rot_mat):
 # Cross-section sampling (DeepACSON approach)
 # ===========================================================================
 
-def precompute_grid(g_radius, g_res):
+def precompute_grid(g_radius):
     """Precompute the XY sampling grid and center mask (called once)."""
-    x, y = np.mgrid[-g_radius:g_radius:g_res, -g_radius:g_radius:g_res]
+    coords = np.arange(-g_radius, g_radius + 1)
+    x, y = np.meshgrid(coords, coords)
     z = np.zeros_like(x)
     xyz = np.array([np.ravel(x), np.ravel(y), np.ravel(z)]).T
-    cent_ball = (x**2 + y**2) < g_res * 1
+    cent_ball = (x**2 + y**2) < 1
     grid_shape = x.shape
     return xyz, cent_ball, grid_shape
 
 
 def _sample_cross_section(interpolating_func, point, tangent_vec,
-                           xyz, cent_ball, grid_shape, g_res):
+                           xyz, cent_ball, grid_shape):
     """
     Sample a perpendicular cross-section using the DeepACSON approach.
 
@@ -432,13 +432,12 @@ def _sample_cross_section(interpolating_func, point, tangent_vec,
     if nz_X < 4 or nz_Y < 4:
         return None
 
-    # Measure area via regionprops
+    # Measure area via regionprops (1 pixel = 1 voxel² at grid resolution 1.0)
     props = regionprops(bw_cross_section.astype(np.int32))
     if len(props) == 0:
         return None
 
-    area_pixels = props[0].area
-    area_voxels = area_pixels * (g_res ** 2)
+    area_voxels = props[0].area
     radius_voxels = np.sqrt(area_voxels / np.pi)
 
     return radius_voxels
@@ -584,7 +583,7 @@ def process_single_axon(args):
 
                 radius_voxels = _sample_cross_section(
                     interpolating_func, point, tangent,
-                    _grid_xyz, _grid_cent_ball, _grid_shape, _g_res
+                    _grid_xyz, _grid_cent_ball, _grid_shape
                 )
 
                 if radius_voxels is not None and radius_voxels > 0:
@@ -658,9 +657,8 @@ def load_zarr_volume(zarr_path: Path) -> Tuple[np.ndarray, float]:
 def compute_fiber_profiles(input_path: Path,
                            output_file: Path,
                            voxel_size_um: Optional[Union[float, Tuple[float, float, float]]] = None,
-                           g_radius: int = 15,
-                           g_res: float = 0.25,
-                           step_size_um: float = 0.1,
+                           max_radius_um: float = 5.0,
+                           step_size_um: float = 0.05,
                            n_jobs: int = -1,
                            max_axons: int = 0,
                            anisotropy_mode: str = 'simple'):
@@ -672,8 +670,7 @@ def compute_fiber_profiles(input_path: Path,
         output_file: Path to save results (.npz)
         voxel_size_um: Voxel size in micrometers (scalar or (vz, vy, vx) tuple).
                        If None, auto-detected from Zarr metadata or companion JSON.
-        g_radius: Grid radius for cross-section sampling in voxels (default: 15)
-        g_res: Grid resolution for cross-section sampling in voxels (default: 0.25)
+        max_radius_um: Maximum expected axon radius in micrometers (sets grid size, default: 5.0)
         step_size_um: Step size along skeleton in micrometers
         n_jobs: Number of parallel jobs (-1 = all CPUs)
         max_axons: Maximum number of axons to process (0 = all)
@@ -707,6 +704,11 @@ def compute_fiber_profiles(input_path: Path,
     vz, vy, vx = voxel_size_tuple
     voxel_size = (vz * vy * vx) ** (1/3)  # geometric mean for isotropic equiv
 
+    # Convert max_radius from μm to voxels for grid sizing
+    g_radius = int(np.ceil(max_radius_um / voxel_size))
+
+    logger.info(f"Max axon radius: {max_radius_um:.1f} μm = {g_radius} voxels")
+
     # Compute bounding boxes
     bboxes = compute_bounding_boxes(volume)
     axon_labels = np.array(sorted(bboxes.keys()))
@@ -720,21 +722,20 @@ def compute_fiber_profiles(input_path: Path,
     if n_jobs == -1:
         n_jobs = mp.cpu_count()
 
-    # Precompute sampling grid
-    xyz, cent_ball, grid_shape = precompute_grid(g_radius, g_res)
+    # Precompute sampling grid (1 pixel = 1 voxel)
+    xyz, cent_ball, grid_shape = precompute_grid(g_radius)
 
     step_voxels = step_size_um / voxel_size if step_size_um is not None else None
 
     # Set globals for workers
     global _shared_volume, _shared_bboxes
     global _grid_xyz, _grid_cent_ball, _grid_shape
-    global _g_res, _g_radius, _step_voxels, _voxel_size_um
+    global _g_radius, _step_voxels, _voxel_size_um
     _shared_volume = volume
     _shared_bboxes = bboxes
     _grid_xyz = xyz
     _grid_cent_ball = cent_ball
     _grid_shape = grid_shape
-    _g_res = g_res
     _g_radius = g_radius
     _step_voxels = step_voxels
     _voxel_size_um = voxel_size
@@ -743,7 +744,7 @@ def compute_fiber_profiles(input_path: Path,
 
     logger.info(f"Voxel size: {voxel_size:.4f} μm")
     logger.info(f"Processing {len(args_list)} axons with {n_jobs} workers")
-    logger.info(f"Parameters: g_radius={g_radius} voxels, g_res={g_res}, "
+    logger.info(f"Parameters: g_radius={g_radius} voxels, "
                 f"step={step_size_um} μm = {step_voxels:.1f} voxels "
                 f"(stride ~{max(1, round(step_voxels / 0.1))})")
 
@@ -790,8 +791,8 @@ def compute_fiber_profiles(input_path: Path,
         skeleton_coords_um=skeleton_coords,
         all_radii_um=all_radii,
         voxel_size_um=voxel_size,
-        g_radius=g_radius,
-        g_res=g_res,
+        max_radius_um=max_radius_um,
+        g_radius_voxels=g_radius,
         step_size_um=step_size_um,
         source_file=str(input_path),
         method='deepacson_csd',
@@ -814,8 +815,7 @@ def batch_compute_fiber_profiles(
     matched_files: List[Path],
     output_root: Path,
     voxel_size_um: Optional[Union[float, Tuple[float, float, float]]],
-    g_radius: int,
-    g_res: float,
+    max_radius_um: float,
     step_size_um: float,
     n_jobs: int,
     max_axons: int,
@@ -855,8 +855,7 @@ def batch_compute_fiber_profiles(
                 input_file,
                 output_file,
                 voxel_size_um=voxel_size_um,
-                g_radius=g_radius,
-                g_res=g_res,
+                max_radius_um=max_radius_um,
                 step_size_um=step_size_um,
                 n_jobs=n_jobs,
                 max_axons=max_axons,
@@ -903,12 +902,10 @@ if __name__ == '__main__':
     parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=None,
                         help='Voxel size in μm: single value (isotropic) or vz,vy,vx. '
                              'If not specified, loads from companion .json file (default: from JSON or 0.05)')
-    parser.add_argument('--g-radius', type=int, default=15,
-                        help='Grid radius for cross-section sampling in voxels (default: 15)')
-    parser.add_argument('--g-res', type=float, default=0.25,
-                        help='Grid resolution for cross-section sampling in voxels (default: 0.25)')
-    parser.add_argument('--step-size', type=float, default=0.1,
-                        help='Step size along skeleton in μm (default: 0.1)')
+    parser.add_argument('--max-radius', type=float, default=5.0,
+                        help='Maximum expected axon radius in μm (sets cross-section grid size, default: 5.0)')
+    parser.add_argument('--step-size', type=float, default=0.05,
+                        help='Step size along skeleton in μm (default: 0.05)')
     parser.add_argument('--n-jobs', type=int, default=-1,
                         help='Number of parallel jobs (-1 = all CPUs)')
     parser.add_argument('--max-axons', type=int, default=0,
@@ -941,8 +938,7 @@ if __name__ == '__main__':
             input_path,
             output_path,
             voxel_size_um=args.voxel_size,
-            g_radius=args.g_radius,
-            g_res=args.g_res,
+            max_radius_um=args.max_radius,
             step_size_um=args.step_size,
             n_jobs=args.n_jobs,
             max_axons=args.max_axons,
@@ -956,8 +952,7 @@ if __name__ == '__main__':
             matched_paths,
             output_path,
             voxel_size_um=args.voxel_size,
-            g_radius=args.g_radius,
-            g_res=args.g_res,
+            max_radius_um=args.max_radius,
             step_size_um=args.step_size,
             n_jobs=args.n_jobs,
             max_axons=args.max_axons,
