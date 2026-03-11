@@ -43,8 +43,8 @@ import numpy as np
 import skfmm
 from numba import njit
 from scipy.ndimage import find_objects, median_filter
-from scipy.interpolate import RegularGridInterpolator as rgi
-from skimage.measure import label, regionprops
+from scipy.ndimage import map_coordinates
+from skimage.measure import label
 from tqdm import tqdm
 
 # Import from axonometry library (for .mat loading only)
@@ -392,27 +392,32 @@ def precompute_grid(g_radius):
     return xyz, cent_ball, grid_shape
 
 
-def _sample_cross_section(interpolating_func, point, tangent_vec,
+_Z_AXIS = np.array([0, 0, 1])
+_ZERO_VEC = np.array([0, 0, 0])
+
+
+def _sample_cross_section(binary, point, tangent_vec,
                            xyz, cent_ball, grid_shape):
     """
     Sample a perpendicular cross-section using the DeepACSON approach.
 
-    Uses trilinear interpolation (RegularGridInterpolator), connected-component
-    labeling at center, and regionprops for area measurement.
+    Uses trilinear interpolation (map_coordinates), connected-component
+    labeling at center, and pixel counting for area measurement.
 
     Returns equivalent radius in voxels, or None if invalid.
     """
-    if np.array_equal(tangent_vec, np.array([0, 0, 0])):
+    if np.array_equal(tangent_vec, _ZERO_VEC):
         return None
 
-    rot_axis = _unit_normal_vector(tangent_vec, np.array([0, 0, 1]))
-    theta = _angle(tangent_vec, np.array([0, 0, 1]))
+    rot_axis = _unit_normal_vector(tangent_vec, _Z_AXIS)
+    theta = _angle(tangent_vec, _Z_AXIS)
     rot_mat = _rotation_matrix_3D(rot_axis, theta)
-    rotated_plane = np.squeeze(_rotate_vector(xyz, rot_mat))
+    rotated_plane = np.dot(xyz, rot_mat)
     cross_section_plane = rotated_plane + point
 
-    # Trilinear interpolation
-    cross_section = interpolating_func(cross_section_plane)
+    # Trilinear interpolation via map_coordinates (order=1 = trilinear)
+    cross_section = map_coordinates(binary, cross_section_plane.T,
+                                    order=1, mode='constant', cval=0.0)
     bw_cross_section = cross_section >= 0.5
     bw_cross_section = np.reshape(bw_cross_section, grid_shape)
 
@@ -432,12 +437,8 @@ def _sample_cross_section(interpolating_func, point, tangent_vec,
     if nz_X < 4 or nz_Y < 4:
         return None
 
-    # Measure area via regionprops (1 pixel = 1 voxel² at grid resolution 1.0)
-    props = regionprops(bw_cross_section.astype(np.int32))
-    if len(props) == 0:
-        return None
-
-    area_voxels = props[0].area
+    # Measure area as pixel count (1 pixel = 1 voxel² at grid resolution 1.0)
+    area_voxels = np.sum(bw_cross_section)
     radius_voxels = np.sqrt(area_voxels / np.pi)
 
     return radius_voxels
@@ -547,13 +548,7 @@ def process_single_axon(args):
         if len(skel_segments) == 0:
             return None
 
-        # Create interpolator once per axon
-        sz = binary.shape
-        interpolating_func = rgi(
-            (range(sz[0]), range(sz[1]), range(sz[2])),
-            binary,
-            bounds_error=False, fill_value=0
-        )
+        # binary volume is passed directly to map_coordinates (no RGI setup)
 
         # Process each skeleton segment — sample cross-sections
         all_radii_um = []
@@ -582,7 +577,7 @@ def process_single_axon(args):
                     continue
 
                 radius_voxels = _sample_cross_section(
-                    interpolating_func, point, tangent,
+                    binary, point, tangent,
                     _grid_xyz, _grid_cent_ball, _grid_shape
                 )
 
