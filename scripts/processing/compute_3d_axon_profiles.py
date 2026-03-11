@@ -10,8 +10,8 @@ The algorithm (per axon):
 1. Extract skeleton via FMM + Euler backtracking (step_size=0.1 voxels)
 2. Organize skeleton: break at junctions, filter by length threshold
 3. For each skeleton segment: sample perpendicular cross-sections using
-   Euler-Rodrigues rotation + trilinear interpolation + connected-component labeling
-4. Measure cross-section area via regionprops → equivalent circular radius
+   fused Numba kernel (rotation + nearest-neighbor interpolation + flood-fill)
+4. Measure cross-section area via flood-fill pixel count → equivalent circular radius
 
 Supports both OME-Zarr volumes (canonical format from preparation pipeline)
 and legacy .mat files.
@@ -42,9 +42,8 @@ from typing import Tuple, Union, Optional, List
 import numpy as np
 import skfmm
 from numba import njit
-from scipy.ndimage import find_objects, median_filter
-from scipy.ndimage import map_coordinates
-from skimage.measure import label
+from scipy.ndimage import find_objects, map_coordinates, median_filter
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 # Import from axonometry library (for .mat loading only)
@@ -69,10 +68,10 @@ logger = logging.getLogger(__name__)
 
 _shared_volume = None
 _shared_bboxes = None
-_grid_xyz = None       # Precomputed sampling plane grid
-_grid_cent_ball = None  # Center mask for connected-component check
-_grid_shape = None      # Shape of the 2D grid
+_base_grid = None      # Precomputed XY sampling grid (N, 2)
+_grid_size = None      # Side length of the 2D grid
 _g_radius = None        # Grid radius in voxels (computed from max_radius_um / voxel_size)
+_g_res = None           # Grid resolution in voxels (default 0.25, matching DeepACSON)
 _step_voxels = None     # Step size for skeleton subsampling (in voxels)
 _voxel_size_um = None   # Isotropic voxel size in micrometers
 
@@ -82,141 +81,102 @@ _voxel_size_um = None   # Isotropic voxel size in micrometers
 # ===========================================================================
 
 @njit(cache=True)
-def _pointmin(D):
+def _compute_gradient_field(D):
+    """Compute gradient field pointing toward minimum-distance neighbor.
+
+    For each voxel, finds the 26-connected neighbor with the smallest value
+    in the travel-time field and records the unit direction toward it.
+    Reads from padded snapshot J; does not mutate D.
+    """
     sz0, sz1, sz2 = D.shape
     max_D = np.max(D)
     Fx = np.zeros((sz0, sz1, sz2))
     Fy = np.zeros((sz0, sz1, sz2))
     Fz = np.zeros((sz0, sz1, sz2))
 
-    # Padded volume
     J = np.full((sz0+2, sz1+2, sz2+2), max_D)
     J[1:sz0+1, 1:sz1+1, 1:sz2+1] = D
 
-    # 26-connected neighbor offsets
     nx = np.array([0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1])
     ny = np.array([0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1])
     nz = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0])
 
+    fx_tab = np.empty(26)
+    fy_tab = np.empty(26)
+    fz_tab = np.empty(26)
     for i in range(26):
-        dx, dy, dz = nx[i], ny[i], nz[i]
-        den = (dx*dx + dy*dy + dz*dz)**0.5
-        fx = dx / den
-        fy = dy / den
-        fz = dz / den
+        den = (nx[i]*nx[i] + ny[i]*ny[i] + nz[i]*nz[i])**0.5
+        fx_tab[i] = nx[i] / den
+        fy_tab[i] = ny[i] / den
+        fz_tab[i] = nz[i] / den
 
-        for a in range(sz0):
-            for b in range(sz1):
-                for c in range(sz2):
-                    val = J[1+a+dx, 1+b+dy, 1+c+dz]
-                    if val < D[a, b, c]:
-                        D[a, b, c] = val
-                        Fx[a, b, c] = fx
-                        Fy[a, b, c] = fy
-                        Fz[a, b, c] = fz
+    for a in range(sz0):
+        for b in range(sz1):
+            for c in range(sz2):
+                best_val = D[a, b, c]
+                best_i = -1
+                for i in range(26):
+                    val = J[1+a+nx[i], 1+b+ny[i], 1+c+nz[i]]
+                    if val < best_val:
+                        best_val = val
+                        best_i = i
+                if best_i >= 0:
+                    Fx[a, b, c] = fx_tab[best_i]
+                    Fy[a, b, c] = fy_tab[best_i]
+                    Fz[a, b, c] = fz_tab[best_i]
 
     return Fx, Fy, Fz
 
 
-@njit(cache=True)
-def _euler_path(Fx, Fy, Fz, start_point, step_size):
-    sz0, sz1, sz2 = Fx.shape
+def _euler_shortest_path(D, source_points, start_point, step_size):
+    """Trace shortest path via Euler integration on the gradient field.
 
-    sp0 = start_point[0, 0]
-    sp1 = start_point[0, 1]
-    sp2 = start_point[0, 2]
-    f0 = int(np.floor(sp0))
-    f1 = int(np.floor(sp1))
-    f2 = int(np.floor(sp2))
+    Uses map_coordinates for trilinear interpolation and cKDTree for
+    fast source-distance queries. Same algorithm as DeepACSON euler path.
+    """
+    Fx, Fy, Fz = _compute_gradient_field(D)
+    # Negate for descent direction
+    Fx = -Fx; Fy = -Fy; Fz = -Fz
+    sz = np.array(D.shape)
 
-    # Trilinear weights
-    d0 = sp0 - f0
-    d1 = sp1 - f1
-    d2 = sp2 - f2
-    c0 = 1.0 - d0
-    c1 = 1.0 - d1
-    c2 = 1.0 - d2
+    source_tree = cKDTree(source_points)
 
-    perc = np.array([c0*c1*c2, c0*c1*d2, c0*d1*c2, c0*d1*d2,
-                     d0*c1*c2, d0*c1*d2, d0*d1*c2, d0*d1*d2])
+    path_list = [start_point[0].copy()]
+    current = start_point[0].astype(np.float64).copy()
 
-    # 8 corner offsets
-    ox = np.array([0, 0, 0, 0, 1, 1, 1, 1])
-    oy = np.array([0, 0, 1, 1, 0, 0, 1, 1])
-    oz = np.array([0, 1, 0, 1, 0, 1, 0, 1])
+    max_iter = int(np.sum(sz) * 10)
 
-    sum_gx = 0.0
-    sum_gy = 0.0
-    sum_gz = 0.0
-    for i in range(8):
-        ix = f0 + ox[i]
-        iy = f1 + oy[i]
-        iz = f2 + oz[i]
-        if ix < 0: ix = 0
-        if ix >= sz0: ix = sz0 - 1
-        if iy < 0: iy = 0
-        if iy >= sz1: iy = sz1 - 1
-        if iz < 0: iz = 0
-        if iz >= sz2: iz = sz2 - 1
+    for itr in range(max_iter):
+        coords = current.reshape(3, 1)
+        gx = map_coordinates(Fx, coords, order=1, mode='nearest')[0]
+        gy = map_coordinates(Fy, coords, order=1, mode='nearest')[0]
+        gz = map_coordinates(Fz, coords, order=1, mode='nearest')[0]
 
-        w = perc[i]
-        sum_gx += Fx[ix, iy, iz] * w
-        sum_gy += Fy[ix, iy, iz] * w
-        sum_gz += Fz[ix, iy, iz] * w
+        mag = np.sqrt(gx*gx + gy*gy + gz*gz) + 1e-6
+        gx, gy, gz = gx/mag, gy/mag, gz/mag
 
-    norm = (sum_gx*sum_gx + sum_gy*sum_gy + sum_gz*sum_gz + 0.000001)**0.5
-    gx = sum_gx / norm
-    gy = sum_gy / norm
-    gz = sum_gz / norm
+        end_point = current - step_size * np.array([gx, gy, gz])
 
-    ep0 = sp0 - step_size * gx
-    ep1 = sp1 - step_size * gy
-    ep2 = sp2 - step_size * gz
-
-    end_point = np.zeros((1, 3))
-    if ep0 < 0 or ep1 < 0 or ep2 < 0 or ep0 > sz0 or ep1 > sz1 or ep2 > sz2:
-        return end_point
-
-    end_point[0, 0] = ep0
-    end_point[0, 1] = ep1
-    end_point[0, 2] = ep2
-    return end_point
-
-
-def _euler_shortest_path(D, source_point, start_point, step_size):
-    Fx, Fy, Fz = _pointmin(D)
-    Fx = -Fx
-    Fy = -Fy
-    Fz = -Fz
-
-    itr = 0
-    path = start_point
-    while True:
-
-        end_point = _euler_path(Fx,Fy,Fz,start_point,step_size)
-
-        dist_endpoint_to_all = np.sum((source_point-end_point)**2,axis=1)**0.5
-        distance_to_endpoint = min(dist_endpoint_to_all)
-
-        if(itr>=10):
-            Movement = np.sum((end_point-path[itr-10])**2)**0.5
-        else:
-            Movement = step_size+1
-
-        if(np.all(end_point==0) or Movement<step_size):
+        if np.any(end_point < 0) or np.any(end_point >= sz):
             break
 
-        itr = itr+1
+        min_dist, _ = source_tree.query(end_point)
 
-        path = np.append(path,end_point,axis=0)
+        if itr >= 10:
+            movement = np.linalg.norm(end_point - path_list[itr - 10])
+            if movement < step_size:
+                break
 
-        if(distance_to_endpoint<10*step_size):
-            source_inx = source_point[np.argmin(dist_endpoint_to_all)]
-            path = np.append(path,np.array(source_inx,ndmin=2),axis=0)
+        path_list.append(end_point.copy())
+
+        if min_dist < 10 * step_size:
+            _, closest_idx = source_tree.query(end_point)
+            path_list.append(source_points[closest_idx].copy())
             break
 
-        start_point = end_point
-    return path
+        current = end_point
+
+    return np.array(path_list)
 
 
 def _get_line_length(L):
@@ -278,55 +238,77 @@ def _organize_skeleton(skel_seg, length_th):
 
 
 def _extract_skeleton(Ax):
-    """FMM + Euler backtracking skeleton extraction (DeepACSON)."""
-    boundary_dist=skfmm.distance(Ax)
+    """FMM + Euler backtracking skeleton extraction (DeepACSON).
 
-    source_point=np.unravel_index(np.argmax(boundary_dist), boundary_dist.shape)
-    maxD=boundary_dist[source_point]
+    Returns:
+        (skeleton_segments, maxD) where maxD is the maximum inscribed radius
+        in voxels (from the boundary distance field).
+    """
+    boundary_dist = skfmm.distance(Ax)
 
-    speed_im=(boundary_dist/maxD)**1.5
+    source_point = np.unravel_index(np.argmax(boundary_dist), boundary_dist.shape)
+    maxD = boundary_dist[source_point]
 
-    Ax=np.ones(Ax.shape)
-    Ax[source_point]=0
+    if maxD < 1e-6:
+        return [], 0.0
 
-    flag=True
-    skeleton_segments=[]
-    source_point = np.array(source_point,ndmin=2)
+    speed_im = (boundary_dist / maxD) ** 1.5
+
+    Ax_work = np.ones(Ax.shape, dtype=np.float64)
+    Ax_work[source_point] = 0
+
+    flag = True
+    skeleton_segments = []
+    source_points_list = [np.array(source_point, dtype=np.float64)]
+
     while True:
+        D = skfmm.travel_time(Ax_work, speed_im)
 
-        D=skfmm.travel_time(Ax,speed_im)
-        end_point=np.unravel_index(np.ma.argmax(D), D.shape)
-        max_dist=D[end_point]
-        D=np.ma.MaskedArray.filled(D,max_dist)
+        # Avoid MaskedArray overhead — work on underlying data directly
+        if isinstance(D, np.ma.MaskedArray):
+            D_data = D.data
+            end_point = np.unravel_index(np.argmax(D_data), D_data.shape)
+            max_dist = D_data[end_point]
+            D_data[D.mask] = max_dist
+            D = D_data
+        else:
+            end_point = np.unravel_index(np.argmax(D), D.shape)
+            max_dist = D[end_point]
 
-        end_point = np.array(end_point,ndmin=2)
-        shortest_line=_euler_shortest_path(D,source_point,end_point,step_size=0.1)
+        source_points = np.array(source_points_list)
+        end_point_arr = np.array(end_point, ndmin=2, dtype=np.float64)
+        shortest_line = _euler_shortest_path(D, source_points, end_point_arr, step_size=0.1)
 
-        line_length=_get_line_length(shortest_line)
+        line_length = _get_line_length(shortest_line)
 
         if flag:
-            length_threshold=min(40*maxD, 0.18*line_length)
-            flag=False
+            length_threshold = min(40 * maxD, 0.18 * line_length)
+            flag = False
 
-        if(line_length<=length_threshold):
+        if line_length <= length_threshold:
             break
-
-
-        source_point=np.append(source_point,shortest_line,axis=0)
 
         skeleton_segments.append(shortest_line)
 
-        shortest_line=np.floor(shortest_line).astype(int)
+        # Mark path voxels as source
+        path_voxels = np.floor(shortest_line).astype(int)
+        valid_mask = np.all(
+            (path_voxels >= 0) & (path_voxels < np.array(Ax_work.shape)),
+            axis=1
+        )
+        path_voxels = path_voxels[valid_mask]
+        if len(path_voxels) > 0:
+            Ax_work[path_voxels[:, 0], path_voxels[:, 1], path_voxels[:, 2]] = 0
 
-        for i in shortest_line:
-            Ax[tuple(i)]=0
+        for pt in shortest_line:
+            source_points_list.append(pt)
 
-    if len(skeleton_segments)!=0:
-        final_skeleton=_organize_skeleton(skeleton_segments,length_threshold)
+    if len(skeleton_segments) != 0:
+        final_skeleton = _organize_skeleton(skeleton_segments, length_threshold)
     else:
-        final_skeleton=[]
+        final_skeleton = []
 
-    return final_skeleton
+    return final_skeleton, maxD
 
 
 # ===========================================================================
@@ -341,107 +323,185 @@ def _unit_tangent_vector(curve):
     return u_tang_vec
 
 
-# ===========================================================================
-# Plane rotation (from DeepACSON/CSD/plane_rotation.py)
-# ===========================================================================
-
-def _unit_normal_vector(vec1, vec2):
-    n = np.cross(vec1, vec2)
-    if np.array_equal(n, np.array([0, 0, 0])):
-        n = vec1
-    s = max(np.sqrt(np.dot(n,n)), 1e-5)
-    n = n/s
-    return n
-
-
-def _angle(vec1, vec2):
-    theta=np.arccos(np.dot(vec1,vec2) / (np.sqrt(np.dot(vec1,vec1)) * np.sqrt(np.dot(vec2, vec2))))
-    return theta
-
-
-def _rotation_matrix_3D(vector, theta):
-    """Euler-Rodrigues rotation matrix."""
-    a=np.cos(theta/2.0)
-    b,c,d=-vector*np.sin(theta/2.0)
-    aa,bb,cc,dd=a**2, b**2, c**2, d**2
-    bc,ad,ac,ab,bd,cd=b*c, a*d, a*c, a*b, b*d, c*d
-
-    rot_mat=np.array([[aa+bb-cc-dd, 2*(bc+ad), 2*(bd-ac)],
-                         [2*(bc-ad), aa+cc-bb-dd, 2*(cd+ab)],
-                         [2*(bd+ac), 2*(cd-ab), aa+dd-bb-cc]])
-    return rot_mat
-
-
-def _rotate_vector(vector, rot_mat):
-    rotated_vec = np.dot(vector,rot_mat)
-    return rotated_vec
-
 
 # ===========================================================================
-# Cross-section sampling (DeepACSON approach)
+# Cross-section sampling (fused Numba kernel)
 # ===========================================================================
 
-def precompute_grid(g_radius):
-    """Precompute the XY sampling grid and center mask (called once)."""
-    coords = np.arange(-g_radius, g_radius + 1)
+def precompute_grid(g_radius, g_res=0.25):
+    """Precompute the XY sampling grid (called once).
+
+    Args:
+        g_radius: Grid radius in voxels
+        g_res: Grid resolution in voxels (default 0.25, matching DeepACSON)
+
+    Returns:
+        base_grid: (N, 2) array of grid coordinates in voxel units
+        grid_size: Number of points per side
+    """
+    coords = np.arange(-g_radius, g_radius, g_res)
     x, y = np.meshgrid(coords, coords)
-    z = np.zeros_like(x)
-    xyz = np.array([np.ravel(x), np.ravel(y), np.ravel(z)]).T
-    cent_ball = (x**2 + y**2) < 1
-    grid_shape = x.shape
-    return xyz, cent_ball, grid_shape
+    base_grid = np.ascontiguousarray(
+        np.stack([x.ravel(), y.ravel()], axis=1), dtype=np.float64
+    )
+    grid_size = len(coords)
+    return base_grid, grid_size
 
 
-_Z_AXIS = np.array([0, 0, 1])
-_ZERO_VEC = np.array([0, 0, 0])
-
-
-def _sample_cross_section(binary, point, tangent_vec,
-                           xyz, cent_ball, grid_shape):
+@njit(cache=True, fastmath=True)
+def _sample_and_flood_fill(volume, base_grid, grid_size,
+                           point_0, point_1, point_2,
+                           tan_0, tan_1, tan_2):
     """
-    Sample a perpendicular cross-section using the DeepACSON approach.
+    Fused kernel: rotation + translation + trilinear interpolation + flood-fill.
 
-    Uses trilinear interpolation (map_coordinates), connected-component
-    labeling at center, and pixel counting for area measurement.
-
-    Returns equivalent radius in voxels, or None if invalid.
+    Single Numba function with no Python round-trips and no intermediate arrays.
+    Uses trilinear interpolation (matching DeepACSON) with threshold >= 0.5.
+    Rejects cross-sections spanning fewer than 4 pixels in either axis.
+    Returns cross-section area in pixels, or 0 if invalid.
     """
-    if np.array_equal(tangent_vec, _ZERO_VEC):
-        return None
+    n_grid = base_grid.shape[0]
+    sz0, sz1, sz2 = volume.shape
 
-    rot_axis = _unit_normal_vector(tangent_vec, _Z_AXIS)
-    theta = _angle(tangent_vec, _Z_AXIS)
-    rot_mat = _rotation_matrix_3D(rot_axis, theta)
-    rotated_plane = np.dot(xyz, rot_mat)
-    cross_section_plane = rotated_plane + point
+    # Compute rotation matrix (Euler-Rodrigues) from tangent to z-axis
+    dot_zt = tan_2
 
-    # Trilinear interpolation via map_coordinates (order=1 = trilinear)
-    cross_section = map_coordinates(binary, cross_section_plane.T,
-                                    order=1, mode='constant', cval=0.0)
-    bw_cross_section = cross_section >= 0.5
-    bw_cross_section = np.reshape(bw_cross_section, grid_shape)
+    if dot_zt > 0.9999:
+        r00 = 1.0; r01 = 0.0; r02 = 0.0
+        r10 = 0.0; r11 = 1.0; r12 = 0.0
+        r20 = 0.0; r21 = 0.0; r22 = 1.0
+    elif dot_zt < -0.9999:
+        r00 = 1.0; r01 = 0.0; r02 = 0.0
+        r10 = 0.0; r11 = 1.0; r12 = 0.0
+        r20 = 0.0; r21 = 0.0; r22 = -1.0
+    else:
+        rn = np.sqrt(tan_0 * tan_0 + tan_1 * tan_1)
+        rx = -tan_1 / rn
+        ry = tan_0 / rn
 
-    # Connected component at center
-    label_cross_section, nn = label(bw_cross_section, return_num=True)
-    main_lbl = np.unique(label_cross_section[cent_ball])
-    main_lbl = main_lbl[np.nonzero(main_lbl)]
+        clamped = max(-1.0, min(1.0, dot_zt))
+        theta = np.arccos(clamped)
 
-    if len(main_lbl) != 1:
-        return None
+        a = np.cos(theta * 0.5)
+        s = np.sin(theta * 0.5)
+        b = -rx * s
+        c = -ry * s
 
-    bw_cross_section = label_cross_section == main_lbl[0]
+        aa = a * a; bb = b * b; cc = c * c
+        bc = b * c; ac = a * c; ab = a * b
 
-    # Size check
-    nz_X = np.count_nonzero(np.sum(bw_cross_section, axis=0))
-    nz_Y = np.count_nonzero(np.sum(bw_cross_section, axis=1))
-    if nz_X < 4 or nz_Y < 4:
-        return None
+        r00 = aa + bb - cc;  r01 = 2.0 * bc;       r02 = -2.0 * ac
+        r10 = 2.0 * bc;      r11 = aa + cc - bb;    r12 = 2.0 * ab
+        r20 = 2.0 * ac;      r21 = -2.0 * ab;       r22 = aa - bb - cc
 
-    # Measure area as pixel count (1 pixel = 1 voxel² at grid resolution 1.0)
-    area_voxels = np.sum(bw_cross_section)
-    radius_voxels = np.sqrt(area_voxels / np.pi)
+    # Rotate grid, translate to skeleton point, trilinear interpolation
+    bw = np.zeros((grid_size, grid_size), dtype=np.uint8)
 
-    return radius_voxels
+    for i in range(n_grid):
+        gx = base_grid[i, 0]
+        gy = base_grid[i, 1]
+
+        sx = r00 * gx + r01 * gy + point_0
+        sy = r10 * gx + r11 * gy + point_1
+        sz = r20 * gx + r21 * gy + point_2
+
+        # Trilinear interpolation
+        ix0 = int(np.floor(sx))
+        iy0 = int(np.floor(sy))
+        iz0 = int(np.floor(sz))
+        ix1 = ix0 + 1
+        iy1 = iy0 + 1
+        iz1 = iz0 + 1
+
+        if ix0 >= 0 and ix1 < sz0 and iy0 >= 0 and iy1 < sz1 and iz0 >= 0 and iz1 < sz2:
+            fx = sx - ix0
+            fy = sy - iy0
+            fz = sz - iz0
+            fx1 = 1.0 - fx
+            fy1 = 1.0 - fy
+            fz1 = 1.0 - fz
+
+            val = (float(volume[ix0, iy0, iz0]) * fx1 * fy1 * fz1 +
+                   float(volume[ix1, iy0, iz0]) * fx  * fy1 * fz1 +
+                   float(volume[ix0, iy1, iz0]) * fx1 * fy  * fz1 +
+                   float(volume[ix0, iy0, iz1]) * fx1 * fy1 * fz  +
+                   float(volume[ix1, iy1, iz0]) * fx  * fy  * fz1 +
+                   float(volume[ix1, iy0, iz1]) * fx  * fy1 * fz  +
+                   float(volume[ix0, iy1, iz1]) * fx1 * fy  * fz  +
+                   float(volume[ix1, iy1, iz1]) * fx  * fy  * fz)
+
+            if val >= 0.5:
+                row = i // grid_size
+                col = i % grid_size
+                bw[row, col] = 1
+
+    # Flood-fill from center (4-connected)
+    center = grid_size // 2
+    if not bw[center, center]:
+        return 0
+
+    queue_r = np.empty(grid_size * grid_size, dtype=np.int32)
+    queue_c = np.empty(grid_size * grid_size, dtype=np.int32)
+    visited = np.zeros((grid_size, grid_size), dtype=np.uint8)
+
+    queue_r[0] = center
+    queue_c[0] = center
+    visited[center, center] = 1
+    head = 0
+    tail = 1
+    area = 0
+
+    while head < tail:
+        r = queue_r[head]
+        c_ = queue_c[head]
+        head += 1
+        area += 1
+
+        if r > 0 and not visited[r - 1, c_] and bw[r - 1, c_]:
+            visited[r - 1, c_] = 1
+            queue_r[tail] = r - 1
+            queue_c[tail] = c_
+            tail += 1
+        if r < grid_size - 1 and not visited[r + 1, c_] and bw[r + 1, c_]:
+            visited[r + 1, c_] = 1
+            queue_r[tail] = r + 1
+            queue_c[tail] = c_
+            tail += 1
+        if c_ > 0 and not visited[r, c_ - 1] and bw[r, c_ - 1]:
+            visited[r, c_ - 1] = 1
+            queue_r[tail] = r
+            queue_c[tail] = c_ - 1
+            tail += 1
+        if c_ < grid_size - 1 and not visited[r, c_ + 1] and bw[r, c_ + 1]:
+            visited[r, c_ + 1] = 1
+            queue_r[tail] = r
+            queue_c[tail] = c_ + 1
+            tail += 1
+
+    # Size filter: reject cross-sections spanning < 4 pixels in either axis
+    # (matches DeepACSON's nz_X/nz_Y filter)
+    min_r = grid_size
+    max_r = 0
+    min_c = grid_size
+    max_c = 0
+    for idx in range(tail):
+        rv = queue_r[idx]
+        cv = queue_c[idx]
+        if rv < min_r:
+            min_r = rv
+        if rv > max_r:
+            max_r = rv
+        if cv < min_c:
+            min_c = cv
+        if cv > max_c:
+            max_c = cv
+
+    extent_r = max_r - min_r + 1
+    extent_c = max_c - min_c + 1
+    if extent_r < 4 or extent_c < 4:
+        return 0
+
+    return area
 
 
 # ===========================================================================
@@ -498,11 +558,14 @@ def filter_radius_outliers(radii, window_size=5, threshold=3.0):
 
 def init_worker():
     """Initialize worker process — trigger Numba JIT compilation."""
-    # Warmup _pointmin and _euler_path with tiny arrays
+    # Warmup _pointmin, _euler_path, and _sample_and_flood_fill with tiny arrays
     D = np.ones((3, 3, 3))
     _pointmin(D)
     sp = np.array([[1.0, 1.0, 1.0]])
     _euler_path(D, D, D, sp, 0.1)
+    tiny_vol = np.ones((3, 3, 3), dtype=np.uint8)
+    tiny_grid = np.array([[0.0, 0.0]], dtype=np.float64)
+    _sample_and_flood_fill(tiny_vol, tiny_grid, 1, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0)
 
 
 def process_single_axon(args):
@@ -525,22 +588,23 @@ def process_single_axon(args):
         min_coords, max_coords = bbox
         vol_shape = np.array(_shared_volume.shape)
 
-        pad = _g_radius + 5
-        min_padded = np.maximum(min_coords - pad, 0)
-        max_padded = np.minimum(max_coords + pad, vol_shape)
+        # Tight crop for skeleton extraction (only needs axon voxels + small border)
+        skel_pad = 5
+        min_tight = np.maximum(min_coords - skel_pad, 0)
+        max_tight = np.minimum(max_coords + skel_pad, vol_shape)
 
-        subvol = _shared_volume[min_padded[0]:max_padded[0],
-                                min_padded[1]:max_padded[1],
-                                min_padded[2]:max_padded[2]]
-        binary = (subvol == axon_label).astype(np.float64)
+        subvol_tight = _shared_volume[min_tight[0]:max_tight[0],
+                                      min_tight[1]:max_tight[1],
+                                      min_tight[2]:max_tight[2]]
+        binary_tight = (subvol_tight == axon_label).astype(np.float64)
 
-        n_voxels = np.count_nonzero(binary)
+        n_voxels = np.count_nonzero(binary_tight)
         if n_voxels < 100:
             return None
 
-        # Skeleton extraction (FMM + Euler backtracking)
+        # Skeleton extraction (FMM + Euler backtracking) on tight crop
         try:
-            skel_segments = _extract_skeleton(binary)
+            skel_segments, maxD = _extract_skeleton(binary_tight)
         except Exception as e:
             logger.debug(f"Axon {axon_label}: skeleton extraction failed - {e}")
             return None
@@ -548,7 +612,24 @@ def process_single_axon(args):
         if len(skel_segments) == 0:
             return None
 
-        # binary volume is passed directly to map_coordinates (no RGI setup)
+        # Adaptive cross-section radius from skeleton's max inscribed radius.
+        # maxD is the max boundary distance in voxels; use it + margin for
+        # the sampling grid instead of the fixed global g_radius.
+        axon_g_radius = int(np.ceil(maxD)) + 5
+        axon_grid, axon_grid_size = precompute_grid(axon_g_radius, _g_res)
+
+        # Wide crop for cross-section sampling (needs axon_g_radius padding)
+        sampling_pad = axon_g_radius + 5
+        min_padded = np.maximum(min_coords - sampling_pad, 0)
+        max_padded = np.minimum(max_coords + sampling_pad, vol_shape)
+
+        subvol_wide = _shared_volume[min_padded[0]:max_padded[0],
+                                     min_padded[1]:max_padded[1],
+                                     min_padded[2]:max_padded[2]]
+        binary_u8 = (subvol_wide == axon_label).astype(np.uint8)
+
+        # Offset to map skeleton coords from tight crop to wide crop space
+        tight_to_wide_offset = min_tight - min_padded
 
         # Process each skeleton segment — sample cross-sections
         all_radii_um = []
@@ -566,22 +647,27 @@ def process_single_axon(args):
                 if len(skel_seg) < 3:
                     continue
 
+            # Map skeleton from tight crop to wide crop coordinates
+            skel_seg_wide = skel_seg + tight_to_wide_offset
+
             # Compute tangent vectors
-            tangent_vecs = _unit_tangent_vector(skel_seg)
+            tangent_vecs = _unit_tangent_vector(skel_seg_wide)
 
             radii = []
             skel_coords = []
 
-            for point, tangent in zip(skel_seg, tangent_vecs):
-                if np.array_equal(tangent, np.array([0, 0, 0])):
+            for point, tangent in zip(skel_seg_wide, tangent_vecs):
+                if tangent[0] == 0.0 and tangent[1] == 0.0 and tangent[2] == 0.0:
                     continue
 
-                radius_voxels = _sample_cross_section(
-                    binary, point, tangent,
-                    _grid_xyz, _grid_cent_ball, _grid_shape
+                area = _sample_and_flood_fill(
+                    binary_u8, axon_grid, axon_grid_size,
+                    point[0], point[1], point[2],
+                    tangent[0], tangent[1], tangent[2],
                 )
 
-                if radius_voxels is not None and radius_voxels > 0:
+                if area > 0:
+                    radius_voxels = np.sqrt(area * (_g_res ** 2) / np.pi)
                     radius_um = radius_voxels * _voxel_size_um
                     radii.append(radius_um)
                     global_coord = (point + min_padded) * _voxel_size_um
@@ -674,10 +760,10 @@ def compute_fiber_profiles(input_path: Path,
     """
     # Warmup Numba JIT
     logger.info("Warming up Numba JIT compilation...")
-    D_warmup = np.ones((3, 3, 3))
-    _pointmin(D_warmup)
-    sp_warmup = np.array([[1.0, 1.0, 1.0]])
-    _euler_path(D_warmup, D_warmup, D_warmup, sp_warmup, 0.1)
+    _compute_gradient_field(np.ones((3, 3, 3)))
+    tiny_vol = np.ones((3, 3, 3), dtype=np.uint8)
+    tiny_grid = np.array([[0.0, 0.0]], dtype=np.float64)
+    _sample_and_flood_fill(tiny_vol, tiny_grid, 1, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0)
 
     # Load volume
     suffix = input_path.suffix.lower()
@@ -717,21 +803,22 @@ def compute_fiber_profiles(input_path: Path,
     if n_jobs == -1:
         n_jobs = mp.cpu_count()
 
-    # Precompute sampling grid (1 pixel = 1 voxel)
-    xyz, cent_ball, grid_shape = precompute_grid(g_radius)
+    # Precompute sampling grid (g_res=0.25 voxels, matching DeepACSON)
+    g_res = 0.25
+    base_grid, grid_size = precompute_grid(g_radius, g_res)
 
     step_voxels = step_size_um / voxel_size if step_size_um is not None else None
 
     # Set globals for workers
     global _shared_volume, _shared_bboxes
-    global _grid_xyz, _grid_cent_ball, _grid_shape
-    global _g_radius, _step_voxels, _voxel_size_um
+    global _base_grid, _grid_size
+    global _g_radius, _g_res, _step_voxels, _voxel_size_um
     _shared_volume = volume
     _shared_bboxes = bboxes
-    _grid_xyz = xyz
-    _grid_cent_ball = cent_ball
-    _grid_shape = grid_shape
+    _base_grid = base_grid
+    _grid_size = grid_size
     _g_radius = g_radius
+    _g_res = g_res
     _step_voxels = step_voxels
     _voxel_size_um = voxel_size
 
