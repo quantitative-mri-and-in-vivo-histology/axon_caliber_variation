@@ -558,11 +558,8 @@ def filter_radius_outliers(radii, window_size=5, threshold=3.0):
 
 def init_worker():
     """Initialize worker process — trigger Numba JIT compilation."""
-    # Warmup _pointmin, _euler_path, and _sample_and_flood_fill with tiny arrays
     D = np.ones((3, 3, 3))
-    _pointmin(D)
-    sp = np.array([[1.0, 1.0, 1.0]])
-    _euler_path(D, D, D, sp, 0.1)
+    _compute_gradient_field(D)
     tiny_vol = np.ones((3, 3, 3), dtype=np.uint8)
     tiny_grid = np.array([[0.0, 0.0]], dtype=np.float64)
     _sample_and_flood_fill(tiny_vol, tiny_grid, 1, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0)
