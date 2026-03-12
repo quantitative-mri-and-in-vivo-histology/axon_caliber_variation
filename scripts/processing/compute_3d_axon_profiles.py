@@ -289,7 +289,8 @@ def compute_fiber_profiles(input_path: Path,
                            step_size_um: float = 0.05,
                            max_axons: int = 0,
                            anisotropy_mode: str = 'simple',
-                           backend: str = 'fast'):
+                           backend: str = 'fast',
+                           n_jobs: int = 1):
     """
     Compute morphometry profiles for all fibers in a labeled volume.
 
@@ -348,21 +349,42 @@ def compute_fiber_profiles(input_path: Path,
                 f"step={step_size_um} μm = {step_voxels:.1f} voxels "
                 f"(stride ~{max(1, round(step_voxels / 0.1))})")
 
-    # Process axons sequentially
+    # Process axons
     results = []
-    for axon_label in tqdm(axon_labels, desc=f"Processing axons ({backend})"):
-        if backend == 'original':
-            result = process_single_axon_original(
-                volume, axon_label, bboxes[axon_label],
-                voxel_size, g_radius, g_res, step_voxels
-            )
-        else:
-            result = process_single_axon_fast(
-                volume, axon_label, bboxes[axon_label],
-                voxel_size, g_radius, g_res, step_voxels
-            )
-        if result is not None:
-            results.append(result)
+    use_parallel = n_jobs != 1 and backend == 'fast'
+
+    if use_parallel:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import multiprocessing
+        workers = n_jobs if n_jobs > 0 else multiprocessing.cpu_count()
+        logger.info(f"Parallel processing with {workers} workers")
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    process_single_axon_fast, volume, lbl, bboxes[lbl],
+                    voxel_size, g_radius, g_res, step_voxels
+                ): lbl for lbl in axon_labels
+            }
+            for fut in tqdm(as_completed(futures), total=len(futures),
+                            desc=f"Processing axons ({backend}, {workers} cores)"):
+                result = fut.result()
+                if result is not None:
+                    results.append(result)
+    else:
+        for axon_label in tqdm(axon_labels, desc=f"Processing axons ({backend})"):
+            if backend == 'original':
+                result = process_single_axon_original(
+                    volume, axon_label, bboxes[axon_label],
+                    voxel_size, g_radius, g_res, step_voxels
+                )
+            else:
+                result = process_single_axon_fast(
+                    volume, axon_label, bboxes[axon_label],
+                    voxel_size, g_radius, g_res, step_voxels
+                )
+            if result is not None:
+                results.append(result)
 
     logger.info(f"Successfully processed {len(results)}/{len(axon_labels)} axons")
 
@@ -424,6 +446,7 @@ def batch_compute_fiber_profiles(
     anisotropy_mode: str,
     backend: str,
     output_suffix: str = '_axon_profiles',
+    n_jobs: int = 1,
 ):
     """Batch process multiple .zarr/.mat files matched by glob pattern."""
     if len(matched_files) == 1:
@@ -463,6 +486,7 @@ def batch_compute_fiber_profiles(
                 max_axons=max_axons,
                 anisotropy_mode=anisotropy_mode,
                 backend=backend,
+                n_jobs=n_jobs,
             )
             successful.append(input_file.name)
         except Exception as e:
@@ -516,6 +540,8 @@ if __name__ == '__main__':
     parser.add_argument('--anisotropy-mode', type=str, default='simple',
                         choices=['simple', 'none'],
                         help="'simple' resamples to isotropic, 'none' uses geometric mean")
+    parser.add_argument('--n-jobs', type=int, default=1,
+                        help='Number of parallel workers (default: 1, -1 = all cores, fast backend only)')
     parser.add_argument('--output-suffix', type=str, default='_axon_profiles',
                         help='Suffix to append to output filenames in batch mode')
 
@@ -546,6 +572,7 @@ if __name__ == '__main__':
             max_axons=args.max_axons,
             anisotropy_mode=args.anisotropy_mode,
             backend=args.backend,
+            n_jobs=args.n_jobs,
         )
     else:
         matched_paths = [Path(f) for f in matched_files]
@@ -561,4 +588,5 @@ if __name__ == '__main__':
             anisotropy_mode=args.anisotropy_mode,
             backend=args.backend,
             output_suffix=args.output_suffix,
+            n_jobs=args.n_jobs,
         )
