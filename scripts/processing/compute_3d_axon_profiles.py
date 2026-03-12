@@ -49,9 +49,13 @@ from axonometry import (
     load_volume_with_metadata,
     resample_to_isotropic,
 )
-from axonometry.axon_profiles import (
-    axon_radius_profile,
-    axon_radius_profile_fast,
+from axonometry.axon_profiles import axon_radius_profile
+from axonometry.deepacson_fast import (
+    skeleton as fast_skeleton,
+    sample_cross_section as fast_sample_cross_section,
+    find_g_radius as fast_find_g_radius,
+    unit_tangent_vector as fast_unit_tangent_vector,
+    get_line_length as fast_get_line_length,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -107,13 +111,9 @@ def compute_bounding_boxes(volume: np.ndarray) -> dict:
 # Per-axon processing
 # ===========================================================================
 
-def process_single_axon(volume, axon_label, bbox, voxel_size_um,
-                        g_radius, g_res, step_voxels, backend):
-    """
-    Process a single axon: crop, extract profile, convert to μm.
-
-    Returns dict with results or None if failed.
-    """
+def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
+                                 g_radius, g_res, step_voxels):
+    """Process a single axon using verbatim DeepACSON backend."""
     try:
         min_coords, max_coords = bbox
         vol_shape = np.array(volume.shape)
@@ -127,37 +127,150 @@ def process_single_axon(volume, axon_label, bbox, voxel_size_um,
                         min_padded[2]:max_padded[2]]
         binary = (subvol == axon_label).astype(np.float64)
 
-        n_voxels = np.count_nonzero(binary)
-        if n_voxels < 100:
+        if np.count_nonzero(binary) < 100:
             return None
 
-        # Call the appropriate backend
-        if backend == 'original':
-            result = axon_radius_profile(
-                binary, g_radius, g_res=g_res, step_voxels=step_voxels
-            )
-        else:
-            result = axon_radius_profile_fast(
-                binary, g_radius, g_res=g_res, step_voxels=step_voxels
-            )
-
+        result = axon_radius_profile(
+            binary, g_radius, g_res=g_res, step_voxels=step_voxels
+        )
         if result is None:
             return None
 
-        # Convert from voxels to μm
         radii_um = result['radii_voxels'] * voxel_size_um
-        skel_um = (result['skeleton_points'] + min_padded) * voxel_size_um
-        length_um = result['length_voxels'] * voxel_size_um
-
         return {
             'label': axon_label,
             'radii_um': radii_um,
-            'skeleton_um': skel_um,
+            'skeleton_um': (result['skeleton_points'] + min_padded) * voxel_size_um,
             'n_points': len(radii_um),
             'n_segments': result['n_segments'],
             'mean_radius_um': np.mean(radii_um),
             'std_radius_um': np.std(radii_um),
-            'length_um': length_um,
+            'length_um': result['length_voxels'] * voxel_size_um,
+        }
+
+    except Exception as e:
+        logger.debug(f"Axon {axon_label}: failed - {e}")
+        return None
+
+
+def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
+                             g_radius, g_res, step_voxels):
+    """Process a single axon using optimized DeepACSON backend.
+
+    # --- MODIFIED ---
+    # Reason: Two-crop approach + adaptive per-point grid sizing.
+    #   (1) Tight crop (bbox + 5) for skeleton extraction — FMM and gradient
+    #       field run on a small subvolume, which is the main speedup.
+    #   (2) Wide crop (bbox + g_radius + 5) for cross-section sampling.
+    #   (3) Per-point adaptive g_radius via find_g_radius(): starts at
+    #       ceil(maxD) + 5, doubles until the cross-section border is clear.
+    #       Avoids the fixed 800×800 grid for every point.
+    #   Skeleton coordinates are offset from tight-crop to wide-crop space.
+    #   The skeleton itself is identical on both crops (background has speed=0,
+    #   so FMM cannot propagate through it).
+    # Original: single wide crop (bbox + g_radius + 5) for both skeleton and
+    #           cross-sections, with fixed g_radius for all points.
+    # ---
+    """
+    try:
+        min_coords, max_coords = bbox
+        vol_shape = np.array(volume.shape)
+
+        # --- Pass 1: tight crop for skeleton extraction (fast FMM) ---
+        tight_pad = 5
+        min_tight = np.maximum(min_coords - tight_pad, 0)
+        max_tight = np.minimum(max_coords + tight_pad, vol_shape)
+
+        tight_subvol = volume[min_tight[0]:max_tight[0],
+                              min_tight[1]:max_tight[1],
+                              min_tight[2]:max_tight[2]]
+        tight_binary = (tight_subvol == axon_label).astype(np.float64)
+
+        if np.count_nonzero(tight_binary) < 100:
+            return None
+
+        skel_segments, maxD = fast_skeleton(tight_binary, verbose=False)
+        if len(skel_segments) == 0:
+            return None
+
+        # Initial per-point g_radius from FMM inscribed radius
+        g_radius_init = int(np.ceil(maxD)) + 5
+
+        # --- Pass 2: wide crop for cross-section sampling ---
+        wide_pad = g_radius + 5
+        min_wide = np.maximum(min_coords - wide_pad, 0)
+        max_wide = np.minimum(max_coords + wide_pad, vol_shape)
+
+        wide_subvol = volume[min_wide[0]:max_wide[0],
+                             min_wide[1]:max_wide[1],
+                             min_wide[2]:max_wide[2]]
+        wide_binary = (wide_subvol == axon_label).astype(np.float64)
+
+        # Offset skeleton coordinates from tight-crop to wide-crop space
+        skel_offset = min_tight - min_wide
+
+        all_radii = []
+        all_skel_points = []
+        main_length = 0.0
+
+        for skel_seg in skel_segments:
+            if len(skel_seg) < 3:
+                continue
+
+            if step_voxels is not None:
+                stride = max(1, round(step_voxels / 0.1))
+                skel_seg = skel_seg[::stride]
+                if len(skel_seg) < 3:
+                    continue
+
+            tangent_vecs = fast_unit_tangent_vector(skel_seg)
+
+            radii = []
+            skel_points = []
+
+            for pt, tangent in zip(skel_seg, tangent_vecs):
+                pt_wide = pt + skel_offset
+                # Find adequate grid size for this point
+                g_r = fast_find_g_radius(
+                    wide_binary, pt_wide, tangent, g_radius_init, g_radius
+                )
+                area_pixels = fast_sample_cross_section(
+                    wide_binary, pt_wide, tangent, g_r, g_res
+                )
+
+                if area_pixels > 0:
+                    area_voxels = area_pixels * (g_res ** 2)
+                    radius_voxels = np.sqrt(area_voxels / np.pi)
+                    radii.append(radius_voxels)
+                    skel_points.append(pt.copy())
+
+            if len(radii) < 2:
+                continue
+
+            seg_length = fast_get_line_length(skel_seg)
+            if seg_length > main_length:
+                main_length = seg_length
+
+            all_radii.extend(radii)
+            all_skel_points.extend(skel_points)
+
+        if len(all_radii) < 2:
+            return None
+
+        radii_voxels = np.array(all_radii)
+        radii_um = radii_voxels * voxel_size_um
+        # Skeleton points are in tight-crop space; convert to global
+        skel_points_global = np.array(all_skel_points) + min_tight
+        return {
+            'label': axon_label,
+            'radii_um': radii_um,
+            'skeleton_um': skel_points_global * voxel_size_um,
+            'n_points': len(radii_um),
+            'n_segments': len(skel_segments),
+            'mean_radius_um': np.mean(radii_um),
+            'std_radius_um': np.std(radii_um),
+            'length_um': main_length * voxel_size_um,
+            'maxD_voxels': float(maxD),
         }
 
     except Exception as e:
@@ -238,10 +351,16 @@ def compute_fiber_profiles(input_path: Path,
     # Process axons sequentially
     results = []
     for axon_label in tqdm(axon_labels, desc=f"Processing axons ({backend})"):
-        result = process_single_axon(
-            volume, axon_label, bboxes[axon_label],
-            voxel_size, g_radius, g_res, step_voxels, backend
-        )
+        if backend == 'original':
+            result = process_single_axon_original(
+                volume, axon_label, bboxes[axon_label],
+                voxel_size, g_radius, g_res, step_voxels
+            )
+        else:
+            result = process_single_axon_fast(
+                volume, axon_label, bboxes[axon_label],
+                voxel_size, g_radius, g_res, step_voxels
+            )
         if result is not None:
             results.append(result)
 

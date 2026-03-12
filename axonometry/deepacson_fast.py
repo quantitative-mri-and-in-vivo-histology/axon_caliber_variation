@@ -41,6 +41,8 @@ import numpy as np
 import skfmm
 import sys
 from scipy.interpolate import RegularGridInterpolator as rgi
+from scipy.ndimage import map_coordinates
+from numba import njit
 from skimage.measure import label, regionprops
 
 
@@ -133,36 +135,64 @@ def discrete_shortest_path(D,start_point):
     return path
 
 
-def pointmin(D):
+# --- MODIFIED ---
+# Reason: Runtime optimization — numba JIT compilation of pointmin.
+#   Same 26-neighbor min-propagation algorithm, compiled to native code
+#   to remove Python loop and indexing overhead.
+# Original:
+#   def pointmin(D):
+#       sz = D.shape
+#       max_D = np.max(D)
+#       Fx = np.zeros(sz)
+#       Fy = np.zeros(sz)
+#       Fz = np.zeros(sz)
+#       J = max_D * np.ones(np.array(sz)+2)
+#       J[1:-1,1:-1,1:-1] = D
+#       x = [0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1]
+#       y = [0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1]
+#       z = [1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0]
+#       for i in range(26):
+#           In = J[1+x[i]:1+sz[0]+x[i], 1+y[i]:1+sz[1]+y[i], 1+z[i]:1+sz[2]+z[i]]
+#           check = In<D
+#           D[check] = In[check]
+#           den = (x[i]**2 + y[i]**2 + z[i]**2)**0.5
+#           Fx[check]= x[i]/den
+#           Fy[check]= y[i]/den
+#           Fz[check]= z[i]/den
+#       return Fx, Fy, Fz
+# ---
+@njit(cache=True)
+def _pointmin_jit(D, J, Fx, Fy, Fz):
+    """Numba-compiled inner loop for pointmin."""
+    x = np.array([0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1])
+    y = np.array([0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1])
+    z = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0])
+    s0, s1, s2 = D.shape
+    for i in range(26):
+        den = (x[i]**2 + y[i]**2 + z[i]**2)**0.5
+        nx = x[i] / den
+        ny = y[i] / den
+        nz = z[i] / den
+        for a in range(s0):
+            for b in range(s1):
+                for c in range(s2):
+                    val = J[1+a+x[i], 1+b+y[i], 1+c+z[i]]
+                    if val < D[a, b, c]:
+                        D[a, b, c] = val
+                        Fx[a, b, c] = nx
+                        Fy[a, b, c] = ny
+                        Fz[a, b, c] = nz
+    return Fx, Fy, Fz
 
+def pointmin(D):
     sz = D.shape
     max_D = np.max(D)
     Fx = np.zeros(sz)
     Fy = np.zeros(sz)
     Fz = np.zeros(sz)
-
-    J = max_D * np.ones(np.array(sz)+2)
+    J = max_D * np.ones((sz[0]+2, sz[1]+2, sz[2]+2))
     J[1:-1,1:-1,1:-1] = D
-
-    x = [0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1]
-    y = [0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1]
-    z = [1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0]
-
-    #x = [1,-1, 0, 0, 0, 0]
-    #y = [0, 0, 1,-1, 0, 0]
-    #z = [0, 0, 0, 0, 1,-1]
-
-    for i in range(26):
-        In = J[1+x[i]:1+sz[0]+x[i], 1+y[i]:1+sz[1]+y[i], 1+z[i]:1+sz[2]+z[i]]
-        check = In<D
-        D[check] = In[check]
-
-        den = (x[i]**2 + y[i]**2 + z[i]**2)**0.5
-
-        Fx[check]= x[i]/den
-        Fy[check]= y[i]/den
-        Fz[check]= z[i]/den
-    return Fx, Fy, Fz
+    return _pointmin_jit(D, J, Fx, Fy, Fz)
 
 
 def Euler_path(Fx,Fy,Fz,start_point,step_size):
@@ -311,7 +341,12 @@ def organize_skeleton(skel_seg,length_th):
     return final_skeleton
 
 
-def skeleton(Ax):
+# --- MODIFIED ---
+# Reason: (1) Add verbose parameter to control print output.
+#         (2) Return maxD (max inscribed radius) for adaptive grid sizing.
+# Original: def skeleton(Ax): ... print(line_length) ... return final_skeleton
+# ---
+def skeleton(Ax, verbose=True):
 
     boundary_dist=skfmm.distance(Ax)
 
@@ -338,7 +373,8 @@ def skeleton(Ax):
         #shortest_line = discrete_shortest_path(D,end_point)
 
         line_length=get_line_length(shortest_line)
-        print(line_length)
+        if verbose:                                    # MODIFIED: was unconditional print
+            print(line_length)
 
         if flag:
             length_threshold=min(40*maxD, 0.18*line_length)
@@ -362,7 +398,7 @@ def skeleton(Ax):
     else:
         final_skeleton=[]
 
-    return final_skeleton
+    return final_skeleton, maxD                        # MODIFIED: was return final_skeleton
 
 if __name__ == "__main__":
     skeleton(sys.argv[1])
@@ -415,10 +451,19 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
     rotated_plane = np.squeeze(rotate_vector(xyz, rot_mat))
     cross_section_plane = rotated_plane+point
 
-    # Trilinear interpolation — verbatim
-    interpolating_func = rgi((range(sz[0]),range(sz[1]),range(sz[2])),
-                                binary_vol,bounds_error=False,fill_value=0)
-    cross_section = interpolating_func(cross_section_plane)
+    # --- MODIFIED ---
+    # Reason: Runtime optimization — replace RegularGridInterpolator with
+    #   scipy.ndimage.map_coordinates for trilinear interpolation. Same
+    #   bilinear (order=1) interpolation, but avoids object construction
+    #   and coordinate-lookup overhead of RGI.
+    # Original:
+    #   interpolating_func = rgi((range(sz[0]),range(sz[1]),range(sz[2])),
+    #                               binary_vol,bounds_error=False,fill_value=0)
+    #   cross_section = interpolating_func(cross_section_plane)
+    # ---
+    coords = cross_section_plane.T  # (3, N) for map_coordinates
+    cross_section = map_coordinates(binary_vol, coords, order=1,
+                                    mode='constant', cval=0.0)
     bw_cross_section = cross_section>=0.5
     bw_cross_section = np.reshape(bw_cross_section, x.shape)
 
@@ -444,3 +489,67 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
         return 0
 
     return props[0].area
+
+
+# --- MODIFIED ---
+# Reason: Adaptive per-point grid sizing for runtime optimization.
+#   Instead of a fixed large g_radius for all cross-sections, start small
+#   and grow only when the cross-section touches the grid border.
+#   Uses cheap nearest-neighbor sampling of border pixels only.
+# Original: not present (DeepACSON uses a fixed g_radius for all points).
+# ---
+def find_g_radius(binary_vol, point, tangent_vec, g_radius_init, max_g_radius):
+    """Find minimum g_radius where cross-section doesn't touch grid border.
+
+    Samples the border of the rotated sampling plane using nearest-neighbor
+    interpolation (cheap). If any border voxel is foreground, doubles g_radius
+    and retries. Returns the first g_radius with a clear border.
+
+    Args:
+        binary_vol: 3D binary volume (float64, 1=inside axon)
+        point: (3,) skeleton point coordinates in volume space
+        tangent_vec: (3,) unit tangent vector at this point
+        g_radius_init: starting grid radius in voxels
+        max_g_radius: upper bound on grid radius
+
+    Returns:
+        g_radius: adequate grid radius (capped at max_g_radius)
+    """
+    if np.array_equal(tangent_vec, np.array([0, 0, 0])):
+        return g_radius_init
+
+    sz = np.array(binary_vol.shape)
+
+    rot_axis = unit_normal_vector(tangent_vec, np.array([0, 0, 1]))
+    theta = angle(tangent_vec, np.array([0, 0, 1]))
+    rot_mat = rotation_matrix_3D(rot_axis, theta)
+
+    g_radius = g_radius_init
+    while g_radius < max_g_radius:
+        # Border points at 1-voxel spacing (cheap)
+        edge = np.arange(-g_radius, g_radius + 1, 1.0)
+        n = len(edge)
+        # Four edges of the square
+        top = np.column_stack([edge, np.full(n, -g_radius), np.zeros(n)])
+        bot = np.column_stack([edge, np.full(n, g_radius), np.zeros(n)])
+        left = np.column_stack([np.full(n - 2, -g_radius), edge[1:-1], np.zeros(n - 2)])
+        right = np.column_stack([np.full(n - 2, g_radius), edge[1:-1], np.zeros(n - 2)])
+        border_local = np.vstack([top, bot, left, right])
+
+        # Rotate to world space
+        border_world = rotate_vector(border_local, rot_mat) + point
+
+        # Nearest-neighbor lookup
+        idx = np.floor(border_world).astype(int)
+        valid = np.all((idx >= 0) & (idx < sz), axis=1)
+        if not valid.any():
+            break  # all out of bounds → background
+
+        idx_v = idx[valid]
+        values = binary_vol[idx_v[:, 0], idx_v[:, 1], idx_v[:, 2]]
+        if not np.any(values >= 0.5):
+            break  # border is clear
+
+        g_radius *= 2
+
+    return min(g_radius, max_g_radius)

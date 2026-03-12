@@ -107,9 +107,7 @@ def axon_radius_profile_fast(binary_vol, g_radius, g_res=0.25, step_voxels=None,
     """
     Extract radius profile using optimized DeepACSON code.
 
-    Same algorithm as axon_radius_profile() but using deepacson_fast, which
-    will gain performance improvements over time (njit kernels, adaptive
-    grid radius, two-crop approach, etc.).
+    Same algorithm as axon_radius_profile() but using deepacson_fast.
 
     Args:
         binary_vol: 3D binary volume (1=axon, 0=background), float64
@@ -122,11 +120,7 @@ def axon_radius_profile_fast(binary_vol, g_radius, g_res=0.25, step_voxels=None,
         dict with 'radii_voxels', 'skeleton_points', 'n_segments',
         'length_voxels', 'maxD', or None if extraction failed
     """
-    if verbose:
-        skel_segments = fast_skeleton(binary_vol)
-    else:
-        with contextlib.redirect_stdout(io.StringIO()):
-            skel_segments = fast_skeleton(binary_vol)
+    skel_segments, maxD = fast_skeleton(binary_vol, verbose=verbose)
 
     if len(skel_segments) == 0:
         return None
@@ -179,4 +173,5 @@ def axon_radius_profile_fast(binary_vol, g_radius, g_res=0.25, step_voxels=None,
         'skeleton_points': np.array(all_skel_points),
         'n_segments': len(skel_segments),
         'length_voxels': main_length,
+        'maxD': float(maxD),
     }
