@@ -8,21 +8,6 @@ Includes utilities for:
 - Effective radius computation
 """
 
-from .skeleton import (
-    extract_skeleton,
-    skeleton,  # backwards compatibility alias
-    warmup as skeleton_warmup,
-    get_line_length,
-)
-
-from .geometry import (
-    unit_tangent_vector,
-    rotation_matrix_3d,
-    compute_arc_length,
-    resample_curve_by_arc_length,
-    create_perpendicular_plane_grid,
-)
-
 from .io import (
     load_mat_volume,
     load_json_metadata,
@@ -30,14 +15,6 @@ from .io import (
     parse_voxel_size,
     resample_to_isotropic,
     construct_output_path,
-)
-
-from .sampling import (
-    sample_perpendicular_cross_section,
-    area_to_equivalent_radius,
-    validate_skeleton_points,
-    find_longest_contiguous_segment,
-    nearest_interp_3d,
 )
 
 from .populations import (
@@ -71,17 +48,6 @@ from .plotting import (
 __version__ = "0.1.0"
 
 __all__ = [
-    # Skeleton
-    "extract_skeleton",
-    "skeleton",
-    "skeleton_warmup",
-    "get_line_length",
-    # Geometry
-    "unit_tangent_vector",
-    "rotation_matrix_3d",
-    "compute_arc_length",
-    "resample_curve_by_arc_length",
-    "create_perpendicular_plane_grid",
     # I/O
     "load_mat_volume",
     "load_json_metadata",
@@ -89,12 +55,6 @@ __all__ = [
     "parse_voxel_size",
     "resample_to_isotropic",
     "construct_output_path",
-    # Sampling
-    "sample_perpendicular_cross_section",
-    "area_to_equivalent_radius",
-    "validate_skeleton_points",
-    "find_longest_contiguous_segment",
-    "nearest_interp_3d",
     # Populations
     "load_volume_downsampled",
     "precompute_axon_voxels",
