@@ -571,9 +571,19 @@ def skeleton(Ax, verbose=True):
     source_point=np.unravel_index(np.argmax(boundary_dist), boundary_dist.shape)
     maxD=boundary_dist[source_point]
 
-    speed_im=(boundary_dist/maxD)**1.5
+    # --- MODIFIED ---
+    # Reason: Memory optimization — compute speed_im in-place on boundary_dist
+    #   (not needed after this) and reuse Ax buffer instead of allocating new array.
+    #   Saves 3 full-crop temporary arrays per call (~4.5 GB for large axons).
+    # Original:
+    #   speed_im=(boundary_dist/maxD)**1.5
+    #   Ax=np.ones(Ax.shape)
+    # ---
+    boundary_dist /= maxD
+    np.power(boundary_dist, 1.5, out=boundary_dist)
+    speed_im = boundary_dist
 
-    Ax=np.ones(Ax.shape)
+    Ax[:] = 1.0
     Ax[source_point]=0
 
     flag=True
@@ -720,7 +730,9 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
     #   cross_section = interpolating_func(cross_section_plane)
     # ---
     coords = cross_section_plane.T  # (3, N) for map_coordinates
-    cross_section = map_coordinates(binary_vol, coords, order=1,
+    # map_coordinates needs float for order=1 interpolation; convert if bool
+    vol = binary_vol if binary_vol.dtype != bool else binary_vol.view(np.uint8)
+    cross_section = map_coordinates(vol, coords, order=1,
                                     mode='constant', cval=0.0)
     bw_cross_section = cross_section>=0.5
     bw_cross_section = np.reshape(bw_cross_section, grid_shape)

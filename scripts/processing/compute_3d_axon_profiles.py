@@ -30,7 +30,6 @@ import argparse
 import glob
 import logging
 import multiprocessing
-from multiprocessing import shared_memory
 import os
 import traceback
 from pathlib import Path
@@ -65,17 +64,18 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# Shared memory helpers for parallel processing
+# Fork-inherited globals for parallel processing
 # ===========================================================================
 
-# Module-level references set before fork — workers inherit the pointer,
-# but the data lives in /dev/shm (not process heap), so no COW copies.
+# Module-level references set before Pool fork — workers inherit read-only
+# access via copy-on-write. Workers only slice into the volume (no writes),
+# so COW pages are not materialized for the volume data.
 _shared_volume = None
 _shared_bboxes = None
 
 
 def _worker_process_axon(args):
-    """Worker function that reads volume from shared memory global."""
+    """Worker function that reads volume from fork-inherited global."""
     axon_label, voxel_size_um, g_radius, g_res, step_voxels = args
     return process_single_axon_fast(
         _shared_volume, axon_label, _shared_bboxes[axon_label],
@@ -205,12 +205,13 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
         tight_subvol = volume[min_tight[0]:max_tight[0],
                               min_tight[1]:max_tight[1],
                               min_tight[2]:max_tight[2]]
-        tight_binary = (tight_subvol == axon_label).astype(np.float64)
+        tight_binary = (tight_subvol == axon_label)
 
         if np.count_nonzero(tight_binary) < 100:
             return None
 
         skel_segments, maxD = fast_skeleton(tight_binary, verbose=False)
+        del tight_binary  # free before allocating wide crop
         if len(skel_segments) == 0:
             return None
 
@@ -218,14 +219,16 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
         g_radius_init = int(np.ceil(maxD)) + 5
 
         # --- Pass 2: wide crop for cross-section sampling ---
-        wide_pad = g_radius + 5
+        # Pad by actual inscribed radius (not global max), capped at g_radius.
+        # find_g_radius can grow up to g_radius, but most axons are much smaller.
+        wide_pad = min(g_radius_init * 2, g_radius) + 5
         min_wide = np.maximum(min_coords - wide_pad, 0)
         max_wide = np.minimum(max_coords + wide_pad, vol_shape)
 
         wide_subvol = volume[min_wide[0]:max_wide[0],
                              min_wide[1]:max_wide[1],
                              min_wide[2]:max_wide[2]]
-        wide_binary = (wide_subvol == axon_label).astype(np.float64)
+        wide_binary = (wide_subvol == axon_label)
 
         # Offset skeleton coordinates from tight-crop to wide-crop space
         skel_offset = min_tight - min_wide
@@ -377,7 +380,7 @@ def compute_fiber_profiles(input_path: Path,
     if use_parallel:
         global _shared_volume, _shared_bboxes
         workers = n_jobs if n_jobs > 0 else multiprocessing.cpu_count()
-        logger.info(f"Parallel processing with {workers} workers (shared memory)")
+        logger.info(f"Parallel processing with {workers} workers")
 
         # JIT warmup before fork — compile Numba functions in parent so
         # workers inherit compiled code via COW instead of each recompiling.
@@ -390,16 +393,8 @@ def compute_fiber_profiles(input_path: Path,
             pass
         logger.info("JIT warmup done")
 
-        # Place volume in /dev/shm so forked workers read from shared memory,
-        # not COW copies of the process heap (avoids refcount-triggered copies).
-        shm = shared_memory.SharedMemory(create=True, size=volume.nbytes)
-        shm_array = np.ndarray(volume.shape, dtype=volume.dtype, buffer=shm.buf)
-        np.copyto(shm_array, volume)
-        del volume  # free the heap copy
-        import gc; gc.collect()
-
-        # Set globals before fork — workers inherit the numpy view into /dev/shm
-        _shared_volume = shm_array
+        # Set globals before fork — workers inherit read-only access via COW
+        _shared_volume = volume
         _shared_bboxes = bboxes
 
         work_items = [
@@ -418,8 +413,6 @@ def compute_fiber_profiles(input_path: Path,
         finally:
             _shared_volume = None
             _shared_bboxes = None
-            shm.close()
-            shm.unlink()
     else:
         for axon_label in tqdm(axon_labels, desc=f"Processing axons ({backend})"):
             if backend == 'original':
