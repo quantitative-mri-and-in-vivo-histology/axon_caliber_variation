@@ -146,25 +146,36 @@ def discrete_shortest_path(D,start_point):
 # ---
 @njit(cache=True)
 def _pointmin_jit(D, J, Fx, Fy, Fz):
-    """Numba-compiled 26-neighbor min-propagation."""
+    """Numba-compiled 26-neighbor min-propagation (tiled).
+
+    Process the volume in blocks that fit in L3 cache.  For each block,
+    run all 26 direction passes before moving to the next block.  The
+    innermost c-loop stays full-length for vectorization.
+    """
     x = np.array([0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1])
     y = np.array([0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1])
     z = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0])
     s0, s1, s2 = D.shape
-    for i in range(26):
-        In = J[1+x[i]:1+s0+x[i], 1+y[i]:1+s1+y[i], 1+z[i]:1+s2+z[i]]
-        den = (x[i]**2 + y[i]**2 + z[i]**2)**0.5
-        nx = x[i] / den
-        ny = y[i] / den
-        nz = z[i] / den
-        for a in range(s0):
-            for b in range(s1):
-                for c in range(s2):
-                    if In[a, b, c] < D[a, b, c]:
-                        D[a, b, c] = In[a, b, c]
-                        Fx[a, b, c] = nx
-                        Fy[a, b, c] = ny
-                        Fz[a, b, c] = nz
+    block_a = 8
+    block_b = 16
+    for ba in range(0, s0, block_a):
+        ba_end = min(ba + block_a, s0)
+        for bb in range(0, s1, block_b):
+            bb_end = min(bb + block_b, s1)
+            for i in range(26):
+                In = J[1+x[i]:1+s0+x[i], 1+y[i]:1+s1+y[i], 1+z[i]:1+s2+z[i]]
+                den = (x[i]**2 + y[i]**2 + z[i]**2)**0.5
+                nx = x[i] / den
+                ny = y[i] / den
+                nz = z[i] / den
+                for a in range(ba, ba_end):
+                    for b in range(bb, bb_end):
+                        for c in range(s2):
+                            if In[a, b, c] < D[a, b, c]:
+                                D[a, b, c] = In[a, b, c]
+                                Fx[a, b, c] = nx
+                                Fy[a, b, c] = ny
+                                Fz[a, b, c] = nz
     return Fx, Fy, Fz
 
 def pointmin(D):
