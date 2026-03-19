@@ -336,7 +336,8 @@ def euler_shortest_path(D, source_point, start_point, step_size):
 
     sz = D.shape
     max_D = np.max(D)
-    J = max_D * np.ones((sz[0]+2, sz[1]+2, sz[2]+2))
+    J = np.empty((sz[0]+2, sz[1]+2, sz[2]+2))
+    J[:, :, :] = max_D
     J[1:-1,1:-1,1:-1] = D
 
     # Flatten start_point from (1,3) to (3,)
@@ -596,7 +597,7 @@ def skeleton(Ax, verbose=True):
         # ---
         D_ma=skfmm.travel_time(Ax,speed_im)
         mask = np.ma.getmask(D_ma)
-        D = np.ma.getdata(D_ma).copy()
+        D = np.ma.getdata(D_ma)
         end_point=np.unravel_index(np.argmax(D), D.shape)
         max_dist=D[end_point]
         if mask is not np.ma.nomask:
