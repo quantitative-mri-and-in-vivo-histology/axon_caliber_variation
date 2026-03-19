@@ -657,6 +657,27 @@ if __name__ == "__main__":
 # which is the part relevant to radius profiling.
 # ===================================================================
 
+# --- MODIFIED ---
+# Reason: Runtime optimization — cache the sampling grid and center mask.
+#   The grid (mgrid + ravel) and center ball mask are identical for every call
+#   with the same g_radius/g_res. Precomputing avoids ~10k redundant grid
+#   constructions (mgrid, zeros_like, ravel, stack).
+# Original: grid was built inside sample_cross_section on every call.
+# ---
+_grid_cache = {}
+
+def _get_grid(g_radius, g_res):
+    """Return cached (xyz, cent_ball, grid_shape) for given g_radius/g_res."""
+    key = (g_radius, g_res)
+    if key not in _grid_cache:
+        x, y = np.mgrid[-g_radius:g_radius:g_res, -g_radius:g_radius:g_res]
+        z = np.zeros_like(x)
+        xyz = np.array([np.ravel(x), np.ravel(y), np.ravel(z)]).T
+        cent_ball = (x**2 + y**2) < g_res * 1
+        _grid_cache[key] = (xyz, cent_ball, x.shape)
+    return _grid_cache[key]
+
+
 def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
     """
     Sample a perpendicular cross-section and measure its area.
@@ -676,14 +697,7 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
         area_pixels: number of pixels in the central connected component,
                      or 0 if invalid (no center hit, multiple labels, too small)
     """
-    sz = binary_vol.shape
-
-    # Build sampling plane grid — verbatim from shape_decomposition.py
-    x, y = np.mgrid[-g_radius:g_radius:g_res, -g_radius:g_radius:g_res]
-    z = np.zeros_like(x)
-    xyz = np.array([np.ravel(x), np.ravel(y), np.ravel(z)]).T
-
-    cent_ball = (x**2+y**2)<g_res*1
+    xyz, cent_ball, grid_shape = _get_grid(g_radius, g_res)
 
     # Rotate plane to be perpendicular to tangent — verbatim
     if np.array_equal(tangent_vec, np.array([0, 0, 0])):
@@ -709,7 +723,7 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
     cross_section = map_coordinates(binary_vol, coords, order=1,
                                     mode='constant', cval=0.0)
     bw_cross_section = cross_section>=0.5
-    bw_cross_section = np.reshape(bw_cross_section, x.shape)
+    bw_cross_section = np.reshape(bw_cross_section, grid_shape)
 
     # Connected component at center — verbatim
     label_cross_section, nn = label(bw_cross_section, return_num=True)
@@ -727,12 +741,18 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
     if (nz_X<4) or (nz_Y<4):
         return 0
 
-    # Area via regionprops — verbatim
-    props = regionprops(bw_cross_section.astype(np.int32))
-    if len(props) == 0:
-        return 0
-
-    return props[0].area
+    # --- MODIFIED ---
+    # Reason: Runtime optimization — replace regionprops with count_nonzero.
+    #   regionprops creates labeled images, calls find_objects, and builds
+    #   property objects just to return .area (pixel count). count_nonzero
+    #   does the same thing directly.
+    # Original:
+    #   props = regionprops(bw_cross_section.astype(np.int32))
+    #   if len(props) == 0:
+    #       return 0
+    #   return props[0].area
+    # ---
+    return np.count_nonzero(bw_cross_section)
 
 
 # --- MODIFIED ---
