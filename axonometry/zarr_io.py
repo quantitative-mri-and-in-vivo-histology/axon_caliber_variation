@@ -41,6 +41,31 @@ import zarr
 logger = logging.getLogger(__name__)
 
 
+def load_zarr_volume(zarr_path: Union[str, Path]) -> Tuple[np.ndarray, float]:
+    """Load level-0 volume and isotropic voxel size from an OME-Zarr store.
+
+    Args:
+        zarr_path: Path to .zarr directory
+
+    Returns:
+        (volume, voxel_size_um) where volume is the full-resolution array
+        and voxel_size_um is the Z voxel size in micrometers.
+    """
+    store = zarr.open_group(str(zarr_path), mode="r")
+    volume = np.asarray(store["0"])
+
+    multiscales = store.attrs["multiscales"]
+    scale = multiscales[0]["datasets"][0]["coordinateTransformations"][0]["scale"]
+    voxel_size_z = scale[0]
+
+    if not np.allclose(scale, scale[0]):
+        logger.warning(
+            f"Zarr voxel size is not isotropic: {scale}. Using Z voxel size ({voxel_size_z})."
+        )
+
+    return volume, float(voxel_size_z)
+
+
 def downsample_nearest(volume: np.ndarray, factor: int = 2) -> np.ndarray:
     """
     Downsample a 3D volume by striding (nearest-neighbor).

@@ -2,8 +2,8 @@
 Axon radius profiling via skeleton extraction and cross-section sampling.
 
 Two variants:
-- axon_radius_profile(): uses verbatim DeepACSON code (axonometry.deepacson)
-- axon_radius_profile_fast(): uses optimized version (axonometry.deepacson_fast)
+- axon_radius_profile(): uses verbatim DeepACSON code (axonometry.deepacson.original)
+- axon_radius_profile_fast(): uses optimized version (axonometry.deepacson.fast)
 """
 
 import contextlib
@@ -11,14 +11,14 @@ import io
 
 import numpy as np
 
-from .deepacson import (
+from .deepacson.original import (
     skeleton as deepacson_skeleton,
     sample_cross_section as deepacson_sample_cross_section,
     unit_tangent_vector as deepacson_unit_tangent_vector,
     get_line_length as deepacson_get_line_length,
 )
 
-from .deepacson_fast import (
+from .deepacson.fast import (
     skeleton as fast_skeleton,
     sample_cross_section as fast_sample_cross_section,
     unit_tangent_vector as fast_unit_tangent_vector,

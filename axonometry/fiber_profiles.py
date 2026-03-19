@@ -1,0 +1,387 @@
+"""Per-axon morphometry profiling: skeleton extraction + cross-section sampling.
+
+Orchestrates the DeepACSON CSD pipeline on a labeled 3D volume:
+1. Compute bounding boxes for all labels
+2. For each axon: crop, skeletonize (FMM), sample perpendicular cross-sections
+3. Collect radius profiles and summary statistics
+
+Two backends:
+- 'fast' (default): optimized DeepACSON (axonometry.deepacson.fast)
+- 'original': verbatim DeepACSON (axonometry.deepacson.original via axon_profiles)
+"""
+
+import logging
+import multiprocessing
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from scipy.ndimage import find_objects
+from tqdm import tqdm
+
+from .axon_profiles import axon_radius_profile
+from .deepacson.fast import (
+    skeleton as fast_skeleton,
+    sample_cross_section as fast_sample_cross_section,
+    find_g_radius as fast_find_g_radius,
+    unit_tangent_vector as fast_unit_tangent_vector,
+    get_line_length as fast_get_line_length,
+)
+from .zarr_io import load_zarr_volume
+
+logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# Fork-inherited globals for parallel processing
+# ===========================================================================
+
+# Module-level references set before Pool fork — workers inherit read-only
+# access via copy-on-write. Workers only slice into the volume (no writes),
+# so COW pages are not materialized for the volume data.
+_shared_volume = None
+_shared_bboxes = None
+
+
+def _worker_process_axon(args):
+    """Worker function that reads volume from fork-inherited global."""
+    axon_label, voxel_size_um, g_radius, g_res, step_voxels = args
+    return process_single_axon_fast(
+        _shared_volume, axon_label, _shared_bboxes[axon_label],
+        voxel_size_um, g_radius, g_res, step_voxels
+    )
+
+
+# ===========================================================================
+# Bounding boxes
+# ===========================================================================
+
+def compute_bounding_boxes(volume: np.ndarray) -> dict:
+    """Compute bounding boxes for all labels via find_objects (single pass)."""
+    logger.info("Computing bounding boxes...")
+    slices = find_objects(volume)
+
+    bboxes = {}
+    for label_idx, bbox_slices in enumerate(slices):
+        if bbox_slices is None:
+            continue
+        lbl = label_idx + 1
+        min_coords = np.array([s.start for s in bbox_slices])
+        max_coords = np.array([s.stop for s in bbox_slices])
+        bboxes[lbl] = (min_coords, max_coords)
+
+    logger.info(f"Computed bounding boxes for {len(bboxes)} labels")
+    return bboxes
+
+
+# ===========================================================================
+# Per-axon processing
+# ===========================================================================
+
+def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
+                                 g_radius, g_res, step_voxels):
+    """Process a single axon using verbatim DeepACSON backend."""
+    try:
+        min_coords, max_coords = bbox
+        vol_shape = np.array(volume.shape)
+
+        pad = g_radius + 5
+        min_padded = np.maximum(min_coords - pad, 0)
+        max_padded = np.minimum(max_coords + pad, vol_shape)
+
+        subvol = volume[min_padded[0]:max_padded[0],
+                        min_padded[1]:max_padded[1],
+                        min_padded[2]:max_padded[2]]
+        binary = (subvol == axon_label).astype(np.float64)
+
+        if np.count_nonzero(binary) < 100:
+            return None
+
+        result = axon_radius_profile(
+            binary, g_radius, g_res=g_res, step_voxels=step_voxels
+        )
+        if result is None:
+            return None
+
+        radii_um = result['radii_voxels'] * voxel_size_um
+        return {
+            'label': axon_label,
+            'radii_um': radii_um,
+            'skeleton_um': (result['skeleton_points'] + min_padded) * voxel_size_um,
+            'n_points': len(radii_um),
+            'n_segments': result['n_segments'],
+            'mean_radius_um': np.mean(radii_um),
+            'std_radius_um': np.std(radii_um),
+            'length_um': result['length_voxels'] * voxel_size_um,
+        }
+
+    except Exception as e:
+        logger.debug(f"Axon {axon_label}: failed - {e}")
+        return None
+
+
+def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
+                             g_radius, g_res, step_voxels):
+    """Process a single axon using optimized DeepACSON backend.
+
+    Two-crop approach + adaptive per-point grid sizing:
+    (1) Tight crop (bbox + 5) for skeleton extraction — FMM runs on a
+        small subvolume for speed and memory.
+    (2) Wide crop (bbox + adapted radius) for cross-section sampling.
+    (3) Per-point adaptive g_radius via find_g_radius(): starts at
+        ceil(maxD) + 5, doubles until the cross-section border is clear.
+    """
+    try:
+        min_coords, max_coords = bbox
+        vol_shape = np.array(volume.shape)
+
+        # --- Pass 1: tight crop for skeleton extraction (fast FMM) ---
+        tight_pad = 5
+        min_tight = np.maximum(min_coords - tight_pad, 0)
+        max_tight = np.minimum(max_coords + tight_pad, vol_shape)
+
+        tight_subvol = volume[min_tight[0]:max_tight[0],
+                              min_tight[1]:max_tight[1],
+                              min_tight[2]:max_tight[2]]
+        tight_binary = (tight_subvol == axon_label)
+
+        if np.count_nonzero(tight_binary) < 100:
+            return None
+
+        skel_segments, maxD = fast_skeleton(tight_binary, verbose=False)
+        del tight_binary  # free before allocating wide crop
+        if len(skel_segments) == 0:
+            return None
+
+        # Initial per-point g_radius from FMM inscribed radius
+        g_radius_init = int(np.ceil(maxD)) + 5
+
+        # --- Pass 2: wide crop for cross-section sampling ---
+        # Pad by actual inscribed radius (not global max), capped at g_radius.
+        wide_pad = min(g_radius_init * 2, g_radius) + 5
+        min_wide = np.maximum(min_coords - wide_pad, 0)
+        max_wide = np.minimum(max_coords + wide_pad, vol_shape)
+
+        wide_subvol = volume[min_wide[0]:max_wide[0],
+                             min_wide[1]:max_wide[1],
+                             min_wide[2]:max_wide[2]]
+        wide_binary = (wide_subvol == axon_label)
+
+        # Offset skeleton coordinates from tight-crop to wide-crop space
+        skel_offset = min_tight - min_wide
+
+        all_radii = []
+        all_skel_points = []
+        main_length = 0.0
+
+        for skel_seg in skel_segments:
+            if len(skel_seg) < 3:
+                continue
+
+            if step_voxels is not None:
+                stride = max(1, round(step_voxels / 0.1))
+                skel_seg = skel_seg[::stride]
+                if len(skel_seg) < 3:
+                    continue
+
+            tangent_vecs = fast_unit_tangent_vector(skel_seg)
+
+            radii = []
+            skel_points = []
+
+            for pt, tangent in zip(skel_seg, tangent_vecs):
+                pt_wide = pt + skel_offset
+                g_r = fast_find_g_radius(
+                    wide_binary, pt_wide, tangent, g_radius_init, g_radius
+                )
+                area_pixels = fast_sample_cross_section(
+                    wide_binary, pt_wide, tangent, g_r, g_res
+                )
+
+                if area_pixels > 0:
+                    area_voxels = area_pixels * (g_res ** 2)
+                    radius_voxels = np.sqrt(area_voxels / np.pi)
+                    radii.append(radius_voxels)
+                    skel_points.append(pt.copy())
+
+            if len(radii) < 2:
+                continue
+
+            seg_length = fast_get_line_length(skel_seg)
+            if seg_length > main_length:
+                main_length = seg_length
+
+            all_radii.extend(radii)
+            all_skel_points.extend(skel_points)
+
+        if len(all_radii) < 2:
+            return None
+
+        radii_voxels = np.array(all_radii)
+        radii_um = radii_voxels * voxel_size_um
+        skel_points_global = np.array(all_skel_points) + min_tight
+        return {
+            'label': axon_label,
+            'radii_um': radii_um,
+            'skeleton_um': skel_points_global * voxel_size_um,
+            'n_points': len(radii_um),
+            'n_segments': len(skel_segments),
+            'mean_radius_um': np.mean(radii_um),
+            'std_radius_um': np.std(radii_um),
+            'length_um': main_length * voxel_size_um,
+            'maxD_voxels': float(maxD),
+        }
+
+    except Exception as e:
+        logger.debug(f"Axon {axon_label}: failed - {e}")
+        return None
+
+
+# ===========================================================================
+# Main orchestration
+# ===========================================================================
+
+def compute_fiber_profiles(input_path: Path,
+                           output_file: Path,
+                           max_radius_um: float = 5.0,
+                           step_size_um: float = 0.05,
+                           max_axons: int = 0,
+                           backend: str = 'fast',
+                           n_jobs: int = 1):
+    """
+    Compute morphometry profiles for all fibers in a labeled volume.
+
+    Args:
+        input_path: Path to .zarr directory with labeled axons
+        output_file: Path to save results (.npz)
+        max_radius_um: Maximum expected axon radius in micrometers (sets grid size)
+        step_size_um: Step size along skeleton in micrometers
+        max_axons: Maximum number of axons to process (0 = all)
+        backend: 'fast' (optimized) or 'original' (verbatim DeepACSON)
+        n_jobs: Number of parallel workers (1 = serial, -1 = all cores)
+    """
+    # Load volume
+    logger.info(f"Loading Zarr volume: {input_path.name}")
+    volume, voxel_size = load_zarr_volume(input_path)
+
+    # Convert max_radius from μm to voxels for grid sizing
+    g_radius = int(np.ceil(max_radius_um / voxel_size))
+    g_res = 0.25
+
+    logger.info(f"Volume shape: {volume.shape}, voxel: {voxel_size:.4f} μm")
+    logger.info(f"Backend: {backend}")
+    logger.info(f"Max axon radius: {max_radius_um:.1f} μm = {g_radius} voxels")
+
+    # Compute bounding boxes
+    bboxes = compute_bounding_boxes(volume)
+    axon_labels = sorted(bboxes.keys())
+
+    logger.info(f"Found {len(axon_labels)} axons")
+
+    if max_axons > 0:
+        axon_labels = axon_labels[:max_axons]
+        logger.info(f"Processing first {max_axons} axons")
+
+    step_voxels = step_size_um / voxel_size if step_size_um is not None else None
+
+    logger.info(f"Parameters: g_radius={g_radius} voxels, g_res={g_res}, "
+                f"step={step_size_um} μm = {step_voxels:.1f} voxels "
+                f"(stride ~{max(1, round(step_voxels / 0.1))})")
+
+    # Process axons
+    results = []
+    use_parallel = n_jobs != 1 and backend == 'fast'
+
+    if use_parallel:
+        global _shared_volume, _shared_bboxes
+        workers = n_jobs if n_jobs > 0 else multiprocessing.cpu_count()
+        logger.info(f"Parallel processing with {workers} workers")
+
+        # JIT warmup before fork
+        logger.info("Warming up Numba JIT (before fork)...")
+        _dummy = np.zeros((20, 20, 20), dtype=np.float64)
+        _dummy[5:15, 5:15, 5:15] = 1.0
+        try:
+            fast_skeleton(_dummy, verbose=False)
+        except Exception:
+            pass
+        logger.info("JIT warmup done")
+
+        _shared_volume = volume
+        _shared_bboxes = bboxes
+
+        work_items = [
+            (lbl, voxel_size, g_radius, g_res, step_voxels)
+            for lbl in axon_labels
+        ]
+        try:
+            with multiprocessing.Pool(processes=workers) as pool:
+                for result in tqdm(
+                    pool.imap_unordered(_worker_process_axon, work_items),
+                    total=len(work_items),
+                    desc=f"Processing axons ({backend}, {workers} cores)",
+                ):
+                    if result is not None:
+                        results.append(result)
+        finally:
+            _shared_volume = None
+            _shared_bboxes = None
+    else:
+        process_fn = (process_single_axon_fast if backend == 'fast'
+                      else process_single_axon_original)
+        for axon_label in tqdm(axon_labels, desc=f"Processing axons ({backend})"):
+            result = process_fn(
+                volume, axon_label, bboxes[axon_label],
+                voxel_size, g_radius, g_res, step_voxels
+            )
+            if result is not None:
+                results.append(result)
+
+    logger.info(f"Successfully processed {len(results)}/{len(axon_labels)} axons")
+
+    if len(results) == 0:
+        logger.error("No axons were successfully processed!")
+        return
+
+    # Save results
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    labels = np.array([r['label'] for r in results])
+    n_points = np.array([r['n_points'] for r in results])
+    mean_radii = np.array([r['mean_radius_um'] for r in results])
+    std_radii = np.array([r['std_radius_um'] for r in results])
+    lengths = np.array([r['length_um'] for r in results])
+    radii_profiles = np.array([r['radii_um'] for r in results], dtype=object)
+    skeleton_coords = np.array([r['skeleton_um'] for r in results], dtype=object)
+
+    all_radii = np.concatenate([r['radii_um'] for r in results])
+
+    np.savez(
+        output_file,
+        labels=labels,
+        n_points=n_points,
+        mean_radii_um=mean_radii,
+        std_radii_um=std_radii,
+        lengths_um=lengths,
+        radii_profiles_um=radii_profiles,
+        skeleton_coords_um=skeleton_coords,
+        all_radii_um=all_radii,
+        voxel_size_um=voxel_size,
+        max_radius_um=max_radius_um,
+        g_radius_voxels=g_radius,
+        step_size_um=step_size_um,
+        source_file=str(input_path),
+        method=f'deepacson_csd_{backend}',
+    )
+
+    logger.info(f"Saved results to {output_file}")
+
+    # Summary statistics
+    r_eff = (np.mean(all_radii**6) / np.mean(all_radii**2)) ** 0.25
+    logger.info("\nSummary Statistics:")
+    logger.info(f"  Total axons processed: {len(results)}")
+    logger.info(f"  Total radius samples: {len(all_radii)}")
+    logger.info(f"  Mean axon length: {np.mean(lengths):.2f} ± {np.std(lengths):.2f} μm")
+    logger.info(f"  Mean points per axon: {np.mean(n_points):.1f}")
+    logger.info(f"  r̄: {np.mean(all_radii):.4f} μm")
+    logger.info(f"  r_eff: {r_eff:.4f} μm")
