@@ -29,6 +29,8 @@ Usage:
 import argparse
 import glob
 import logging
+import multiprocessing
+from multiprocessing import shared_memory
 import os
 import traceback
 from pathlib import Path
@@ -60,6 +62,25 @@ from axonometry.deepacson_fast import (
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# Shared memory helpers for parallel processing
+# ===========================================================================
+
+# Module-level references set before fork — workers inherit the pointer,
+# but the data lives in /dev/shm (not process heap), so no COW copies.
+_shared_volume = None
+_shared_bboxes = None
+
+
+def _worker_process_axon(args):
+    """Worker function that reads volume from shared memory global."""
+    axon_label, voxel_size_um, g_radius, g_res, step_voxels = args
+    return process_single_axon_fast(
+        _shared_volume, axon_label, _shared_bboxes[axon_label],
+        voxel_size_um, g_radius, g_res, step_voxels
+    )
 
 
 # ===========================================================================
@@ -354,23 +375,51 @@ def compute_fiber_profiles(input_path: Path,
     use_parallel = n_jobs != 1 and backend == 'fast'
 
     if use_parallel:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        import multiprocessing
+        global _shared_volume, _shared_bboxes
         workers = n_jobs if n_jobs > 0 else multiprocessing.cpu_count()
-        logger.info(f"Parallel processing with {workers} workers")
+        logger.info(f"Parallel processing with {workers} workers (shared memory)")
 
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    process_single_axon_fast, volume, lbl, bboxes[lbl],
-                    voxel_size, g_radius, g_res, step_voxels
-                ): lbl for lbl in axon_labels
-            }
-            for fut in tqdm(as_completed(futures), total=len(futures),
-                            desc=f"Processing axons ({backend}, {workers} cores)"):
-                result = fut.result()
-                if result is not None:
-                    results.append(result)
+        # JIT warmup before fork — compile Numba functions in parent so
+        # workers inherit compiled code via COW instead of each recompiling.
+        logger.info("Warming up Numba JIT (before fork)...")
+        _dummy = np.zeros((20, 20, 20), dtype=np.float64)
+        _dummy[5:15, 5:15, 5:15] = 1.0
+        try:
+            fast_skeleton(_dummy, verbose=False)
+        except Exception:
+            pass
+        logger.info("JIT warmup done")
+
+        # Place volume in /dev/shm so forked workers read from shared memory,
+        # not COW copies of the process heap (avoids refcount-triggered copies).
+        shm = shared_memory.SharedMemory(create=True, size=volume.nbytes)
+        shm_array = np.ndarray(volume.shape, dtype=volume.dtype, buffer=shm.buf)
+        np.copyto(shm_array, volume)
+        del volume  # free the heap copy
+        import gc; gc.collect()
+
+        # Set globals before fork — workers inherit the numpy view into /dev/shm
+        _shared_volume = shm_array
+        _shared_bboxes = bboxes
+
+        work_items = [
+            (lbl, voxel_size, g_radius, g_res, step_voxels)
+            for lbl in axon_labels
+        ]
+        try:
+            with multiprocessing.Pool(processes=workers) as pool:
+                for result in tqdm(
+                    pool.imap_unordered(_worker_process_axon, work_items),
+                    total=len(work_items),
+                    desc=f"Processing axons ({backend}, {workers} cores)",
+                ):
+                    if result is not None:
+                        results.append(result)
+        finally:
+            _shared_volume = None
+            _shared_bboxes = None
+            shm.close()
+            shm.unlink()
     else:
         for axon_label in tqdm(axon_labels, desc=f"Processing axons ({backend})"):
             if backend == 'original':
