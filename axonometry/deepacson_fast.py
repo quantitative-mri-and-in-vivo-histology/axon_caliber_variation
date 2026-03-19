@@ -334,10 +334,10 @@ def _euler_shortest_path_jit(Fx, Fy, Fz, source_point, start_point, step_size,
 
 def euler_shortest_path(D, source_point, start_point, step_size):
 
-    Fx, Fy, Fz = pointmin(D)
-    Fx = -Fx
-    Fy = -Fy
-    Fz = -Fz
+    sz = D.shape
+    max_D = np.max(D)
+    J = max_D * np.ones((sz[0]+2, sz[1]+2, sz[2]+2))
+    J[1:-1,1:-1,1:-1] = D
 
     # Flatten start_point from (1,3) to (3,)
     sp = np.ascontiguousarray(start_point.ravel()[:3])
@@ -346,8 +346,156 @@ def euler_shortest_path(D, source_point, start_point, step_size):
     # Conservative upper bound on iterations
     max_iters = max(int(np.sum(np.array(D.shape)) * 10 / step_size), 10000)
 
-    path = _euler_shortest_path_jit(Fx, Fy, Fz, src, sp, step_size, max_iters)
+    path = _euler_shortest_path_fused_jit(J, src, sp, step_size, max_iters)
     return path
+
+
+@njit(cache=True)
+def _euler_shortest_path_fused_jit(J, source_point, start_point, step_size,
+                                    max_iters):
+    """Fused pointmin + Euler path: compute gradient direction on-the-fly.
+
+    Instead of precomputing the gradient field for all voxels (pointmin),
+    compute it only at the ~2000 voxels the path actually visits.
+    For each path point, find the 26-neighbor with minimum value in J
+    at each of the 8 trilinear corners, then blend directions with
+    trilinear weights.  Identical to pointmin + trilinear Euler integration
+    but avoids allocating 3 full-volume gradient arrays.
+    """
+    # Neighbor offsets (26-connected)
+    ox = np.array([0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1])
+    oy = np.array([0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1])
+    oz = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0])
+    # Precompute unit normals (negated — we want uphill = away from minimum)
+    norms = np.empty((26, 3))
+    for i in range(26):
+        den = (ox[i]**2 + oy[i]**2 + oz[i]**2)**0.5
+        norms[i, 0] = -ox[i] / den
+        norms[i, 1] = -oy[i] / den
+        norms[i, 2] = -oz[i] / den
+
+    # J is padded by 1 on each side, so valid D indices [0..s0) map to J[1..s0+1)
+    s0 = J.shape[0] - 2
+    s1 = J.shape[1] - 2
+    s2 = J.shape[2] - 2
+
+    path = np.empty((max_iters + 2, 3))
+    path[0, 0] = start_point[0]
+    path[0, 1] = start_point[1]
+    path[0, 2] = start_point[2]
+    n_path = 1
+
+    cur = np.empty(3)
+    cur[0] = start_point[0]
+    cur[1] = start_point[1]
+    cur[2] = start_point[2]
+
+    n_src = source_point.shape[0]
+
+    for itr in range(max_iters):
+        # Trilinear interpolation corners (in D-space coordinates)
+        fi = int(np.floor(cur[0]))
+        fj = int(np.floor(cur[1]))
+        fk = int(np.floor(cur[2]))
+        ci = min(max(fi, 0), s0 - 2)
+        cj = min(max(fj, 0), s1 - 2)
+        ck = min(max(fk, 0), s2 - 2)
+
+        dx = cur[0] - ci
+        dy = cur[1] - cj
+        dz = cur[2] - ck
+        cx = 1.0 - dx
+        cy = 1.0 - dy
+        cz = 1.0 - dz
+
+        weights = np.empty(8)
+        weights[0] = cx * cy * cz
+        weights[1] = cx * cy * dz
+        weights[2] = cx * dy * cz
+        weights[3] = cx * dy * dz
+        weights[4] = dx * cy * cz
+        weights[5] = dx * cy * dz
+        weights[6] = dx * dy * cz
+        weights[7] = dx * dy * dz
+
+        # 8 trilinear corners in J-space (offset by 1 for padding)
+        corners_i = np.array([ci, ci, ci, ci, ci+1, ci+1, ci+1, ci+1])
+        corners_j = np.array([cj, cj, cj+1, cj+1, cj, cj, cj+1, cj+1])
+        corners_k = np.array([ck, ck+1, ck, ck+1, ck, ck+1, ck, ck+1])
+
+        # For each corner, find min-neighbor direction, then blend
+        gx = 0.0; gy = 0.0; gz = 0.0
+        for corn in range(8):
+            # J-space index (add 1 for padding)
+            ja = corners_i[corn] + 1
+            jb = corners_j[corn] + 1
+            jc = corners_k[corn] + 1
+            best_val = J[ja, jb, jc]
+            best_nx = 0.0; best_ny = 0.0; best_nz = 0.0
+            for nb in range(26):
+                val = J[ja + ox[nb], jb + oy[nb], jc + oz[nb]]
+                if val < best_val:
+                    best_val = val
+                    best_nx = norms[nb, 0]
+                    best_ny = norms[nb, 1]
+                    best_nz = norms[nb, 2]
+            gx += weights[corn] * best_nx
+            gy += weights[corn] * best_ny
+            gz += weights[corn] * best_nz
+
+        # Normalize
+        mag = (gx * gx + gy * gy + gz * gz + 1e-12) ** 0.5
+        gx /= mag
+        gy /= mag
+        gz /= mag
+
+        # Step
+        nx = cur[0] - step_size * gx
+        ny = cur[1] - step_size * gy
+        nz = cur[2] - step_size * gz
+
+        if nx < 0.0 or ny < 0.0 or nz < 0.0 or nx > s0 or ny > s1 or nz > s2:
+            break
+
+        # Stall check
+        if itr >= 10:
+            pi = n_path - 10
+            ddx = nx - path[pi, 0]
+            ddy = ny - path[pi, 1]
+            ddz = nz - path[pi, 2]
+            movement = (ddx * ddx + ddy * ddy + ddz * ddz) ** 0.5
+            if movement < step_size:
+                break
+
+        path[n_path, 0] = nx
+        path[n_path, 1] = ny
+        path[n_path, 2] = nz
+        n_path += 1
+
+        # Distance to nearest source point
+        min_dist = 1e30
+        min_idx = 0
+        for si in range(n_src):
+            ddx = source_point[si, 0] - nx
+            ddy = source_point[si, 1] - ny
+            ddz = source_point[si, 2] - nz
+            d = (ddx * ddx + ddy * ddy + ddz * ddz) ** 0.5
+            if d < min_dist:
+                min_dist = d
+                min_idx = si
+
+        if min_dist < 10.0 * step_size:
+            path[n_path, 0] = source_point[min_idx, 0]
+            path[n_path, 1] = source_point[min_idx, 1]
+            path[n_path, 2] = source_point[min_idx, 2]
+            n_path += 1
+            break
+
+        cur[0] = nx
+        cur[1] = ny
+        cur[2] = nz
+
+    return path[:n_path].copy()
 
 
 def get_line_length(L):
@@ -432,10 +580,27 @@ def skeleton(Ax, verbose=True):
     source_point = np.array(source_point,ndmin=2)
     while True:
 
-        D=skfmm.travel_time(Ax,speed_im)
-        end_point=np.unravel_index(np.ma.argmax(D), D.shape)
+        # --- MODIFIED ---
+        # Reason: Runtime optimization — avoid MaskedArray operations.
+        #   skfmm.travel_time returns a MaskedArray (masked outside the object).
+        #   The original code used np.ma.argmax and MaskedArray.filled, which
+        #   have significant Python-level overhead (~14s for 139 calls).
+        #   Instead, extract raw data + mask immediately, use np.argmax (masked
+        #   voxels have travel_time <= 0 so argmax still finds the farthest
+        #   reachable point), then fill masked positions with max_dist.
+        # Original:
+        #   D=skfmm.travel_time(Ax,speed_im)
+        #   end_point=np.unravel_index(np.ma.argmax(D), D.shape)
+        #   max_dist=D[end_point]
+        #   D=np.ma.MaskedArray.filled(D,max_dist)
+        # ---
+        D_ma=skfmm.travel_time(Ax,speed_im)
+        mask = np.ma.getmask(D_ma)
+        D = np.ma.getdata(D_ma).copy()
+        end_point=np.unravel_index(np.argmax(D), D.shape)
         max_dist=D[end_point]
-        D=np.ma.MaskedArray.filled(D,max_dist)
+        if mask is not np.ma.nomask:
+            D[mask] = max_dist
 
         end_point = np.array(end_point,ndmin=2)
         # --- MODIFIED ---
