@@ -9,8 +9,8 @@ Two backends available:
 - 'fast' (default): optimized version (axonometry.deepacson_fast)
 - 'original': verbatim DeepACSON code (axonometry.deepacson)
 
-Supports both OME-Zarr volumes (canonical format from preparation pipeline)
-and legacy .mat files.
+Expects OME-Zarr volumes (canonical format from preparation pipeline)
+with isotropic voxels and Z axis = along-axon direction.
 
 Usage:
   # Single Zarr volume
@@ -33,7 +33,7 @@ import multiprocessing
 import os
 import traceback
 from pathlib import Path
-from typing import Tuple, Union, Optional, List
+from typing import Tuple, Optional, List
 
 import numpy as np
 from scipy.ndimage import find_objects
@@ -46,11 +46,6 @@ while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
 
-from axonometry import (
-    load_volume_with_metadata,
-    resample_to_isotropic,
-)
-from axonometry.axon_profiles import axon_radius_profile
 from axonometry.deepacson_fast import (
     skeleton as fast_skeleton,
     sample_cross_section as fast_sample_cross_section,
@@ -308,46 +303,25 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
 
 def compute_fiber_profiles(input_path: Path,
                            output_file: Path,
-                           voxel_size_um: Optional[Union[float, Tuple[float, float, float]]] = None,
                            max_radius_um: float = 5.0,
                            step_size_um: float = 0.05,
                            max_axons: int = 0,
-                           anisotropy_mode: str = 'simple',
                            backend: str = 'fast',
                            n_jobs: int = 1):
     """
     Compute morphometry profiles for all fibers in a labeled volume.
 
     Args:
-        input_path: Path to .zarr directory or .mat file with labeled axons
+        input_path: Path to .zarr directory with labeled axons
         output_file: Path to save results (.npz)
-        voxel_size_um: Voxel size in micrometers (scalar or (vz, vy, vx) tuple).
-                       If None, auto-detected from Zarr metadata or companion JSON.
         max_radius_um: Maximum expected axon radius in micrometers (sets grid size)
         step_size_um: Step size along skeleton in micrometers
         max_axons: Maximum number of axons to process (0 = all)
-        anisotropy_mode: 'simple' (resample to isotropic) or 'none' (use geometric mean)
         backend: 'fast' (optimized) or 'original' (verbatim DeepACSON)
     """
     # Load volume
-    suffix = input_path.suffix.lower()
-    if suffix == ".zarr" or input_path.is_dir():
-        logger.info(f"Loading Zarr volume: {input_path.name}")
-        volume, iso_voxel_size = load_zarr_volume(input_path)
-        voxel_size_tuple = (iso_voxel_size, iso_voxel_size, iso_voxel_size)
-    elif suffix == ".mat":
-        logger.info(f"Loading .mat volume: {input_path.name}")
-        volume, voxel_size_tuple, _ = load_volume_with_metadata(input_path, voxel_size_um)
-        if anisotropy_mode == 'simple':
-            volume, iso_voxel_size = resample_to_isotropic(volume, voxel_size_tuple)
-            voxel_size_tuple = (iso_voxel_size, iso_voxel_size, iso_voxel_size)
-        elif anisotropy_mode != 'none':
-            raise ValueError(f"Unknown anisotropy_mode: {anisotropy_mode}")
-    else:
-        raise ValueError(f"Unsupported input format: {suffix}. Use .zarr or .mat")
-
-    vz, vy, vx = voxel_size_tuple
-    voxel_size = (vz * vy * vx) ** (1/3)
+    logger.info(f"Loading Zarr volume: {input_path.name}")
+    volume, voxel_size = load_zarr_volume(input_path)
 
     # Convert max_radius from μm to voxels for grid sizing
     g_radius = int(np.ceil(max_radius_um / voxel_size))
@@ -481,16 +455,14 @@ def compute_fiber_profiles(input_path: Path,
 def batch_compute_fiber_profiles(
     matched_files: List[Path],
     output_root: Path,
-    voxel_size_um: Optional[Union[float, Tuple[float, float, float]]],
     max_radius_um: float,
     step_size_um: float,
     max_axons: int,
-    anisotropy_mode: str,
     backend: str,
     output_suffix: str = '_axon_profiles',
     n_jobs: int = 1,
 ):
-    """Batch process multiple .zarr/.mat files matched by glob pattern."""
+    """Batch process multiple .zarr files matched by glob pattern."""
     if len(matched_files) == 1:
         common_root = matched_files[0].parent
     else:
@@ -522,11 +494,9 @@ def batch_compute_fiber_profiles(
             compute_fiber_profiles(
                 input_file,
                 output_file,
-                voxel_size_um=voxel_size_um,
                 max_radius_um=max_radius_um,
                 step_size_um=step_size_um,
                 max_axons=max_axons,
-                anisotropy_mode=anisotropy_mode,
                 backend=backend,
                 n_jobs=n_jobs,
             )
@@ -550,40 +520,25 @@ def batch_compute_fiber_profiles(
     logger.info(f"{'='*80}\n")
 
 
-def parse_voxel_size_arg(value: str) -> Union[float, Tuple[float, float, float]]:
-    """Parse voxel size CLI argument."""
-    if ',' in value:
-        parts = value.split(',')
-        if len(parts) != 3:
-            raise argparse.ArgumentTypeError(f"Expected 1 or 3 values, got {len(parts)}")
-        return tuple(float(p.strip()) for p in parts)
-    return float(value)
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Compute fiber morphometry profiles using DeepACSON CSD approach'
     )
     parser.add_argument('input', type=str,
-                        help="Path to .zarr directory, .mat file, or glob pattern")
+                        help="Path to .zarr directory or glob pattern")
     parser.add_argument('output', type=Path,
                         help='Output .npz file (single file) OR output directory (batch mode)')
     parser.add_argument('--backend', type=str, default='fast',
                         choices=['fast', 'original'],
                         help="'fast' (optimized, default) or 'original' (verbatim DeepACSON)")
-    parser.add_argument('--voxel-size', type=parse_voxel_size_arg, default=None,
-                        help='Voxel size in μm: single value (isotropic) or vz,vy,vx')
     parser.add_argument('--max-radius', type=float, default=5.0,
                         help='Maximum expected axon radius in μm (sets cross-section grid size, default: 5.0)')
     parser.add_argument('--step-size', type=float, default=0.05,
                         help='Step size along skeleton in μm (default: 0.05)')
     parser.add_argument('--max-axons', type=int, default=0,
                         help='Maximum axons to process (0 = all)')
-    parser.add_argument('--anisotropy-mode', type=str, default='simple',
-                        choices=['simple', 'none'],
-                        help="'simple' resamples to isotropic, 'none' uses geometric mean")
     parser.add_argument('--n-jobs', type=int, default=1,
-                        help='Number of parallel workers (default: 1, -1 = all cores, fast backend only)')
+                        help='Number of parallel workers (default: 1, -1 = all cores)')
     parser.add_argument('--output-suffix', type=str, default='_axon_profiles',
                         help='Suffix to append to output filenames in batch mode')
 
@@ -608,11 +563,9 @@ if __name__ == '__main__':
         compute_fiber_profiles(
             input_path,
             output_path,
-            voxel_size_um=args.voxel_size,
             max_radius_um=args.max_radius,
             step_size_um=args.step_size,
             max_axons=args.max_axons,
-            anisotropy_mode=args.anisotropy_mode,
             backend=args.backend,
             n_jobs=args.n_jobs,
         )
@@ -623,11 +576,9 @@ if __name__ == '__main__':
         batch_compute_fiber_profiles(
             matched_paths,
             output_path,
-            voxel_size_um=args.voxel_size,
             max_radius_um=args.max_radius,
             step_size_um=args.step_size,
             max_axons=args.max_axons,
-            anisotropy_mode=args.anisotropy_mode,
             backend=args.backend,
             output_suffix=args.output_suffix,
             n_jobs=args.n_jobs,
