@@ -79,7 +79,7 @@ def batch_compute(matched_files, output_root, args):
             compute_axon_radius_profiles(
                 input_file,
                 output_file,
-                max_radius_um=args.max_radius,
+                max_radius_um=args.max_axon_radius,
                 step_size_um=args.step_size,
                 max_axons=args.max_axons,
                 backend=args.backend,
@@ -116,8 +116,8 @@ if __name__ == '__main__':
     parser.add_argument('--backend', type=str, default='fast',
                         choices=['fast', 'original'],
                         help="'fast' (optimized, default) or 'original' (verbatim DeepACSON)")
-    parser.add_argument('--max-radius', type=float, default=5.0,
-                        help='Maximum expected axon radius in μm (sets cross-section grid size, default: 5.0)')
+    parser.add_argument('--max-axon-radius', type=float, default=10.0,
+                        help='Maximum expected axon radius in μm (sets cross-section grid size, default: 10.0)')
     parser.add_argument('--step-size', type=float, default=0.05,
                         help='Step size along skeleton in μm (default: 0.05)')
     parser.add_argument('--max-axons', type=int, default=0,
@@ -148,7 +148,7 @@ if __name__ == '__main__':
         compute_axon_radius_profiles(
             input_path,
             output_path,
-            max_radius_um=args.max_radius,
+            max_radius_um=args.max_axon_radius,
             step_size_um=args.step_size,
             max_axons=args.max_axons,
             backend=args.backend,
