@@ -15,6 +15,10 @@ from .io import (
     parse_voxel_size,
     resample_to_isotropic,
     construct_output_path,
+    load_zarr_volume,
+    write_ome_zarr_pyramid,
+    downsample_nearest,
+    downsample_mean,
 )
 
 from .populations import (
@@ -29,12 +33,6 @@ from .populations import (
 from .morphometry import (
     assign_myelin_to_axons,
     compute_fiber_metrics,
-)
-
-from .zarr_io import (
-    write_ome_zarr_pyramid,
-    downsample_nearest,
-    downsample_mean,
 )
 
 from .plotting import (
@@ -66,6 +64,7 @@ __all__ = [
     "assign_myelin_to_axons",
     "compute_fiber_metrics",
     # Zarr I/O
+    "load_zarr_volume",
     "write_ome_zarr_pyramid",
     "downsample_nearest",
     "downsample_mean",

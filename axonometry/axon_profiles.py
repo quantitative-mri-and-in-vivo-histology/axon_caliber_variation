@@ -32,7 +32,7 @@ from .deepacson.fast import (
     unit_tangent_vector as fast_unit_tangent_vector,
     get_line_length as fast_get_line_length,
 )
-from .zarr_io import load_zarr_volume
+from .io import load_zarr_volume
 
 logger = logging.getLogger(__name__)
 

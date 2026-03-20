@@ -29,8 +29,7 @@ import h5py
 import numpy as np
 from skimage.measure import regionprops
 
-from axonometry.io import load_volume_with_metadata, resample_to_isotropic
-from axonometry.zarr_io import write_ome_zarr_pyramid
+from axonometry.io import load_volume_with_metadata, resample_to_isotropic, write_ome_zarr_pyramid
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
