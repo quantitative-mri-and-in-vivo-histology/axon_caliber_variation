@@ -44,7 +44,7 @@ import h5py
 import neuroglancer
 import numpy as np
 
-from axonometry.io import write_ome_zarr_pyramid
+from axonometry.io import load_zarr_volume, write_ome_zarr_pyramid
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -164,13 +164,11 @@ def convert_to_zarr(
 
 def add_grayscale_layer(viewer, name: str, zarr_path: Path, http_port: int, tmp_dir: Path):
     """Add a grayscale image layer from an OME-Zarr."""
-    import zarr
     rel = zarr_path.relative_to(tmp_dir)
     url = f"zarr://http://localhost:{http_port}/{rel}"
 
     # Compute display range from level 0
-    root = zarr.open_group(str(zarr_path), mode='r')
-    sample = root['0'][:]
+    sample, _voxel_size = load_zarr_volume(zarr_path)
     data_min = int(np.percentile(sample, 1))
     data_max = int(np.percentile(sample, 99))
 

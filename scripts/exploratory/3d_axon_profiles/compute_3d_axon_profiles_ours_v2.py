@@ -33,6 +33,8 @@ from scipy.interpolate import RegularGridInterpolator as rgi
 from skimage.measure import label, regionprops
 from tqdm import tqdm
 
+from axonometry.io import load_zarr_volume
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -337,20 +339,6 @@ def rotation_matrix_3D(vector, theta):
 def rotate_vector(vector, rot_mat):
     rotated_vec = np.dot(vector,rot_mat)
     return rotated_vec
-
-
-# ---------------------------------------------------------------------------
-# Volume loading
-# ---------------------------------------------------------------------------
-
-def load_zarr_volume(zarr_path: Path):
-    """Load level-0 volume and voxel size from an OME-Zarr store."""
-    import zarr
-    store = zarr.open_group(str(zarr_path), mode="r")
-    volume = np.asarray(store["0"])
-    multiscales = store.attrs["multiscales"]
-    scale = multiscales[0]["datasets"][0]["coordinateTransformations"][0]["scale"]
-    return volume, float(scale[0])
 
 
 # ---------------------------------------------------------------------------

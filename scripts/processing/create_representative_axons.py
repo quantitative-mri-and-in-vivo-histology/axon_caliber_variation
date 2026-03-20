@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import affine_transform
 
+from axonometry.io import load_zarr_volume
+
 # Find repo root (contains pyproject.toml)
 _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
@@ -168,19 +170,14 @@ def extract_axon_crop(zarr_path: Path, label: int, skeleton_um, padding: int = 6
 
     Returns (crop, bbox_min) where crop has only `label` nonzero.
     """
-    import zarr
-
-    store = zarr.open_group(str(zarr_path), mode="r")
-    arr = store["0"]
-    vol_shape = np.array(arr.shape)
+    volume, _voxel_size = load_zarr_volume(zarr_path)
+    vol_shape = np.array(volume.shape)
 
     skel_vox = (np.asarray(skeleton_um) / VOXEL_SIZE).astype(int)
     bbox_min = np.maximum(skel_vox.min(axis=0) - padding, 0)
     bbox_max = np.minimum(skel_vox.max(axis=0) + padding, vol_shape)
 
-    crop = np.asarray(
-        arr[bbox_min[0]:bbox_max[0], bbox_min[1]:bbox_max[1], bbox_min[2]:bbox_max[2]]
-    )
+    crop = volume[bbox_min[0]:bbox_max[0], bbox_min[1]:bbox_max[1], bbox_min[2]:bbox_max[2]]
     crop = crop.copy()
     crop[crop != label] = 0
 

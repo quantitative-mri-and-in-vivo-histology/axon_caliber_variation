@@ -41,6 +41,7 @@ from axonometry import (
     validate_skeleton_points,
     find_longest_contiguous_segment,
 )
+from axonometry.io import load_zarr_volume
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -209,16 +210,6 @@ def sample_cross_section_fast(volume_bool, point, tangent_vec, g_res):
     if area == 0:
         return None
     return area * (g_res ** 2)
-
-
-def load_zarr_volume(zarr_path: Path):
-    """Load level-0 volume and voxel size from an OME-Zarr store."""
-    import zarr
-    store = zarr.open_group(str(zarr_path), mode="r")
-    volume = np.asarray(store["0"])
-    multiscales = store.attrs["multiscales"]
-    scale = multiscales[0]["datasets"][0]["coordinateTransformations"][0]["scale"]
-    return volume, float(scale[0])
 
 
 def process_single_axon(volume, axon_label, bboxes, voxel_size_um,

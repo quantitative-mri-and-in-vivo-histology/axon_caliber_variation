@@ -51,7 +51,7 @@ _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
-from axonometry.io import load_volume_with_metadata, resample_to_isotropic
+from axonometry.io import load_volume_with_metadata, load_zarr_volume, resample_to_isotropic
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -111,27 +111,6 @@ def _process_slice(z: int) -> dict:
         result["centroid_col"][i] = region.centroid[1]
 
     return result
-
-
-def load_zarr_volume(zarr_path: Path) -> Tuple[np.ndarray, float]:
-    """Load level-0 volume and voxel size from an OME-Zarr store."""
-    import zarr
-
-    store = zarr.open_group(str(zarr_path), mode="r")
-    volume = np.asarray(store["0"])
-
-    # Read voxel size from OME-NGFF metadata
-    multiscales = store.attrs["multiscales"]
-    scale = multiscales[0]["datasets"][0]["coordinateTransformations"][0]["scale"]
-    voxel_size_z = scale[0]
-
-    # Verify isotropic
-    if not np.allclose(scale, scale[0]):
-        logger.warning(
-            f"Zarr voxel size is not isotropic: {scale}. Using Z voxel size ({voxel_size_z})."
-        )
-
-    return volume, float(voxel_size_z)
 
 
 def compute_2d_slice_profiles(
