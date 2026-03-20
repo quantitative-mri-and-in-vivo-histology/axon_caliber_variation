@@ -133,9 +133,9 @@ def compute_per_slice_pdfs(data: Dict, bin_centers: np.ndarray) -> np.ndarray:
 
 
 def load_3d_radii(npz_path: Path) -> np.ndarray:
-    """Load pooled 3D radii (main trunk, no branches)."""
+    """Load pooled 3D radii."""
     d = np.load(npz_path, allow_pickle=True)
-    radii = d['all_radii_wo_branches_um']
+    radii = d['all_radii_um']
     radii = radii[radii >= MIN_RADIUS_UM]
     return radii
 

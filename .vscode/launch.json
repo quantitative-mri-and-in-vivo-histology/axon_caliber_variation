@@ -83,17 +83,18 @@
                 "data/raw/rat/LM/*_myelin.zarr",
                 "data/processed/rat/LM/",
                 "--max-axon-radius", "5.0",
-                "--step-size", "0.1",
+                "--step-size", "0.05",
                 "--n-jobs", "-1",
-                "--path-method", "discrete",
-                "--skeleton-downsample", "2",
                 "--output-suffix", "_axon_profiles"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1"
             }
         },
         {
@@ -105,17 +106,18 @@
                 "data/raw/rat/HM/*_myelin.zarr",
                 "data/processed/rat/HM/",
                 "--max-axon-radius", "5.0",
-                "--step-size", "0.1",
+                "--step-size", "0.05",
                 "--n-jobs", "-1",
-                "--path-method", "discrete",
-                "--skeleton-downsample", "2",
                 "--output-suffix", "_axon_profiles"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1"
             }
         },
         {
@@ -181,7 +183,7 @@
             "program": "${workspaceFolder}/scripts/figures/plot_2d_vs_3d_distribution_comparison.py",
             "args": [
                 "--data-dir", "data/processed/rat/lm",
-                "--output", "fig/main/distribution_2d_vs_3d_comparison_x.svg",
+                "--output", "fig/main/distribution_2d_vs_3d_comparison.svg",
                 "--radius-type", "minor",
                 "--min-radius", "0.0",
                 "--max-eccentricity", "1.0",

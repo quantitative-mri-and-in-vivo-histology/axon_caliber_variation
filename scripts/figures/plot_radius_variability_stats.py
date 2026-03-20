@@ -2,11 +2,12 @@
 """
 Plot radius variability statistics: CV histogram, CV vs radius, slowdown reduction.
 
-Loads pre-computed NPZ from create_representative_axons.py and creates a 1×3
+Loads axon profile NPZ files from a data directory and creates a 1×3
 panel figure using pooled statistics across all axons.
 
 Usage:
     python scripts/figures/plot_radius_variability_stats.py
+    python scripts/figures/plot_radius_variability_stats.py --data-dir data/processed/rat/lm
 """
 
 import argparse
@@ -24,32 +25,66 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 
-def load_pooled_stats(npz_path: Path) -> dict:
-    """Load pooled statistics from representative axons NPZ."""
-    data = np.load(npz_path, allow_pickle=True)
+def load_axon_stats(data_dir: Path, min_points: int = 10) -> dict:
+    """Load per-axon statistics from all axon profile NPZ files in data_dir."""
+    all_mean_radii = []
+    all_cv = []
+    all_slowdown = []
+
+    for npz_path in sorted(data_dir.glob("*_axon_profiles.npz")):
+        d = np.load(npz_path, allow_pickle=True)
+        mean_r = d['mean_radii_um']
+        std_r = d['std_radii_um']
+        n_pts = d['n_points']
+        profiles = d['radii_profiles_um']
+
+        for i in range(len(mean_r)):
+            if n_pts[i] < min_points or mean_r[i] <= 0:
+                continue
+
+            cv = std_r[i] / mean_r[i]
+            radii = profiles[i]
+            # Conduction velocity slowdown: v_actual/v_ideal = <r^2> / <r>^2
+            r2_mean = np.mean(radii ** 2)
+            r_mean2 = np.mean(radii) ** 2
+            slowdown = r_mean2 / r2_mean if r2_mean > 0 else 1.0
+
+            all_mean_radii.append(mean_r[i])
+            all_cv.append(cv)
+            all_slowdown.append(slowdown)
+
+        logger.info(f"  {npz_path.name}: {len(mean_r)} axons")
+
+    logger.info(f"Total axons loaded: {len(all_mean_radii)}")
     return {
-        "all_mean_radii": data["all_mean_radii"],
-        "all_cv": data["all_cv"],
-        "all_slowdown": data["all_slowdown"],
+        "all_mean_radii": np.array(all_mean_radii),
+        "all_cv": np.array(all_cv),
+        "all_slowdown": np.array(all_slowdown),
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Plot radius variability statistics")
-    parser.add_argument("--input", type=Path,
-                        default=Path("data/processed/rat/lm/representative_axons.npz"))
+    parser.add_argument("--data-dir", type=Path,
+                        default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
                         default=Path("fig/main/radius_variability_stats.svg"))
+    parser.add_argument("--min-points", type=int, default=10,
+                        help="Minimum skeleton points per axon")
     args = parser.parse_args()
 
-    if not args.input.exists():
-        logger.error(f"Input not found: {args.input}")
+    if not args.data_dir.exists():
+        logger.error(f"Data directory not found: {args.data_dir}")
         return
 
-    d = load_pooled_stats(args.input)
+    d = load_axon_stats(args.data_dir, min_points=args.min_points)
     all_r = d["all_mean_radii"]
     all_cv = d["all_cv"]
     all_slow = d["all_slowdown"]
+
+    if len(all_r) == 0:
+        logger.error("No axons loaded")
+        return
 
     hist_s = settings.histogram
     font_s = settings.fonts
@@ -156,7 +191,6 @@ def main():
         ax.set_box_aspect(1)
 
     plt.tight_layout()
-
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.output, dpi=settings.figure["dpi"], bbox_inches="tight")
