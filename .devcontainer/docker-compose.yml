@@ -14,7 +14,7 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    shm_size: 4g
+    shm_size: 16g
     volumes:
       - ..:/workspace:delegated
       - claude-code-bashhistory:/commandhistory

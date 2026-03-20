@@ -40,7 +40,7 @@ while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
 
-from axonometry.fiber_profiles import compute_fiber_profiles
+from axonometry.axon_profiles import compute_axon_radius_profiles
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ def batch_compute(matched_files, output_root, args):
         logger.info(f"{'='*80}")
 
         try:
-            compute_fiber_profiles(
+            compute_axon_radius_profiles(
                 input_file,
                 output_file,
                 max_radius_um=args.max_radius,
@@ -145,7 +145,7 @@ if __name__ == '__main__':
                 stem = input_path.with_suffix("").stem if "." in input_path.stem else input_path.stem
             output_path = output_path / f"{stem}{args.output_suffix}.npz"
 
-        compute_fiber_profiles(
+        compute_axon_radius_profiles(
             input_path,
             output_path,
             max_radius_um=args.max_radius,
