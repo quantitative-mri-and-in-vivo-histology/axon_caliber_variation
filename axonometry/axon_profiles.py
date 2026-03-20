@@ -1,11 +1,11 @@
 """Axon morphometry profiling: skeleton extraction + cross-section sampling.
 
-Per-axon profiling functions:
-- axon_radius_profile(): verbatim DeepACSON code (axonometry.deepacson.original)
-- axon_radius_profile_fast(): optimized version (axonometry.deepacson.fast)
+Two backends for per-axon processing:
+- process_single_axon_original(): verbatim DeepACSON (skeleton step=0.1, stride subsampling)
+- process_single_axon_fast(): optimized DeepACSON (euler_step = sampling step, two-crop)
 
 Volume-level orchestration:
-- compute_fiber_profiles(): runs the pipeline on all axons in a labeled 3D volume
+- compute_axon_radius_profiles(): runs the pipeline on all axons in a labeled 3D volume
 """
 
 import contextlib
@@ -35,161 +35,6 @@ from .deepacson.fast import (
 from .zarr_io import load_zarr_volume
 
 logger = logging.getLogger(__name__)
-
-
-# ===========================================================================
-# Per-axon profiling functions
-# ===========================================================================
-
-def axon_radius_profile(binary_vol, g_radius, g_res=0.25, step_voxels=None,
-                        verbose=False):
-    """
-    Extract radius profile using verbatim DeepACSON code.
-
-    Args:
-        binary_vol: 3D binary volume (1=axon, 0=background), float64
-        g_radius: grid radius in voxels for cross-section sampling
-        g_res: grid resolution in voxels (default 0.25, matching DeepACSON)
-        step_voxels: if set, subsample skeleton at this spacing in voxels
-        verbose: print skeleton segment lengths
-
-    Returns:
-        dict with 'radii_voxels', 'skeleton_points', 'n_segments',
-        'length_voxels', or None if extraction failed
-    """
-    if verbose:
-        skel_segments = deepacson_skeleton(binary_vol)
-    else:
-        with contextlib.redirect_stdout(io.StringIO()):
-            skel_segments = deepacson_skeleton(binary_vol)
-
-    if len(skel_segments) == 0:
-        return None
-
-    all_radii = []
-    all_skel_points = []
-    main_length = 0.0
-
-    for skel_seg in skel_segments:
-        if len(skel_seg) < 3:
-            continue
-
-        if step_voxels is not None:
-            stride = max(1, round(step_voxels / 0.1))
-            skel_seg = skel_seg[::stride]
-            if len(skel_seg) < 3:
-                continue
-
-        tangent_vecs = deepacson_unit_tangent_vector(skel_seg)
-
-        radii = []
-        skel_points = []
-
-        for pt, tangent in zip(skel_seg, tangent_vecs):
-            area_pixels = deepacson_sample_cross_section(
-                binary_vol, pt, tangent, g_radius, g_res
-            )
-
-            if area_pixels > 0:
-                area_voxels = area_pixels * (g_res ** 2)
-                radius_voxels = np.sqrt(area_voxels / np.pi)
-                radii.append(radius_voxels)
-                skel_points.append(pt.copy())
-
-        if len(radii) < 2:
-            continue
-
-        seg_length = deepacson_get_line_length(skel_seg)
-        if seg_length > main_length:
-            main_length = seg_length
-
-        all_radii.extend(radii)
-        all_skel_points.extend(skel_points)
-
-    if len(all_radii) < 2:
-        return None
-
-    return {
-        'radii_voxels': np.array(all_radii),
-        'skeleton_points': np.array(all_skel_points),
-        'n_segments': len(skel_segments),
-        'length_voxels': main_length,
-    }
-
-
-def axon_radius_profile_fast(binary_vol, g_radius, g_res=0.25, step_voxels=None,
-                             verbose=False):
-    """
-    Extract radius profile using optimized DeepACSON code.
-
-    Same algorithm as axon_radius_profile() but using deepacson_fast.
-
-    Args:
-        binary_vol: 3D binary volume (1=axon, 0=background), float64
-        g_radius: grid radius in voxels for cross-section sampling
-        g_res: grid resolution in voxels (default 0.25, matching DeepACSON)
-        step_voxels: if set, subsample skeleton at this spacing in voxels
-        verbose: print skeleton segment lengths
-
-    Returns:
-        dict with 'radii_voxels', 'skeleton_points', 'n_segments',
-        'length_voxels', 'maxD', or None if extraction failed
-    """
-    skel_segments, maxD = fast_skeleton(binary_vol, verbose=verbose)
-
-    if len(skel_segments) == 0:
-        return None
-
-    all_radii = []
-    all_skel_points = []
-    main_length = 0.0
-
-    for skel_seg in skel_segments:
-        if len(skel_seg) < 3:
-            continue
-
-        if step_voxels is not None:
-            stride = max(1, round(step_voxels / 0.1))
-            skel_seg = skel_seg[::stride]
-            if len(skel_seg) < 3:
-                continue
-
-        tangent_vecs = fast_unit_tangent_vector(skel_seg)
-
-        radii = []
-        skel_points = []
-
-        for pt, tangent in zip(skel_seg, tangent_vecs):
-            area_pixels = fast_sample_cross_section(
-                binary_vol, pt, tangent, g_radius, g_res
-            )
-
-            if area_pixels > 0:
-                area_voxels = area_pixels * (g_res ** 2)
-                radius_voxels = np.sqrt(area_voxels / np.pi)
-                radii.append(radius_voxels)
-                skel_points.append(pt.copy())
-
-        if len(radii) < 2:
-            continue
-
-        seg_length = fast_get_line_length(skel_seg)
-        if seg_length > main_length:
-            main_length = seg_length
-
-        all_radii.extend(radii)
-        all_skel_points.extend(skel_points)
-
-    if len(all_radii) < 2:
-        return None
-
-    return {
-        'radii_voxels': np.array(all_radii),
-        'skeleton_points': np.array(all_skel_points),
-        'n_segments': len(skel_segments),
-        'length_voxels': main_length,
-        'maxD': float(maxD),
-    }
 
 
 # ===========================================================================
@@ -249,7 +94,11 @@ def compute_bounding_boxes(volume: np.ndarray) -> dict:
 
 def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
                                  g_radius, g_res, step_voxels):
-    """Process a single axon using verbatim DeepACSON backend."""
+    """Process a single axon using verbatim DeepACSON backend.
+
+    Single crop (bbox + g_radius + 5), skeleton with Euler step=0.1,
+    subsampled at step_voxels spacing for cross-section sampling.
+    """
     try:
         min_coords, max_coords = bbox
         vol_shape = np.array(volume.shape)
@@ -266,22 +115,67 @@ def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
         if np.count_nonzero(binary) < 100:
             return None
 
-        result = axon_radius_profile(
-            binary, g_radius, g_res=g_res, step_voxels=step_voxels
-        )
-        if result is None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            skel_segments = deepacson_skeleton(binary)
+
+        if len(skel_segments) == 0:
             return None
 
-        radii_um = result['radii_voxels'] * voxel_size_um
+        all_radii = []
+        all_skel_points = []
+        main_length = 0.0
+
+        for skel_seg in skel_segments:
+            if len(skel_seg) < 3:
+                continue
+
+            if step_voxels is not None:
+                stride = max(1, round(step_voxels / 0.1))
+                skel_seg = skel_seg[::stride]
+                if len(skel_seg) < 3:
+                    continue
+
+            tangent_vecs = deepacson_unit_tangent_vector(skel_seg)
+
+            radii = []
+            skel_points = []
+
+            for pt, tangent in zip(skel_seg, tangent_vecs):
+                area_pixels = deepacson_sample_cross_section(
+                    binary, pt, tangent, g_radius, g_res
+                )
+
+                if area_pixels > 0:
+                    area_voxels = area_pixels * (g_res ** 2)
+                    radius_voxels = np.sqrt(area_voxels / np.pi)
+                    radii.append(radius_voxels)
+                    skel_points.append(pt.copy())
+
+            if len(radii) < 2:
+                continue
+
+            seg_length = deepacson_get_line_length(skel_seg)
+            if seg_length > main_length:
+                main_length = seg_length
+
+            all_radii.extend(radii)
+            all_skel_points.extend(skel_points)
+
+        if len(all_radii) < 2:
+            return None
+
+        radii_voxels = np.array(all_radii)
+        radii_um = radii_voxels * voxel_size_um
+        skel_points_global = np.array(all_skel_points) + min_padded
         return {
             'label': axon_label,
             'radii_um': radii_um,
-            'skeleton_um': (result['skeleton_points'] + min_padded) * voxel_size_um,
+            'skeleton_um': skel_points_global * voxel_size_um,
             'n_points': len(radii_um),
-            'n_segments': result['n_segments'],
+            'n_segments': len(skel_segments),
             'mean_radius_um': np.mean(radii_um),
             'std_radius_um': np.std(radii_um),
-            'length_um': result['length_voxels'] * voxel_size_um,
+            'length_um': main_length * voxel_size_um,
         }
 
     except Exception as e:
@@ -294,8 +188,8 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
     """Process a single axon using optimized DeepACSON backend.
 
     Two-crop approach + adaptive per-point grid sizing:
-    (1) Tight crop (bbox + 5) for skeleton extraction — FMM runs on a
-        small subvolume for speed and memory.
+    (1) Tight crop (bbox + 5) for skeleton extraction — FMM Euler step
+        equals step_voxels, so every skeleton point is a sampling point.
     (2) Wide crop (bbox + adapted radius) for cross-section sampling.
     (3) Per-point adaptive g_radius via find_g_radius(): starts at
         ceil(maxD) + 5, doubles until the cross-section border is clear.
@@ -317,7 +211,9 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
         if np.count_nonzero(tight_binary) < 100:
             return None
 
-        skel_segments, maxD = fast_skeleton(tight_binary, verbose=False)
+        # Euler step = desired sampling spacing — use every skeleton point
+        skel_segments, maxD = fast_skeleton(tight_binary, verbose=False,
+                                            euler_step=step_voxels)
         del tight_binary  # free before allocating wide crop
         if len(skel_segments) == 0:
             return None
@@ -346,12 +242,6 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
         for skel_seg in skel_segments:
             if len(skel_seg) < 3:
                 continue
-
-            if step_voxels is not None:
-                stride = max(1, round(step_voxels / 0.1))
-                skel_seg = skel_seg[::stride]
-                if len(skel_seg) < 3:
-                    continue
 
             tangent_vecs = fast_unit_tangent_vector(skel_seg)
 
@@ -548,9 +438,14 @@ def compute_axon_radius_profiles(input_path: Path,
 
     step_voxels = step_size_um / voxel_size if step_size_um is not None else None
 
-    logger.info(f"Parameters: g_radius={g_radius} voxels, g_res={g_res}, "
-                f"step={step_size_um} μm = {step_voxels:.1f} voxels "
-                f"(stride ~{max(1, round(step_voxels / 0.1))})")
+    if backend == 'fast':
+        logger.info(f"Parameters: g_radius={g_radius} voxels, g_res={g_res}, "
+                    f"step={step_size_um} μm = {step_voxels:.1f} voxels "
+                    f"(euler_step = sampling step, no stride)")
+    else:
+        logger.info(f"Parameters: g_radius={g_radius} voxels, g_res={g_res}, "
+                    f"step={step_size_um} μm = {step_voxels:.1f} voxels "
+                    f"(stride ~{max(1, round(step_voxels / 0.1))})")
 
     # Dispatch to backend
     if backend == 'fast':

@@ -564,7 +564,7 @@ def organize_skeleton(skel_seg,length_th):
 #         (2) Return maxD (max inscribed radius) for adaptive grid sizing.
 # Original: def skeleton(Ax): ... print(line_length) ... return final_skeleton
 # ---
-def skeleton(Ax, verbose=True):
+def skeleton(Ax, verbose=True, euler_step=0.5):
 
     boundary_dist=skfmm.distance(Ax)
 
@@ -623,7 +623,7 @@ def skeleton(Ax, verbose=True):
         #   subsampled at step_voxels spacing for cross-section sampling anyway.
         # Original: shortest_line=euler_shortest_path(D,source_point,end_point,step_size=0.1)
         # ---
-        shortest_line=euler_shortest_path(D,source_point,end_point,step_size=0.5)
+        shortest_line=euler_shortest_path(D,source_point,end_point,step_size=euler_step)
         #shortest_line = discrete_shortest_path(D,end_point)
 
         line_length=get_line_length(shortest_line)
@@ -730,7 +730,7 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
     #   cross_section = interpolating_func(cross_section_plane)
     # ---
     coords = cross_section_plane.T  # (3, N) for map_coordinates
-    # map_coordinates needs float for order=1 interpolation; convert if bool
+    # map_coordinates needs numeric type for order=1 interpolation; convert if bool
     vol = binary_vol if binary_vol.dtype != bool else binary_vol.view(np.uint8)
     cross_section = map_coordinates(vol, coords, order=1,
                                     mode='constant', cval=0.0)
