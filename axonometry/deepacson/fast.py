@@ -479,7 +479,11 @@ def skeleton(Ax, verbose=True, euler_step=0.5):
             Ax[tuple(i)]=0
 
     if len(skeleton_segments)!=0:
-        final_skeleton=organize_skeleton(skeleton_segments,length_threshold)
+        # --- MODIFIED ---
+        # Pass length_th=3 instead of length_threshold. See original.py.
+        # Original: organize_skeleton(skeleton_segments, length_threshold)
+        # ---
+        final_skeleton=organize_skeleton(skeleton_segments, 3)
     else:
         final_skeleton=[]
 

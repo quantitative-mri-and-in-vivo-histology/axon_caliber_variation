@@ -352,7 +352,14 @@ def skeleton(Ax):
             Ax[tuple(i)]=0
 
     if len(skeleton_segments)!=0:
-        final_skeleton=organize_skeleton(skeleton_segments,length_threshold)
+        # --- MODIFIED ---
+        # Pass length_th=3 (minimum for tangent computation) instead of
+        # length_threshold. The original threshold discards short branches,
+        # but the input data was already processed by the full DeepACSON/CSD
+        # pipeline, so all remaining structures are valid parts of the axon.
+        # Original: organize_skeleton(skeleton_segments, length_threshold)
+        # ---
+        final_skeleton=organize_skeleton(skeleton_segments, 3)
     else:
         final_skeleton=[]
 
