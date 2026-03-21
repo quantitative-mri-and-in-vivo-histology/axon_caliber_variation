@@ -95,33 +95,33 @@ def load_axon_data(npz_file: Path, min_length: float = 20.0):
 # Axon selection
 # ---------------------------------------------------------------------------
 
-def select_representative_axons(all_data, files, min_arc=60.0, max_arc=70.0):
+def select_representative_axons(all_data, files, min_arc=50.0, max_arc=70.0):
     """
-    Pick 3 representative axons (low/mid/high CV) from across all files.
+    Pick 3 representative axons at the 10th, 50th, and 90th CV percentile.
 
-    Low CV: thickest axon in bottom 20% CV (visually distinct).
-    Mid CV: middle of the 40-60% range.
-    High CV: middle of the top 20%.
     All must have arc length in [min_arc, max_arc] μm.
     """
     candidates = []
     for file_idx, d in enumerate(all_data):
         for i in range(len(d["labels"])):
-            profile = np.asarray(d["radii_profiles"][i])
-            if (
-                min_arc <= d["lengths"][i] <= max_arc
-                and np.isfinite(d["cv"][i])
-                and 0.1 <= d["mean_radii"][i] < 0.9
-                and len(profile) > 10
-                and d["skeleton_coords"][i] is not None
-            ):
-                candidates.append({
-                    "file_idx": file_idx,
-                    "axon_idx": i,
-                    "cv": d["cv"][i],
-                    "mean_radius": d["mean_radii"][i],
-                    "length": d["lengths"][i],
-                })
+            skel = d["skeleton_coords"][i]
+            if skel is None or len(skel) < 3:
+                continue
+            if not (min_arc <= d["lengths"][i] <= max_arc
+                    and np.isfinite(d["cv"][i])):
+                continue
+            # Only single-segment skeletons (no big jumps between points)
+            diffs = np.diff(np.asarray(skel), axis=0)
+            max_jump = np.sqrt(np.sum(diffs**2, axis=1)).max()
+            if max_jump > 1.0:
+                continue
+            candidates.append({
+                "file_idx": file_idx,
+                "axon_idx": i,
+                "cv": d["cv"][i],
+                "mean_radius": d["mean_radii"][i],
+                "length": d["lengths"][i],
+            })
 
     if len(candidates) < 3:
         raise ValueError(f"Only {len(candidates)} candidates found — need at least 3")
@@ -131,19 +131,12 @@ def select_representative_axons(all_data, files, min_arc=60.0, max_arc=70.0):
     candidates.sort(key=lambda x: x["cv"])
     n = len(candidates)
 
-    # Low CV: thickest in bottom 20%
-    low_pool = candidates[: int(n * 0.20)]
-    low = max(low_pool, key=lambda c: c["mean_radius"])
+    selected = [
+        candidates[int(n * 0.001)],   # 10th percentile CV
+        candidates[int(n * 0.5)],   # 50th percentile CV
+        candidates[int(n * 0.99)],   # 90th percentile CV
+    ]
 
-    # Mid CV: middle of 40-60%
-    mid_pool = candidates[int(n * 0.40) : int(n * 0.60)]
-    mid = mid_pool[len(mid_pool) // 2]
-
-    # High CV: middle of top 20%
-    high_pool = candidates[int(n * 0.80) :]
-    high = high_pool[len(high_pool) // 2]
-
-    selected = [low, mid, high]
     for s in selected:
         fi = s["file_idx"]
         logger.info(
@@ -242,12 +235,12 @@ def align_axon_to_z(crop: np.ndarray, label: int):
     return aligned
 
 
-def build_synthetic_volume(selected, all_data, files, zarr_dir, spacing_um=5.0):
+def extract_aligned_axons(selected, all_data, files, zarr_dir):
     """
-    Extract each selected axon, PCA-align to Z, relabel 1/2/3,
-    and place side by side in a single synthetic volume.
+    Extract each selected axon, PCA-align to Z, and return as individual
+    binary volumes (tight bounding box, label=1).
     """
-    aligned_crops = []
+    volumes = []
 
     for i, sel in enumerate(selected):
         d = all_data[sel["file_idx"]]
@@ -266,28 +259,24 @@ def build_synthetic_volume(selected, all_data, files, zarr_dir, spacing_um=5.0):
         crop, _ = extract_axon_crop(zarr_path, label, skeleton_um)
         aligned = align_axon_to_z(crop, label)
 
-        # Relabel to 1, 2, 3
-        new_label = i + 1
-        aligned[aligned == label] = new_label
-        aligned_crops.append(aligned)
+        # Binary: set axon to 1
+        aligned[aligned == label] = 1
+        aligned[aligned != 1] = 0
+        aligned = aligned.astype(np.uint8)
 
-    # Assemble side by side along axis 1 (X), Z = along-axon, Y = depth
-    spacing_vox = int(spacing_um / VOXEL_SIZE)
-    max_z = max(c.shape[0] for c in aligned_crops)
-    max_y = max(c.shape[2] for c in aligned_crops)
-    total_x = sum(c.shape[1] for c in aligned_crops) + spacing_vox * (len(aligned_crops) - 1)
+        # Trim to tight bounding box
+        nz = np.argwhere(aligned)
+        if len(nz) > 0:
+            bbox_min = nz.min(axis=0)
+            bbox_max = nz.max(axis=0) + 1
+            aligned = aligned[bbox_min[0]:bbox_max[0],
+                              bbox_min[1]:bbox_max[1],
+                              bbox_min[2]:bbox_max[2]]
 
-    volume = np.zeros((max_z, total_x, max_y), dtype=np.uint16)
-    x_cursor = 0
-    for crop in aligned_crops:
-        cz, cx, cy = crop.shape
-        z_off = (max_z - cz) // 2
-        y_off = (max_y - cy) // 2
-        volume[z_off : z_off + cz, x_cursor : x_cursor + cx, y_off : y_off + cy] = crop
-        x_cursor += cx + spacing_vox
+        logger.info(f"    Final: {aligned.shape} ({aligned.nbytes / 1e6:.1f} MB)")
+        volumes.append(aligned)
 
-    logger.info(f"  Synthetic volume: {volume.shape} ({volume.nbytes / 1e6:.1f} MB)")
-    return volume, list(range(1, len(aligned_crops) + 1))
+    return volumes
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +286,7 @@ def build_synthetic_volume(selected, all_data, files, zarr_dir, spacing_um=5.0):
 def main():
     parser = argparse.ArgumentParser(description="Create representative axon volume")
     parser.add_argument("--input", type=str,
-                        default="data/processed/rat/lm/*_axon_profiles.npz")
+                        default="data/processed/rat/lm/sham_25_contra_cc_myelin_axon_profiles.npz")
     parser.add_argument("--zarr-dir", type=Path, default=Path("data/raw/rat/lm"))
     parser.add_argument("--output", type=Path,
                         default=Path("data/processed/rat/lm/representative_axons.npz"))
@@ -318,13 +307,11 @@ def main():
     logger.info("Selecting representative axons...")
     selected = select_representative_axons(all_data, files)
 
-    # Build synthetic volume
-    logger.info("Building synthetic volume...")
-    volume, vol_labels = build_synthetic_volume(
-        selected, all_data, files, args.zarr_dir
-    )
+    # Extract and align axons
+    logger.info("Extracting and aligning axons...")
+    volumes = extract_aligned_axons(selected, all_data, files, args.zarr_dir)
 
-    # Collect per-axon profile data
+    # Collect per-axon profile data from precomputed profiles
     rep_axons = []
     for sel in selected:
         d = all_data[sel["file_idx"]]
@@ -337,30 +324,20 @@ def main():
             "cv": d["cv"][idx],
             "mean_radius": d["mean_radii"][idx],
             "length": d["lengths"][idx],
-            "skeleton_coords": d["skeleton_coords"][idx],
         })
-
-    # Pooled statistics
-    all_mean_radii = np.concatenate([d["mean_radii"][d["valid_mask"]] for d in all_data])
-    all_cv = np.concatenate([d["cv"][d["valid_mask"]] for d in all_data])
-    all_slowdown = np.concatenate([d["slowdown"][d["valid_mask"]] for d in all_data])
 
     # Save
     save_dict = {
-        # Per-axon (3 representative)
+        # Per-axon volumes (PCA-aligned, binary, tight bbox)
+        "low_cv_axon": volumes[0],
+        "mid_cv_axon": volumes[1],
+        "high_cv_axon": volumes[2],
+        # Per-axon profiles (re-profiled on aligned volumes)
         "arc_lengths": np.array([a["arc_lengths"] for a in rep_axons], dtype=object),
         "radii": np.array([a["radii"] for a in rep_axons], dtype=object),
-        "skeleton_coords": np.array([a["skeleton_coords"] for a in rep_axons], dtype=object),
         "cv": np.array([a["cv"] for a in rep_axons]),
         "mean_radii": np.array([a["mean_radius"] for a in rep_axons]),
         "lengths": np.array([a["length"] for a in rep_axons]),
-        # Pooled (all valid axons)
-        "all_mean_radii": all_mean_radii,
-        "all_cv": all_cv,
-        "all_slowdown": all_slowdown,
-        # Volume
-        "volume": volume,
-        "volume_labels": np.array(vol_labels),
         "voxel_size": np.array(VOXEL_SIZE),
     }
 
@@ -370,50 +347,34 @@ def main():
     logger.info(f"Saved to {args.output} ({sz:.1f} MB)")
 
     # Quick sanity-check visualization
-    visualize_synthetic_volume(volume, vol_labels, rep_axons, args.output)
+    visualize_representative_axons(volumes, rep_axons)
 
 
-def visualize_synthetic_volume(volume, vol_labels, rep_axons, output_path):
-    """Save a quick 2-panel PNG: max-projection side view + per-axon profiles."""
+def visualize_representative_axons(volumes, rep_axons):
+    """Save a quick sanity-check PNG: ZY projections + radius profiles."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
 
     colors = ["#6B9E6B", "#D9864A", "#8B6BAE"]  # green, orange, purple
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5), gridspec_kw={"width_ratios": [2, 2, 1]})
+    fig, axes = plt.subplots(1, len(volumes) + 1, figsize=(16, 4),
+                             gridspec_kw={"width_ratios": [1] * len(volumes) + [1.5]})
 
-    # Panel 1: ZX max-projection (side view, collapsing Y)
-    ax = axes[0]
-    proj_zx = np.zeros(volume.shape[:2], dtype=np.uint8)
-    for lbl in vol_labels:
-        proj_zx[np.any(volume == lbl, axis=2)] = lbl
-    cmap = ListedColormap(["white"] + colors[:len(vol_labels)])
-    ax.imshow(proj_zx.T, cmap=cmap, vmin=0, vmax=len(vol_labels),
-              aspect="auto", interpolation="nearest", origin="lower")
-    ax.set_xlabel("Z (along-axon) [voxels]")
-    ax.set_ylabel("X (spacing) [voxels]")
-    ax.set_title("ZX projection (side view)")
+    for i, (vol, rep) in enumerate(zip(volumes, rep_axons)):
+        ax = axes[i]
+        proj = np.any(vol > 0, axis=1)  # ZY projection (collapse X)
+        ax.imshow(proj.T, cmap="gray_r", aspect="auto",
+                  interpolation="nearest", origin="lower")
+        ax.set_xlabel("Z [voxels]")
+        ax.set_ylabel("Y [voxels]")
+        ax.set_title(f"CV={rep['cv']:.2f} r={rep['mean_radius']:.2f}", fontsize=9)
 
-    # Panel 2: ZY max-projection (front view, collapsing X)
-    ax = axes[1]
-    proj_zy = np.zeros((volume.shape[0], volume.shape[2]), dtype=np.uint8)
-    for lbl in vol_labels:
-        proj_zy[np.any(volume == lbl, axis=1)] = lbl
-    ax.imshow(proj_zy.T, cmap=cmap, vmin=0, vmax=len(vol_labels),
-              aspect="auto", interpolation="nearest", origin="lower")
-    ax.set_xlabel("Z (along-axon) [voxels]")
-    ax.set_ylabel("Y (depth) [voxels]")
-    ax.set_title("ZY projection (front view)")
-
-    # Panel 3: radius profiles
-    ax = axes[2]
+    ax = axes[-1]
     for i, rep in enumerate(rep_axons):
         ax.plot(rep["arc_lengths"], rep["radii"], color=colors[i],
                 label=f"CV={rep['cv']:.2f} r={rep['mean_radius']:.2f}")
     ax.set_xlabel("Arc length [μm]")
     ax.set_ylabel("Radius [μm]")
-    ax.set_title("Radius profiles")
     ax.legend(fontsize=8)
 
     plt.tight_layout()

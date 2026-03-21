@@ -18,12 +18,14 @@ import numpy as np
 from matplotlib.colors import to_rgb
 from scipy import ndimage
 
-from axonometry import add_panel_labels, get_plot_settings, style_axis
+from axonometry import get_plot_settings, style_axis
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 settings = get_plot_settings()
+
+VOLUME_KEYS = ["low_cv_axon", "mid_cv_axon", "high_cv_axon"]
 
 
 def load_data(npz_path: Path) -> dict:
@@ -35,7 +37,6 @@ def load_data(npz_path: Path) -> dict:
     cv_values = data["cv"]
     mean_radii = data["mean_radii"]
     lengths = data["lengths"]
-    vol_labels = data["volume_labels"] if "volume_labels" in data else np.arange(1, len(cv_values) + 1)
 
     rep_axons = []
     for i in range(len(cv_values)):
@@ -43,95 +44,133 @@ def load_data(npz_path: Path) -> dict:
             "arc_lengths": np.array(arc_lengths[i]),
             "radii": np.array(radii[i]),
             "cv": float(cv_values[i]),
-            "label": int(vol_labels[i]),
             "mean_radius": float(mean_radii[i]),
             "length": float(lengths[i]),
         })
 
+    volumes = [np.array(data[k]) for k in VOLUME_KEYS]
+
+    # Rotate high-CV axon 90° around Z (swap X↔Y) so diameter
+    # variations are visible from the default viewing angle
+    volumes[2] = np.swapaxes(volumes[2], 1, 2)
+
     return {
         "rep_axons": rep_axons,
-        "volume": np.array(data["volume"]) if "volume" in data else None,
-        "volume_labels": list(vol_labels),
+        "volumes": volumes,
         "voxel_size": float(data["voxel_size"]),
     }
 
 
-def render_axons_3d(volume, labels, colors, voxel_size, ax, rep_axons,
+def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
+                        max_points=20000):
+    """Render a single axon volume as 3D surface scatter, colored by local radius."""
+    mask = vol > 0
+    if not mask.any():
+        return None
+
+    # Surface voxels via erosion
+    eroded = ndimage.binary_erosion(mask)
+    surface = mask & ~eroded
+    coords_vox = np.argwhere(surface)
+    if len(coords_vox) == 0:
+        return None
+
+    # Color by local radius (distance transform on this small volume)
+    dist = ndimage.distance_transform_edt(mask)
+    local_radii = dist[coords_vox[:, 0], coords_vox[:, 1], coords_vox[:, 2]] * voxel_size
+
+    # Subsample
+    if len(coords_vox) > max_points:
+        idx = np.random.choice(len(coords_vox), size=max_points, replace=False)
+        coords_vox = coords_vox[idx]
+        local_radii = local_radii[idx]
+
+    # Volume axes: (Z, X, Y) → plot as (x=X, y=Y, z=Z)
+    z_um = coords_vox[:, 0] * voxel_size
+    x_um = coords_vox[:, 1] * voxel_size + x_offset
+    y_um = coords_vox[:, 2] * voxel_size
+
+    r_min, r_max = np.percentile(local_radii, [5, 95])
+    if r_max > r_min:
+        norm = np.clip((local_radii - r_min) / (r_max - r_min), 0, 1)
+    else:
+        norm = np.ones(len(coords_vox)) * 0.5
+
+    intensities = 0.25 + 0.75 * norm
+    point_sizes = 2 + 8 * norm
+    base_color = np.array(to_rgb(color))
+    point_colors = np.outer(intensities, base_color)
+
+    ax.scatter(x_um, y_um, z_um, c=point_colors, s=point_sizes,
+               alpha=0.9, rasterized=True)
+
+    logger.info(f"  {len(coords_vox)} surface pts, Z-extent: {z_um.max()-z_um.min():.1f} μm")
+
+    return np.column_stack([x_um, y_um, z_um])
+
+
+def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                     arc_interval=10.0):
-    """Render pre-aligned axons as 3D surface scatter."""
-    # Global radius range for color scaling
-    all_radii = []
-    for axon in rep_axons:
-        all_radii.extend(axon["radii"])
-    global_r_min = np.percentile(all_radii, 5)
-    global_r_max = np.percentile(all_radii, 95)
-
+    """Render individual axon volumes side by side along X in 3D."""
     all_points = []
+    x_offset = 0.0
+    spacing_um = 8.0
 
-    for i, (label, color) in enumerate(zip(labels, colors)):
-        mask = volume == label
-        if not mask.any():
-            continue
+    axon_extents = []  # (x_lo, x_hi, y_center, z_min, z_max) per axon
 
-        # Surface voxels via erosion
-        eroded = ndimage.binary_erosion(mask)
-        surface = mask & ~eroded
-        coords_vox = np.argwhere(surface)
-        if len(coords_vox) == 0:
-            continue
+    for i, (vol, color) in enumerate(zip(volumes, colors)):
+        pts = render_axon_surface(vol, color, voxel_size, ax, x_offset=x_offset)
+        if pts is not None:
+            all_points.append(pts)
 
-        # Volume axes: (Z, X, Y) → plot as (x=X, y=Y, z=Z)
-        z_um = coords_vox[:, 0] * voxel_size
-        x_um = coords_vox[:, 1] * voxel_size
-        y_um = coords_vox[:, 2] * voxel_size
+            x_lo = pts[:, 0].min() - 1.0
+            x_hi = pts[:, 0].max() + 1.0
+            y_center = pts[:, 1].mean()
+            z_min_ax = pts[:, 2].min()
+            z_top = pts[:, 2].max()
 
-        # Subsample
-        if len(coords_vox) > 20000:
-            idx = np.random.choice(len(coords_vox), size=20000, replace=False)
-            coords_vox = coords_vox[idx]
-            z_um, x_um, y_um = z_um[idx], x_um[idx], y_um[idx]
+            axon_extents.append((x_lo, x_hi, y_center, z_min_ax, z_top))
 
-        # Color by local radius (distance transform)
-        dist = ndimage.distance_transform_edt(mask)
-        local_radii = dist[coords_vox[:, 0], coords_vox[:, 1], coords_vox[:, 2]] * voxel_size
-
-        if global_r_max > global_r_min:
-            norm = np.clip((local_radii - global_r_min) / (global_r_max - global_r_min), 0, 1)
+            # CV label
+            x_center = pts[:, 0].mean()
+            ax.text(x_center, y_center, z_top + 2,
+                    f"CoV = {rep_axons[i]['cv']:.2f}", fontsize=10,
+                    ha="center", va="bottom", color=color,
+                    fontweight="bold", zorder=10)
         else:
-            norm = np.ones(len(coords_vox)) * 0.5
+            axon_extents.append(None)
 
-        intensities = 0.25 + 0.75 * norm
-        point_sizes = 2 + 8 * norm
-        base_color = np.array(to_rgb(color))
-        point_colors = np.outer(intensities, base_color)
+        x_offset += vol.shape[1] * voxel_size + spacing_um
 
-        ax.scatter(x_um, y_um, z_um, c=point_colors, s=point_sizes,
-                   alpha=0.9, rasterized=True)
-
-        pts = np.column_stack([x_um, y_um, z_um])
-        all_points.append(pts)
-
-        # Arc length tick marks
-        z_min_ax, z_max_ax = z_um.min(), z_um.max()
-        x_center = x_um.mean()
-        y_center = y_um.mean()
-        z_range = z_max_ax - z_min_ax
-        if z_range > 0:
-            for arc_val in np.arange(arc_interval, z_range, arc_interval):
-                z_pos = z_min_ax + arc_val
-                tick_len = 1.0
-                ax.plot([x_center - tick_len, x_center + tick_len],
-                        [y_center, y_center], [z_pos, z_pos],
-                        color="black", linewidth=0.8, zorder=10)
-
-        # CV label
-        if i < len(rep_axons):
-            cv_val = rep_axons[i]["cv"]
-            ax.text(x_center, y_center, z_max_ax + 2,
-                    f"CoV = {cv_val:.2f}", fontsize=10, ha="center", va="bottom",
-                    color=color, fontweight="bold", zorder=10)
-
-        logger.info(f"  Axon {label}: {len(coords_vox)} surface pts, Z-extent: {z_range:.1f} μm")
+    # Arc length tick lines + connecting lines between axons
+    if axon_extents:
+        z_min_all = min(e[3] for e in axon_extents if e)
+        z_max_all = max(e[4] for e in axon_extents if e)
+        first_ext = next(e for e in axon_extents if e is not None)
+        tick_count = 0
+        for z_tick in np.arange(z_min_all + arc_interval, z_max_all, arc_interval):
+            tick_count += 1
+            arc_um = tick_count * arc_interval
+            for j, ext in enumerate(axon_extents):
+                if ext is None:
+                    continue
+                x_lo, x_hi, y_c, z_lo, z_hi = ext
+                if z_lo <= z_tick <= z_hi:
+                    ax.plot([x_lo, x_hi], [y_c, y_c],
+                            [z_tick, z_tick], color="black", linewidth=0.8,
+                            alpha=0.6, zorder=10)
+                    # Connect to next axon
+                    if j + 1 < len(axon_extents) and axon_extents[j + 1] is not None:
+                        ext_next = axon_extents[j + 1]
+                        if ext_next[3] <= z_tick <= ext_next[4]:
+                            ax.plot([x_hi, ext_next[0]],
+                                    [y_c, ext_next[2]],
+                                    [z_tick, z_tick], color="black",
+                                    linewidth=0.5, alpha=0.3, zorder=5)
+            # Label left of first axon
+            ax.text(first_ext[0] - 1.5, first_ext[2], z_tick,
+                    f"{arc_um:.0f}", fontsize=7, ha="right", va="center",
+                    color="black", zorder=10)
 
     if not all_points:
         return
@@ -143,26 +182,31 @@ def render_axons_3d(volume, labels, colors, voxel_size, ax, rep_axons,
     pad = 1.0
     pad_top = 8.0
 
-    ax.set_xlim(pt_min[0] - pad, pt_max[0] + pad)
+    ax.set_xlim(pt_min[0] - pad - 15, pt_max[0] + pad)
     ax.set_ylim(pt_min[1] - pad, pt_max[1] + pad)
     ax.set_zlim(pt_min[2] - pad, pt_max[2] + pad_top)
 
     extent_padded = extent.copy()
+    extent_padded[0] += 15
     extent_padded[2] += pad_top - pad
     ax.set_box_aspect(extent_padded + 2 * pad)
 
-    # Arc length arrow
-    leftmost_x = pt_min[0] - 4
-    y_mid = (pt_min[1] + pt_max[1]) / 2
-    ax.plot([leftmost_x, leftmost_x], [y_mid, y_mid],
-            [pt_min[2], pt_max[2] + 3], color="black", linewidth=1.5, zorder=10)
-    ax.plot([leftmost_x - 0.5, leftmost_x, leftmost_x + 0.5],
-            [y_mid, y_mid, y_mid],
-            [pt_max[2] + 1, pt_max[2] + 3, pt_max[2] + 1],
-            color="black", linewidth=1.5, zorder=10)
-    ax.text2D(0.265, 0.5, "Arc length [μm]", fontsize=14,
-              ha="center", va="center", color="black",
-              transform=ax.transAxes, rotation=90)
+    # Vertical arrow with label to the left of tick numbers
+    if axon_extents:
+        arrow_x = first_ext[0] - 8.0
+        arrow_y = first_ext[2]
+        ax.plot([arrow_x, arrow_x], [arrow_y, arrow_y],
+                [z_min_all, z_max_all], color="black", linewidth=1.2, zorder=10)
+        # Arrowhead
+        head_len = 1.5
+        ax.plot([arrow_x - 0.4, arrow_x, arrow_x + 0.4],
+                [arrow_y, arrow_y, arrow_y],
+                [z_max_all - head_len, z_max_all, z_max_all - head_len],
+                color="black", linewidth=1.2, zorder=10)
+        # Label
+        ax.text2D(0.27, 0.5, r"Arc length [$\mu$m]", fontsize=12,
+                  ha="center", va="center", color="black",
+                  transform=ax.transAxes, rotation=90)
 
     ax.view_init(elev=5, azim=-85)
     ax.set_axis_off()
@@ -182,38 +226,35 @@ def main():
 
     data = load_data(args.input)
     rep_axons = data["rep_axons"]
-    vol = data["volume"]
-    vol_labels = data["volume_labels"]
+    volumes = data["volumes"]
     voxel_size = data["voxel_size"]
 
-    colors = [settings.colors["example_3"],   # Purple (low CV)
+    colors = [settings.colors["example_1"],   # Green (low CV)
               settings.colors["example_2"],   # Orange (mid CV)
-              settings.colors["example_1"]]   # Green (high CV)
+              settings.colors["example_3"]]   # Purple (high CV)
 
-    # Figure: 3D (left, tall) + profiles (right)
-    fig = plt.figure(figsize=(10, 8))
-    gs = fig.add_gridspec(1, 2, width_ratios=[0.6, 1], wspace=0.05)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    width = 6
 
-    ax_vol = fig.add_subplot(gs[0, 0], projection="3d")
-    ax_vol.set_position([-0.35, -0.5, 0.55, 2.0])
+    # Figure 1: 3D rendering (tall)
+    fig_vol = plt.figure(figsize=(width, width * 2))
+    ax_vol = fig_vol.add_subplot(111, projection="3d")
+    render_axons_3d(volumes, colors, voxel_size, ax_vol, rep_axons,
+                    arc_interval=10.0)
+    vol_path = args.output.with_stem(args.output.stem + "_rendering")
+    plt.savefig(vol_path, dpi=settings.figure["dpi"], bbox_inches="tight")
+    plt.savefig(vol_path.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight")
+    plt.close()
+    logger.info(f"Saved rendering to {vol_path}")
 
-    ax_prof = fig.add_subplot(gs[0, 1])
-
-    # 3D rendering
-    if vol is not None:
-        render_axons_3d(vol, vol_labels, colors, voxel_size, ax_vol,
-                        rep_axons, arc_interval=10.0)
-    else:
-        ax_vol.text2D(0.5, 0.5, "No volume data", ha="center", va="center",
-                      transform=ax_vol.transAxes)
-
-    # Radius profiles
+    # Figure 2: Radius profiles
+    fig_prof, ax_prof = plt.subplots(figsize=(width, width))
     for i, axon in enumerate(rep_axons):
         ax_prof.plot(axon["arc_lengths"], axon["radii"], color=colors[i],
                      linewidth=1.5, label=f'CoV = {axon["cv"]:.2f}')
 
-    style_axis(ax_prof, xlabel="Arc length [μm]", ylabel="Axon radius [μm]")
-    ax_prof.legend(loc="upper right", fontsize=settings.fonts["legend_size"])
+    style_axis(ax_prof, xlabel=r"Arc length [$\mu$m]", ylabel=r"Axon radius [$\mu$m]")
+    ax_prof.legend(loc="upper right", fontsize=settings.fonts["legend_size"], ncol=2)
     max_arc = max(a["arc_lengths"].max() for a in rep_axons)
     x_max = int(np.ceil(max_arc / 10) * 10)
     ax_prof.set_xticks(range(0, x_max + 1, 10))
@@ -222,14 +263,12 @@ def main():
     ax_prof.set_ylim(ymin, ymax * 1.15)
     ax_prof.set_box_aspect(1)
 
-    fig.subplots_adjust(left=0.14, right=0.98, top=0.95, bottom=0.08)
-    ax_vol.set_position([-0.35, -0.5, 0.55, 2.0])
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(args.output, dpi=settings.figure["dpi"], bbox_inches="tight")
-    plt.savefig(args.output.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight")
+    plt.tight_layout()
+    prof_path = args.output.with_stem(args.output.stem + "_profiles")
+    plt.savefig(prof_path, dpi=settings.figure["dpi"], bbox_inches="tight")
+    plt.savefig(prof_path.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight")
     plt.close()
-    logger.info(f"Saved to {args.output}")
+    logger.info(f"Saved profiles to {prof_path}")
 
 
 if __name__ == "__main__":
