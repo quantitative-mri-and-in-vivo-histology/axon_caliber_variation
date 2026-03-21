@@ -133,8 +133,9 @@ def compute_per_slice_pdfs(data: Dict, bin_centers: np.ndarray) -> np.ndarray:
 
 
 def load_3d_radii(npz_path: Path) -> np.ndarray:
-    """Load pooled 3D radii."""
-    d = np.load(npz_path, allow_pickle=True)
+    """Load pooled 3D radii with endpoint trimming."""
+    from axonometry.profile_filters import load_and_filter_3d
+    d = load_and_filter_3d(npz_path)
     radii = d['all_radii_um']
     radii = radii[radii >= MIN_RADIUS_UM]
     return radii
