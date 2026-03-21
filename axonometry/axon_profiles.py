@@ -211,9 +211,11 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
         if np.count_nonzero(tight_binary) < 100:
             return None
 
-        # Euler step = desired sampling spacing — use every skeleton point
+        # Euler step 0.1 matches the original DeepACSON integrator resolution.
+        # Cost is negligible (~2s extra per 50 axons) vs FMM + cross-sections.
+        euler_step = 0.1
         skel_segments, maxD = fast_skeleton(tight_binary, verbose=False,
-                                            euler_step=step_voxels)
+                                            euler_step=euler_step)
         del tight_binary  # free before allocating wide crop
         if len(skel_segments) == 0:
             return None
@@ -242,6 +244,12 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
         for skel_seg in skel_segments:
             if len(skel_seg) < 3:
                 continue
+
+            if step_voxels is not None:
+                stride = max(1, round(step_voxels / euler_step))
+                skel_seg = skel_seg[::stride]
+                if len(skel_seg) < 3:
+                    continue
 
             tangent_vecs = fast_unit_tangent_vector(skel_seg)
 
@@ -400,6 +408,7 @@ def compute_axon_radius_profiles(input_path: Path,
                                  max_radius_um: float = 5.0,
                                  step_size_um: float = 0.05,
                                  max_axons: int = 0,
+                                 axon_ids: Optional[list] = None,
                                  backend: str = 'fast',
                                  n_jobs: int = 1):
     """
@@ -411,6 +420,7 @@ def compute_axon_radius_profiles(input_path: Path,
         max_radius_um: Maximum expected axon radius in micrometers (sets grid size)
         step_size_um: Step size along skeleton in micrometers
         max_axons: Maximum number of axons to process (0 = all)
+        axon_ids: If set, only process these specific axon labels
         backend: 'fast' (optimized) or 'original' (verbatim DeepACSON)
         n_jobs: Number of parallel workers (1 = serial, -1 = all cores)
     """
@@ -428,9 +438,16 @@ def compute_axon_radius_profiles(input_path: Path,
 
     # Compute bounding boxes
     bboxes = compute_bounding_boxes(volume)
-    axon_labels = sorted(bboxes.keys())
 
-    logger.info(f"Found {len(axon_labels)} axons")
+    if axon_ids is not None:
+        axon_labels = sorted([l for l in axon_ids if l in bboxes])
+        missing = set(axon_ids) - set(axon_labels)
+        if missing:
+            logger.warning(f"Axon IDs not found in volume: {missing}")
+        logger.info(f"Processing {len(axon_labels)} specified axons")
+    else:
+        axon_labels = sorted(bboxes.keys())
+        logger.info(f"Found {len(axon_labels)} axons")
 
     if max_axons > 0:
         axon_labels = axon_labels[:max_axons]

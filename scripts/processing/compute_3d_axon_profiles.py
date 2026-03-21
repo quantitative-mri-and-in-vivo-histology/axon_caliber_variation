@@ -82,6 +82,7 @@ def batch_compute(matched_files, output_root, args):
                 max_radius_um=args.max_axon_radius,
                 step_size_um=args.step_size,
                 max_axons=args.max_axons,
+                axon_ids=args.axon_ids,
                 backend=args.backend,
                 n_jobs=args.n_jobs,
             )
@@ -122,6 +123,8 @@ if __name__ == '__main__':
                         help='Step size along skeleton in μm (default: 0.05)')
     parser.add_argument('--max-axons', type=int, default=0,
                         help='Maximum axons to process (0 = all)')
+    parser.add_argument('--axon-ids', type=int, nargs='+', default=None,
+                        help='Only process these specific axon label IDs')
     parser.add_argument('--n-jobs', type=int, default=1,
                         help='Number of parallel workers (default: 1, -1 = all cores)')
     parser.add_argument('--output-suffix', type=str, default='_axon_profiles',
@@ -151,6 +154,7 @@ if __name__ == '__main__':
             max_radius_um=args.max_axon_radius,
             step_size_um=args.step_size,
             max_axons=args.max_axons,
+            axon_ids=args.axon_ids,
             backend=args.backend,
             n_jobs=args.n_jobs,
         )
