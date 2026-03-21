@@ -5,6 +5,7 @@ This is a derivative of the DeepACSON CSD (Cross-Section Decomposition) code
 from Abdollahzadeh et al. (2019, 2021).
 
 Original implementation: https://github.com/aAbdz/DeepACSON
+Source commit: https://github.com/aAbdz/DeepACSON/commit/ad894cda498139b13b8b4e9e8944d88b3e23afe4
 Citation:
     Abdollahzadeh A, Belevich I, Jokitalo E, Tohka J, Sierra A.
     "DeepACSON automated segmentation of white matter in 3D electron microscopy."
@@ -40,15 +41,15 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import sys
+
 import numpy as np
 import skfmm
-import sys
 from scipy.interpolate import RegularGridInterpolator as rgi
 from skimage.measure import label, regionprops
 
-
 # ===================================================================
-# plane_rotation.py (verbatim)
+# DeepACSON/CSD/plane_rotation.py 
 # ===================================================================
 
 def rotate_vector(vector, rot_mat):
@@ -90,7 +91,7 @@ def angle(vec1, vec2):
 
 
 # ===================================================================
-# unit_tangent_vector.py (verbatim)
+# DeepACSON/CSD/unit_tangent_vector.py 
 # ===================================================================
 
 def unit_tangent_vector(curve):
@@ -103,38 +104,8 @@ def unit_tangent_vector(curve):
 
 
 # ===================================================================
-# skeleton3D.py (verbatim except where marked)
+# DeepACSON/CSD/skeleton3D.py 
 # ===================================================================
-
-def discrete_shortest_path(D,start_point):
-
-    sz = D.shape
-    x = [0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1]
-    y = [0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1]
-    z = [1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0]
-
-    path = [start_point]
-
-    min_v = np.inf
-    while(min_v!=0):
-
-        neighbor_inx = np.array((x,y,z)).T
-        ngb = start_point + neighbor_inx
-
-        valid_ngb_inx = np.where(np.all((np.all(ngb>=0,axis=1), np.all(ngb<sz,axis=1)), axis=0))
-        ngb = ngb[valid_ngb_inx]
-
-        ngb_value = [D[tuple(i)] for i in ngb]
-
-        min_ind = np.argmin(ngb_value)
-        min_v = ngb_value[min_ind]
-
-        start_point = ngb[min_ind]
-        path.append(start_point)
-
-    path = np.array(path)
-    return path
-
 
 def pointmin(D):
 
@@ -372,12 +343,12 @@ if __name__ == "__main__":
 
 
 # ===================================================================
-# Cross-section sampling (from shape_decomposition.py, restructured)
+# Cross-section sampling (from DeepACSON/CSD/shape_decomposition.py, restructured)
 #
 # The original tangent_planes_to_zone_of_interest() combines cross-section
 # sampling with zone-of-interest tracking (Hausdorff distance, mean curve,
-# shift imposition). We extract only the cross-section sampling logic,
-# which is the part relevant to radius profiling.
+# shift imposition). We extract only the cross-section sampling logic, and
+# additionally compute the cross-section area.
 # ===================================================================
 
 def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):

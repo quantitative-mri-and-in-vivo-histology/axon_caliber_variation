@@ -9,6 +9,7 @@ improvements will be applied here incrementally, each marked with:
     # ---
 
 Original implementation: https://github.com/aAbdz/DeepACSON
+Source commit: https://github.com/aAbdz/DeepACSON/commit/ad894cda498139b13b8b4e9e8944d88b3e23afe4
 Citation:
     Abdollahzadeh A, Belevich I, Jokitalo E, Tohka J, Sierra A.
     "DeepACSON automated segmentation of white matter in 3D electron microscopy."
