@@ -75,11 +75,15 @@ def rotation_matrix_3D(vector, theta):
 def unit_normal_vector(vec1, vec2):
 
     n = np.cross(vec1, vec2)
-    if np.array_equal(n, np.array([0, 0, 0])):
-        n = vec1
-
-    s = max(np.sqrt(np.dot(n,n)), 1e-5)
-    n = n/s
+    s = np.sqrt(np.dot(n, n))
+    if s < 1e-8:
+        # Parallel or antiparallel — pick an arbitrary perpendicular axis
+        n = np.cross(vec1, np.array([1, 0, 0]))
+        s = np.sqrt(np.dot(n, n))
+        if s < 1e-8:
+            n = np.cross(vec1, np.array([0, 1, 0]))
+            s = np.sqrt(np.dot(n, n))
+    n = n / s
     return n
 
 def angle(vec1, vec2):

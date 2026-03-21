@@ -49,7 +49,7 @@ from scipy.interpolate import RegularGridInterpolator as rgi
 from skimage.measure import label, regionprops
 
 # ===================================================================
-# DeepACSON/CSD/plane_rotation.py 
+# DeepACSON/CSD/plane_rotation.py (verbatim)
 # ===================================================================
 
 def rotate_vector(vector, rot_mat):
@@ -74,14 +74,34 @@ def rotation_matrix_3D(vector, theta):
                          [2*(bd+ac), 2*(cd-ab), aa+dd-bb-cc]])
     return rot_mat
 
+# --- BUGFIX ---
+# Original code used exact zero check and clamped normalization (1e-5),
+# which fails for near-antiparallel vectors: cross product magnitude ~1e-6
+# gets divided by 1e-5, producing a non-unit axis (|n|≈0.18). This causes
+# rotation_matrix_3D (Euler-Rodrigues) to produce a scaled-down matrix
+# (factor ≈0.03), collapsing the cross-section grid and inflating measured
+# radii to the full grid size (~11 μm).
+# Fix: detect near-zero cross product and use an arbitrary perpendicular axis.
+# Original:
+#   n = np.cross(vec1, vec2)
+#   if np.array_equal(n, np.array([0, 0, 0])):
+#       n = vec1
+#   s = max(np.sqrt(np.dot(n,n)), 1e-5)
+#   n = n/s
+#   return n
+# ---
 def unit_normal_vector(vec1, vec2):
 
     n = np.cross(vec1, vec2)
-    if np.array_equal(n, np.array([0, 0, 0])):
-        n = vec1
-
-    s = max(np.sqrt(np.dot(n,n)), 1e-5)
-    n = n/s
+    s = np.sqrt(np.dot(n, n))
+    if s < 1e-8:
+        # Parallel or antiparallel — pick an arbitrary perpendicular axis
+        n = np.cross(vec1, np.array([1, 0, 0]))
+        s = np.sqrt(np.dot(n, n))
+        if s < 1e-8:
+            n = np.cross(vec1, np.array([0, 1, 0]))
+            s = np.sqrt(np.dot(n, n))
+    n = n / s
     return n
 
 def angle(vec1, vec2):
@@ -91,7 +111,7 @@ def angle(vec1, vec2):
 
 
 # ===================================================================
-# DeepACSON/CSD/unit_tangent_vector.py 
+# DeepACSON/CSD/unit_tangent_vector.py (verbatim)
 # ===================================================================
 
 def unit_tangent_vector(curve):
@@ -104,7 +124,7 @@ def unit_tangent_vector(curve):
 
 
 # ===================================================================
-# DeepACSON/CSD/skeleton3D.py 
+# DeepACSON/CSD/skeleton3D.py (verbatim)
 # ===================================================================
 
 def pointmin(D):
