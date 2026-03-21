@@ -112,7 +112,7 @@ def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
                         min_padded[2]:max_padded[2]]
         binary = (subvol == axon_label).astype(np.float64)
 
-        if np.count_nonzero(binary) < 100:
+        if np.count_nonzero(binary) == 0:
             return None
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -123,10 +123,8 @@ def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
 
         segments = []
 
-        # Trim unreliable endpoints (see fast backend comment for rationale)
-        endpoint_trim_voxels = 2
-
         for skel_seg in skel_segments:
+            # np.gradient needs >= 3 points for tangent vector computation
             if len(skel_seg) < 3:
                 continue
 
@@ -135,11 +133,6 @@ def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
                 skel_seg = skel_seg[::stride]
                 if len(skel_seg) < 3:
                     continue
-
-            # Trim endpoints
-            trim_pts = max(1, round(endpoint_trim_voxels / (step_voxels or 1.0)))
-            if len(skel_seg) > 2 * trim_pts + 2:
-                skel_seg = skel_seg[trim_pts:-trim_pts]
 
             tangent_vecs = deepacson_unit_tangent_vector(skel_seg)
 
@@ -172,18 +165,10 @@ def process_single_axon_original(volume, axon_label, bbox, voxel_size_um,
         if not segments:
             return None
 
-        # Main segment = longest
-        main_idx = max(range(len(segments)), key=lambda i: segments[i]['length_um'])
-        main = segments[main_idx]
-
         return {
             'label': axon_label,
             'segments': segments,
             'n_segments': len(segments),
-            'main_seg_idx': main_idx,
-            'mean_radius_um': np.mean(main['radii_um']),
-            'std_radius_um': np.std(main['radii_um']),
-            'length_um': main['length_um'],
         }
 
     except Exception as e:
@@ -216,7 +201,7 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
                               min_tight[2]:max_tight[2]]
         tight_binary = (tight_subvol == axon_label)
 
-        if np.count_nonzero(tight_binary) < 100:
+        if np.count_nonzero(tight_binary) == 0:
             return None
 
         # Euler step 0.1 matches the original DeepACSON integrator resolution.
@@ -247,14 +232,8 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
 
         segments = []
 
-        # Trim unreliable endpoints from each segment. The tangent vector
-        # at skeleton endpoints uses one-sided gradient estimates, producing
-        # oblique cross-section planes with inflated area. gACSON trims 20
-        # points at native 0.1 spacing (= 2 voxels); we trim the equivalent
-        # number of points after subsampling.
-        endpoint_trim_voxels = 2  # voxels to trim from each end
-
         for skel_seg in skel_segments:
+            # np.gradient needs >= 3 points for tangent vector computation
             if len(skel_seg) < 3:
                 continue
 
@@ -263,11 +242,6 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
                 skel_seg = skel_seg[::stride]
                 if len(skel_seg) < 3:
                     continue
-
-            # Trim endpoints
-            trim_pts = max(1, round(endpoint_trim_voxels / (step_voxels or 1.0)))
-            if len(skel_seg) > 2 * trim_pts + 2:
-                skel_seg = skel_seg[trim_pts:-trim_pts]
 
             tangent_vecs = fast_unit_tangent_vector(skel_seg)
 
@@ -304,19 +278,10 @@ def process_single_axon_fast(volume, axon_label, bbox, voxel_size_um,
         if not segments:
             return None
 
-        # Main segment = longest
-        main_idx = max(range(len(segments)), key=lambda i: segments[i]['length_um'])
-        main = segments[main_idx]
-
         return {
             'label': axon_label,
             'segments': segments,
             'n_segments': len(segments),
-            'main_seg_idx': main_idx,
-            'mean_radius_um': np.mean(main['radii_um']),
-            'std_radius_um': np.std(main['radii_um']),
-            'length_um': main['length_um'],
-            'maxD_voxels': float(maxD),
         }
 
     except Exception as e:
@@ -502,15 +467,13 @@ def compute_axon_radius_profiles(input_path: Path,
         logger.error("No axons were successfully processed!")
         return
 
-    # Save results
+    # Save results — raw per-segment data, no summary stats or filtering.
+    # Endpoint trimming, summary stats, and segment selection are deferred
+    # to analysis scripts where they can be adjusted without reprocessing.
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     labels = np.array([r['label'] for r in results])
     n_segments = np.array([r['n_segments'] for r in results])
-    main_seg_idx = np.array([r['main_seg_idx'] for r in results])
-    mean_radii = np.array([r['mean_radius_um'] for r in results])
-    std_radii = np.array([r['std_radius_um'] for r in results])
-    lengths = np.array([r['length_um'] for r in results])
 
     # Per-axon per-segment data (object arrays of object arrays)
     segment_radii = np.array([
@@ -536,10 +499,6 @@ def compute_axon_radius_profiles(input_path: Path,
         output_file,
         labels=labels,
         n_segments=n_segments,
-        main_seg_idx=main_seg_idx,
-        mean_radii_um=mean_radii,
-        std_radii_um=std_radii,
-        lengths_um=lengths,
         segment_radii_um=segment_radii,
         segment_skeletons_um=segment_skeletons,
         segment_lengths_um=segment_lengths,
@@ -554,16 +513,10 @@ def compute_axon_radius_profiles(input_path: Path,
 
     logger.info(f"Saved results to {output_file}")
 
-    # Summary statistics (from main segments)
-    main_radii = np.concatenate([
-        r['segments'][r['main_seg_idx']]['radii_um'] for r in results
-    ])
-    r_eff = (np.mean(main_radii**6) / np.mean(main_radii**2)) ** 0.25
-    n_main_pts = sum(len(r['segments'][r['main_seg_idx']]['radii_um']) for r in results)
-    logger.info("\nSummary Statistics (main segments):")
+    # Summary statistics
+    r_eff = (np.mean(all_radii**6) / np.mean(all_radii**2)) ** 0.25
+    logger.info("\nSummary Statistics:")
     logger.info(f"  Total axons processed: {len(results)}")
-    logger.info(f"  Total radius samples (main): {n_main_pts}")
-    logger.info(f"  Total radius samples (all): {len(all_radii)}")
-    logger.info(f"  Mean axon length: {np.mean(lengths):.2f} ± {np.std(lengths):.2f} μm")
-    logger.info(f"  r̄: {np.mean(main_radii):.4f} μm")
+    logger.info(f"  Total radius samples: {len(all_radii)}")
+    logger.info(f"  r̄: {np.mean(all_radii):.4f} μm")
     logger.info(f"  r_eff: {r_eff:.4f} μm")
