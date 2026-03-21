@@ -38,17 +38,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import sys
+
 import numpy as np
 import skfmm
-import sys
-from scipy.interpolate import RegularGridInterpolator as rgi
-from scipy.ndimage import map_coordinates
 from numba import njit
-from skimage.measure import label, regionprops
-
+from scipy.ndimage import map_coordinates
+from skimage.measure import label
 
 # ===================================================================
-# plane_rotation.py (verbatim)
+# DeepACSON/CSD/plane_rotation.py (verbatim)
 # ===================================================================
 
 def rotate_vector(vector, rot_mat):
@@ -90,7 +89,7 @@ def angle(vec1, vec2):
 
 
 # ===================================================================
-# unit_tangent_vector.py (verbatim)
+# DeepACSON/CSD/unit_tangent_vector.py (verbatim)
 # ===================================================================
 
 def unit_tangent_vector(curve):
@@ -103,38 +102,8 @@ def unit_tangent_vector(curve):
 
 
 # ===================================================================
-# skeleton3D.py (verbatim except where marked)
+# DeepACSON/CSD/skeleton3D.py
 # ===================================================================
-
-def discrete_shortest_path(D,start_point):
-
-    sz = D.shape
-    x = [0, 1,-1, 0, 0, 1, 1,-1,-1, 0, 1,-1, 0, 0, 1, 1,-1,-1, 1,-1, 0, 0, 1, 1,-1,-1]
-    y = [0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 0, 1,-1, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1]
-    z = [1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 0, 0, 0]
-
-    path = [start_point]
-
-    min_v = np.inf
-    while(min_v!=0):
-
-        neighbor_inx = np.array((x,y,z)).T
-        ngb = start_point + neighbor_inx
-
-        valid_ngb_inx = np.where(np.all((np.all(ngb>=0,axis=1), np.all(ngb<sz,axis=1)), axis=0))
-        ngb = ngb[valid_ngb_inx]
-
-        ngb_value = [D[tuple(i)] for i in ngb]
-
-        min_ind = np.argmin(ngb_value)
-        min_v = ngb_value[min_ind]
-
-        start_point = ngb[min_ind]
-        path.append(start_point)
-
-    path = np.array(path)
-    return path
-
 
 # --- MODIFIED ---
 # Reason: Runtime optimization — numba JIT compilation of pointmin.
@@ -188,149 +157,6 @@ def pointmin(D):
     J = max_D * np.ones((sz[0]+2, sz[1]+2, sz[2]+2))
     J[1:-1,1:-1,1:-1] = D
     return _pointmin_jit(D, J, Fx, Fy, Fz)
-
-
-# --- MODIFIED ---
-# Reason: Runtime optimization — fuse Euler_path + euler_shortest_path into
-#   a single @njit function. Eliminates per-step Python overhead:
-#   - No temporary array allocations (np.array, np.append, list comprehensions)
-#   - Pre-allocated path buffer instead of np.append copies
-#   - Flat (3,) coordinates instead of (1,3) with squeeze/reshape
-#   - Trilinear interpolation inlined with direct indexing
-#   The algorithm is identical: gradient descent on the (Fx,Fy,Fz) field with
-#   trilinear interpolation, stopping when reaching a source point or stalling.
-# Original: Euler_path() + euler_shortest_path() as separate Python functions
-#   (see deepacson.py for verbatim original)
-# ---
-@njit(cache=True)
-def _euler_shortest_path_jit(Fx, Fy, Fz, source_point, start_point, step_size,
-                              max_iters):
-    """JIT-compiled Euler gradient descent path tracer.
-
-    Args:
-        Fx, Fy, Fz: negative gradient field arrays (same shape)
-        source_point: (N, 3) array of source points to converge toward
-        start_point: (3,) starting coordinates
-        step_size: Euler integration step size
-        max_iters: upper bound on iterations (safety limit)
-
-    Returns:
-        path: (M, 3) array of path points
-    """
-    s0, s1, s2 = Fx.shape
-
-    # Pre-allocate path buffer (will trim at end)
-    path = np.empty((max_iters + 2, 3))
-    path[0, 0] = start_point[0]
-    path[0, 1] = start_point[1]
-    path[0, 2] = start_point[2]
-    n_path = 1
-
-    cur = np.empty(3)
-    cur[0] = start_point[0]
-    cur[1] = start_point[1]
-    cur[2] = start_point[2]
-
-    n_src = source_point.shape[0]
-
-    for itr in range(max_iters):
-        # --- Trilinear interpolation of gradient field (inlined Euler_path) ---
-        fi = int(np.floor(cur[0]))
-        fj = int(np.floor(cur[1]))
-        fk = int(np.floor(cur[2]))
-
-        # Clamp to valid range
-        ci = min(max(fi, 0), s0 - 2)
-        cj = min(max(fj, 0), s1 - 2)
-        ck = min(max(fk, 0), s2 - 2)
-
-        # Fractional distances
-        dx = cur[0] - ci
-        dy = cur[1] - cj
-        dz = cur[2] - ck
-        cx = 1.0 - dx
-        cy = 1.0 - dy
-        cz = 1.0 - dz
-
-        # Trilinear weights (8 corners)
-        w0 = cx * cy * cz
-        w1 = cx * cy * dz
-        w2 = cx * dy * cz
-        w3 = cx * dy * dz
-        w4 = dx * cy * cz
-        w5 = dx * cy * dz
-        w6 = dx * dy * cz
-        w7 = dx * dy * dz
-
-        gx = (w0 * Fx[ci, cj, ck] + w1 * Fx[ci, cj, ck+1] +
-              w2 * Fx[ci, cj+1, ck] + w3 * Fx[ci, cj+1, ck+1] +
-              w4 * Fx[ci+1, cj, ck] + w5 * Fx[ci+1, cj, ck+1] +
-              w6 * Fx[ci+1, cj+1, ck] + w7 * Fx[ci+1, cj+1, ck+1])
-        gy = (w0 * Fy[ci, cj, ck] + w1 * Fy[ci, cj, ck+1] +
-              w2 * Fy[ci, cj+1, ck] + w3 * Fy[ci, cj+1, ck+1] +
-              w4 * Fy[ci+1, cj, ck] + w5 * Fy[ci+1, cj, ck+1] +
-              w6 * Fy[ci+1, cj+1, ck] + w7 * Fy[ci+1, cj+1, ck+1])
-        gz = (w0 * Fz[ci, cj, ck] + w1 * Fz[ci, cj, ck+1] +
-              w2 * Fz[ci, cj+1, ck] + w3 * Fz[ci, cj+1, ck+1] +
-              w4 * Fz[ci+1, cj, ck] + w5 * Fz[ci+1, cj, ck+1] +
-              w6 * Fz[ci+1, cj+1, ck] + w7 * Fz[ci+1, cj+1, ck+1])
-
-        # Normalize gradient
-        mag = (gx * gx + gy * gy + gz * gz + 1e-12) ** 0.5
-        gx /= mag
-        gy /= mag
-        gz /= mag
-
-        # Step
-        nx = cur[0] - step_size * gx
-        ny = cur[1] - step_size * gy
-        nz = cur[2] - step_size * gz
-
-        # Bounds check — if out of volume, stop (matches original zeros-check)
-        if nx < 0.0 or ny < 0.0 or nz < 0.0 or nx > s0 or ny > s1 or nz > s2:
-            break
-
-        # Stall check (every 10 steps, compare to path[itr-10])
-        if itr >= 10:
-            pi = n_path - 10
-            ddx = nx - path[pi, 0]
-            ddy = ny - path[pi, 1]
-            ddz = nz - path[pi, 2]
-            movement = (ddx * ddx + ddy * ddy + ddz * ddz) ** 0.5
-            if movement < step_size:
-                break
-
-        # Append to path
-        path[n_path, 0] = nx
-        path[n_path, 1] = ny
-        path[n_path, 2] = nz
-        n_path += 1
-
-        # Distance to nearest source point
-        min_dist = 1e30
-        min_idx = 0
-        for si in range(n_src):
-            ddx = source_point[si, 0] - nx
-            ddy = source_point[si, 1] - ny
-            ddz = source_point[si, 2] - nz
-            d = (ddx * ddx + ddy * ddy + ddz * ddz) ** 0.5
-            if d < min_dist:
-                min_dist = d
-                min_idx = si
-
-        if min_dist < 10.0 * step_size:
-            # Snap to source point and stop
-            path[n_path, 0] = source_point[min_idx, 0]
-            path[n_path, 1] = source_point[min_idx, 1]
-            path[n_path, 2] = source_point[min_idx, 2]
-            n_path += 1
-            break
-
-        cur[0] = nx
-        cur[1] = ny
-        cur[2] = nz
-
-    return path[:n_path].copy()
 
 
 def euler_shortest_path(D, source_point, start_point, step_size):
@@ -660,12 +486,12 @@ if __name__ == "__main__":
 
 
 # ===================================================================
-# Cross-section sampling (from shape_decomposition.py, restructured)
+# DeepACSON/CSD/shape_decomposition.py (restructured)
 #
 # The original tangent_planes_to_zone_of_interest() combines cross-section
 # sampling with zone-of-interest tracking (Hausdorff distance, mean curve,
-# shift imposition). We extract only the cross-section sampling logic,
-# which is the part relevant to radius profiling.
+# shift imposition). We extract only the cross-section sampling logic, and
+# additionally compute the cross-section area.
 # ===================================================================
 
 # --- MODIFIED ---
@@ -739,7 +565,7 @@ def sample_cross_section(binary_vol, point, tangent_vec, g_radius, g_res):
     bw_cross_section = np.reshape(bw_cross_section, grid_shape)
 
     # Connected component at center — verbatim
-    label_cross_section, nn = label(bw_cross_section, return_num=True)
+    label_cross_section = label(bw_cross_section)
     main_lbl = np.unique(label_cross_section[cent_ball])
     main_lbl = main_lbl[np.nonzero(main_lbl)]
 
