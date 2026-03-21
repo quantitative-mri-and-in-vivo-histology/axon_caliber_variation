@@ -157,23 +157,16 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str]]:
 
     Returns list of (slice_file, axon_file, sample_name) tuples.
     """
-    EXCLUDED_SAMPLES = {'tbi_2_ipsi'}
-
     pairs = []
     for sf in sorted(data_dir.glob("*_myelin_slice_profiles.npz")):
         stem = sf.stem.replace('_slice_profiles', '')  # e.g. sham_25_ipsi_cc_myelin
         af = data_dir / f"{stem}_axon_profiles.npz"
 
-        # Extract sample base for exclusion check (e.g. sham_25_ipsi)
-        # stem is like sham_25_ipsi_cc_myelin
+        # Extract sample name (e.g. sham_25_ipsi_CC)
         parts = stem.replace('_myelin', '').rsplit('_', 1)  # ['sham_25_ipsi', 'cc']
         base_name = parts[0] if len(parts) == 2 else stem
         pop = parts[1].upper() if len(parts) == 2 else ''
         sample_name = f"{base_name}_{pop}" if pop else base_name
-
-        if base_name in EXCLUDED_SAMPLES:
-            logger.info(f"  Skipping excluded: {sample_name}")
-            continue
 
         if not af.exists():
             logger.warning(f"  No 3D file for {sf.name}, skipping")
