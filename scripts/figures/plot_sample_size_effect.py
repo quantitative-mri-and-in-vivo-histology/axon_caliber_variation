@@ -177,10 +177,12 @@ def load_rat_histograms(
     all_counts = []
     all_names = []
 
+    from axonometry.profile_filters import load_and_filter_3d
+
     for npz_file in npz_files:
         volume_name = npz_file.stem.replace('_axon_profiles', '')
-        data = np.load(npz_file, allow_pickle=True)
-        radii = data['all_radii_w_branches_um']
+        data = load_and_filter_3d(npz_file)
+        radii = data['all_radii_um']
         n_axons = len(data['labels'])
         if n_axons < min_axons:
             logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")

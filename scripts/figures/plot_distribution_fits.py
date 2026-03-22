@@ -173,6 +173,8 @@ class FitResult:
     rmse: float
     wasserstein: float = 0.0  # Wasserstein distance between empirical and fitted CDF
     pdf_values: np.ndarray = field(default_factory=lambda: np.array([]))
+    pdf_x_fine: np.ndarray = field(default_factory=lambda: np.array([]))
+    pdf_values_fine: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
 @dataclass
@@ -359,10 +361,12 @@ def load_rat_data(
     all_counts = []
     all_names = []
 
+    from axonometry.profile_filters import load_and_filter_3d
+
     for npz_file in npz_files:
         volume_name = npz_file.stem.replace('_axon_profiles', '')
-        data = np.load(npz_file, allow_pickle=True)
-        radii = data['all_radii_w_branches_um']
+        data = load_and_filter_3d(npz_file)
+        radii = data['all_radii_um']
         n_axons = len(data['labels'])
         if n_axons < min_axons:
             logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")
@@ -590,6 +594,9 @@ def fit_distribution_mle(
         hist_density = counts / (total * bin_width)
         rmse = np.sqrt(np.mean((pdf_values - hist_density) ** 2))
 
+        x_fine = np.linspace(bin_centers[0], bin_centers[-1], 500)
+        pdf_fine = dist.pdf(x_fine, *shape_params, loc=loc, scale=scale)
+
         result = FitResult(
             distribution_name=dist_name,
             n_params=len(params),
@@ -600,7 +607,9 @@ def fit_distribution_mle(
             ks_statistic=ks_stat,
             rmse=rmse,
             wasserstein=wasserstein,
-            pdf_values=pdf_values
+            pdf_values=pdf_values,
+            pdf_x_fine=x_fine,
+            pdf_values_fine=pdf_fine
         )
         np.random.set_state(saved_state)  # Restore random state
         return result
@@ -837,7 +846,7 @@ def _plot_pooled_pdf_with_fits(
     for result in ordered_results:
         color = get_dist_color(result.distribution_name)
         display_name = get_display_name(result.distribution_name)
-        ax.plot(hist_data.bin_centers, result.pdf_values, '-',
+        ax.plot(result.pdf_x_fine, result.pdf_values_fine, '-',
                 color=color, linewidth=1.5, label=display_name, zorder=2)
 
     ax.set_xlim(0, PLOT_XLIM_MAX)
@@ -858,7 +867,7 @@ def _plot_pooled_pdf_with_fits(
                  alpha=0.4, color=species_color, edgecolor='white', linewidth=0.3)
     for result in ordered_results:
         color = get_dist_color(result.distribution_name)
-        ax_inset.plot(hist_data.bin_centers, result.pdf_values, '-',
+        ax_inset.plot(result.pdf_x_fine, result.pdf_values_fine, '-',
                       color=color, linewidth=1.5)
     ax_inset.set_xlim(*inset_xlim)
     ax_inset.set_ylim(0, tail_y_max)
@@ -1045,7 +1054,7 @@ def _plot_histogram_illustrative(
         if result.distribution_name in distributions:
             color = get_dist_color(result.distribution_name)
             display_name = get_display_name(result.distribution_name)
-            ax.plot(hist_data.bin_centers, result.pdf_values, '-',
+            ax.plot(result.pdf_x_fine, result.pdf_values_fine, '-',
                     color=color, linewidth=2, label=display_name)
 
     ax.set_xlim(0, PLOT_XLIM_MAX)
@@ -1688,7 +1697,7 @@ def _plot_histogram_with_fits(
     for result in fit_results[:top_n]:
         color = get_dist_color(result.distribution_name)
         display_name = get_display_name(result.distribution_name)
-        ax.plot(hist_data.bin_centers, result.pdf_values, '-',
+        ax.plot(result.pdf_x_fine, result.pdf_values_fine, '-',
                 color=color, linewidth=2, label=display_name)
 
     ax.set_xlim(0, PLOT_XLIM_MAX)
@@ -2088,8 +2097,9 @@ def create_pooled_histogram_figure(
                       width=human_bin_width * 0.9, alpha=0.5, color=HUMAN_COLOR,
                       edgecolor='white', linewidth=0.5)
     if best_fit_human:
-        ax_human_tail.plot(human_pooled.bin_centers[tail_mask_human],
-                           best_fit_human.pdf_values[tail_mask_human], '-',
+        fine_mask = (best_fit_human.pdf_x_fine >= tail_xmin) & (best_fit_human.pdf_x_fine <= tail_xmax)
+        ax_human_tail.plot(best_fit_human.pdf_x_fine[fine_mask],
+                           best_fit_human.pdf_values_fine[fine_mask], '-',
                            color=HUMAN_COLOR, linewidth=2)
     ax_human_tail.set_xlim(tail_xmin, tail_xmax)
     ax_human_tail.set_ylim(0, None)
@@ -2104,8 +2114,9 @@ def create_pooled_histogram_figure(
                     width=rat_bin_width * 0.9, alpha=0.5, color=RAT_COLOR,
                     edgecolor='white', linewidth=0.5)
     if best_fit_rat:
-        ax_rat_tail.plot(rat_pooled.bin_centers[tail_mask_rat],
-                         best_fit_rat.pdf_values[tail_mask_rat], '-',
+        fine_mask = (best_fit_rat.pdf_x_fine >= tail_xmin) & (best_fit_rat.pdf_x_fine <= tail_xmax)
+        ax_rat_tail.plot(best_fit_rat.pdf_x_fine[fine_mask],
+                         best_fit_rat.pdf_values_fine[fine_mask], '-',
                          color=RAT_COLOR, linewidth=2)
     ax_rat_tail.set_xlim(tail_xmin, tail_xmax)
     ax_rat_tail.set_ylim(0, None)
@@ -2118,14 +2129,14 @@ def create_pooled_histogram_figure(
                 alpha=0.5, color=HUMAN_COLOR, edgecolor='white', linewidth=0.5,
                 label=f'Human CC (n={human_pooled.total_count:,})')
     if best_fit_human:
-        ax_full.plot(human_pooled.bin_centers, best_fit_human.pdf_values, '-',
+        ax_full.plot(best_fit_human.pdf_x_fine, best_fit_human.pdf_values_fine, '-',
                      color=HUMAN_COLOR, linewidth=2.5)
 
     ax_full.bar(rat_pooled.bin_centers, rat_density, width=rat_bin_width * 0.9,
                 alpha=0.5, color=RAT_COLOR, edgecolor='white', linewidth=0.5,
                 label=f'Rat WM (n={rat_pooled.total_count:,})')
     if best_fit_rat:
-        ax_full.plot(rat_pooled.bin_centers, best_fit_rat.pdf_values, '-',
+        ax_full.plot(best_fit_rat.pdf_x_fine, best_fit_rat.pdf_values_fine, '-',
                      color=RAT_COLOR, linewidth=2.5)
 
     ax_full.set_xlim(0, PLOT_XLIM_MAX)
