@@ -120,5 +120,5 @@ histogram:
 # Line plot settings
 line:
   linewidth: 0.8
-  marker_size: 5
+  marker_size: 3
   fill_alpha: 0.2
