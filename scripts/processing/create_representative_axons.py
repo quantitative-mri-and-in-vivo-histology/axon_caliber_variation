@@ -39,55 +39,64 @@ G_BAR = 0.6  # g-ratio for conduction velocity
 # ---------------------------------------------------------------------------
 
 def load_axon_data(npz_file: Path, min_length: float = 20.0):
-    """Load axon profiles from NPZ and compute CV + slowdown."""
-    data = np.load(npz_file, allow_pickle=True)
+    """Load axon profiles from NPZ and compute per-axon stats from main segment."""
+    from axonometry.profile_filters import load_and_filter_3d
 
-    mean_radii = data["mean_radii_um"]
-    std_radii = data["std_radii_um"]
-    lengths = data["lengths_um"]
-    radii_profiles = data["radii_profiles_um"]
-    skeleton_coords = data["skeleton_coords_um"]
-    labels = data["labels"]
+    raw = np.load(npz_file, allow_pickle=True)
+    filtered = load_and_filter_3d(npz_file)
 
-    # CV = std / mean
-    with np.errstate(divide="ignore", invalid="ignore"):
-        cv = np.where(mean_radii > 0, std_radii / mean_radii, np.nan)
+    labels = filtered["labels"]
+    seg_radii = filtered["segment_radii_um"]
+    seg_lengths = filtered["segment_lengths_um"]
+    # Skeleton coords (unfiltered, for PCA alignment + jump detection)
+    raw_seg_skeletons = raw["segment_skeletons_um"]
 
-    # Conduction velocity slowdown per axon
-    slowdown = np.full(len(radii_profiles), np.nan)
-    for i, profile in enumerate(radii_profiles):
-        r = np.asarray(profile)
-        r = r[r > 0]
+    n_axons = len(labels)
+    mean_radii = np.full(n_axons, np.nan)
+    std_radii = np.full(n_axons, np.nan)
+    lengths = np.full(n_axons, np.nan)
+    cv = np.full(n_axons, np.nan)
+    main_radii_profiles = [None] * n_axons
+    main_skeleton_coords = [None] * n_axons
+
+    for i in range(n_axons):
+        segs_r = seg_radii[i]
+        segs_l = seg_lengths[i]
+        if not segs_r:
+            continue
+
+        # Main segment = longest
+        main_idx = max(range(len(segs_r)), key=lambda j: segs_l[j])
+        r = np.asarray(segs_r[main_idx])
         if len(r) < 2:
             continue
-        r_bar = np.mean(r)
-        d_m = r_bar * (1 - G_BAR) / G_BAR
-        v = r * np.sqrt(np.log(1.0 + d_m / r))
-        v_eff = len(v) / np.sum(1.0 / v)  # harmonic mean
-        v_ideal = r_bar * np.sqrt(np.log(1.0 + d_m / r_bar))
-        if v_ideal > 0:
-            slowdown[i] = v_eff / v_ideal
 
-    # Valid mask for pooled stats
-    valid = (
-        np.isfinite(cv) & np.isfinite(slowdown)
-        & (mean_radii > 0) & (lengths >= min_length)
-    )
+        mean_radii[i] = np.mean(r)
+        std_radii[i] = np.std(r)
+        lengths[i] = segs_l[main_idx]
+        main_radii_profiles[i] = r
 
-    sample = npz_file.stem.replace("_axon_profiles", "")
-    logger.info(f"Loaded {npz_file.name}: {valid.sum()}/{len(labels)} valid axons")
+        if mean_radii[i] > 0:
+            cv[i] = std_radii[i] / mean_radii[i]
+
+        # Skeleton from raw (unfiltered) for PCA alignment
+        raw_segs = raw_seg_skeletons[i]
+        if len(raw_segs) > main_idx:
+            main_skeleton_coords[i] = np.asarray(raw_segs[main_idx])
+
+    valid = np.isfinite(cv) & (lengths >= min_length)
+
+    logger.info(f"Loaded {npz_file.name}: {valid.sum()}/{n_axons} valid axons")
 
     return {
         "mean_radii": mean_radii,
         "std_radii": std_radii,
         "lengths": lengths,
         "cv": cv,
-        "slowdown": slowdown,
         "labels": labels,
-        "radii_profiles": radii_profiles,
-        "skeleton_coords": skeleton_coords,
+        "radii_profiles": main_radii_profiles,
+        "skeleton_coords": main_skeleton_coords,
         "valid_mask": valid,
-        "sample": sample,
     }
 
 
@@ -104,16 +113,11 @@ def select_representative_axons(all_data, files, min_arc=50.0, max_arc=70.0):
     candidates = []
     for file_idx, d in enumerate(all_data):
         for i in range(len(d["labels"])):
-            skel = d["skeleton_coords"][i]
-            if skel is None or len(skel) < 3:
-                continue
             if not (min_arc <= d["lengths"][i] <= max_arc
                     and np.isfinite(d["cv"][i])):
                 continue
-            # Only single-segment skeletons (no big jumps between points)
-            diffs = np.diff(np.asarray(skel), axis=0)
-            max_jump = np.sqrt(np.sum(diffs**2, axis=1)).max()
-            if max_jump > 1.0:
+            skel = d["skeleton_coords"][i]
+            if skel is None or len(skel) < 3:
                 continue
             candidates.append({
                 "file_idx": file_idx,
@@ -232,15 +236,17 @@ def align_axon_to_z(crop: np.ndarray, label: int):
     logger.info(f"    Aligned: {crop.shape} → {tuple(out_shape)}  "
                 f"voxels: {n_before} → {n_after} ({100*n_after/max(n_before,1):.0f}%)")
 
-    return aligned
+    # Return transform params: aligned_vox = Vt @ (crop_vox - centroid) - out_min
+    return aligned, Vt, centroid, out_min
 
 
 def extract_aligned_axons(selected, all_data, files, zarr_dir):
     """
-    Extract each selected axon, PCA-align to Z, and return as individual
-    binary volumes (tight bounding box, label=1).
+    Extract each selected axon, PCA-align to Z, and return individual
+    binary volumes (tight bounding box, label=1) plus transformed skeletons.
     """
     volumes = []
+    aligned_skeletons = []
 
     for i, sel in enumerate(selected):
         d = all_data[sel["file_idx"]]
@@ -256,27 +262,52 @@ def extract_aligned_axons(selected, all_data, files, zarr_dir):
 
         logger.info(f"  Axon {i+1}: label={label} from {zarr_path.name}")
 
-        crop, _ = extract_axon_crop(zarr_path, label, skeleton_um)
-        aligned = align_axon_to_z(crop, label)
+        crop, bbox_min_crop = extract_axon_crop(zarr_path, label, skeleton_um)
+        aligned, Vt, centroid, out_min = align_axon_to_z(crop, label)
+
+        # Transform skeleton coords: μm → crop voxels → aligned voxels → μm
+        skel_vox = np.asarray(skeleton_um) / VOXEL_SIZE - bbox_min_crop
+        aligned_skel_vox = (skel_vox - centroid) @ Vt.T - out_min
+
+        # Ensure arc length increases with Z (flip volume + skeleton if needed)
+        if aligned_skel_vox[-1, 0] < aligned_skel_vox[0, 0]:
+            aligned = aligned[::-1, :, :]
+            aligned_skel_vox[:, 0] = aligned.shape[0] - 1 - aligned_skel_vox[:, 0]
 
         # Binary: set axon to 1
         aligned[aligned == label] = 1
         aligned[aligned != 1] = 0
         aligned = aligned.astype(np.uint8)
 
-        # Trim to tight bounding box
+        # Trim to tight bounding box (shift skeleton accordingly)
         nz = np.argwhere(aligned)
         if len(nz) > 0:
-            bbox_min = nz.min(axis=0)
-            bbox_max = nz.max(axis=0) + 1
-            aligned = aligned[bbox_min[0]:bbox_max[0],
-                              bbox_min[1]:bbox_max[1],
-                              bbox_min[2]:bbox_max[2]]
+            trim_min = nz.min(axis=0)
+            trim_max = nz.max(axis=0) + 1
+            aligned = aligned[trim_min[0]:trim_max[0],
+                              trim_min[1]:trim_max[1],
+                              trim_min[2]:trim_max[2]]
+            aligned_skel_vox = aligned_skel_vox - trim_min
+
+        # Trim skeleton endpoints to match profile trimming (20 points)
+        from axonometry.profile_filters import ENDPOINT_TRIM_POINTS
+        if len(aligned_skel_vox) > 2 * ENDPOINT_TRIM_POINTS:
+            aligned_skel_vox = aligned_skel_vox[ENDPOINT_TRIM_POINTS:-ENDPOINT_TRIM_POINTS]
+
+        # Zero out volume beyond trimmed skeleton range
+        z_start = max(0, int(aligned_skel_vox[0, 0]))
+        z_end = min(aligned.shape[0], int(aligned_skel_vox[-1, 0]) + 1)
+        aligned[:z_start] = 0
+        aligned[z_end:] = 0
+
+        # Convert to μm
+        aligned_skel_um = aligned_skel_vox * VOXEL_SIZE
 
         logger.info(f"    Final: {aligned.shape} ({aligned.nbytes / 1e6:.1f} MB)")
         volumes.append(aligned)
+        aligned_skeletons.append(aligned_skel_um)
 
-    return volumes
+    return volumes, aligned_skeletons
 
 
 # ---------------------------------------------------------------------------
@@ -309,21 +340,30 @@ def main():
 
     # Extract and align axons
     logger.info("Extracting and aligning axons...")
-    volumes = extract_aligned_axons(selected, all_data, files, args.zarr_dir)
+    volumes, aligned_skeletons = extract_aligned_axons(
+        selected, all_data, files, args.zarr_dir
+    )
 
     # Collect per-axon profile data from precomputed profiles
     rep_axons = []
-    for sel in selected:
+    for i_sel, sel in enumerate(selected):
         d = all_data[sel["file_idx"]]
         idx = sel["axon_idx"]
         profile = np.asarray(d["radii_profiles"][idx])
-        arc_lengths = np.linspace(0, d["lengths"][idx], len(profile))
+
+        # Compute arc length from aligned (trimmed) skeleton
+        skel = aligned_skeletons[i_sel]
+        diffs = np.diff(skel, axis=0)
+        cum_arc = np.concatenate([[0], np.cumsum(np.sqrt(np.sum(diffs**2, axis=1)))])
+        # Profile and skeleton should have same length after trimming
+        arc_lengths = np.linspace(0, cum_arc[-1], len(profile))
+
         rep_axons.append({
             "arc_lengths": arc_lengths,
             "radii": profile,
             "cv": d["cv"][idx],
             "mean_radius": d["mean_radii"][idx],
-            "length": d["lengths"][idx],
+            "length": cum_arc[-1],
         })
 
     # Save
@@ -332,9 +372,10 @@ def main():
         "low_cv_axon": volumes[0],
         "mid_cv_axon": volumes[1],
         "high_cv_axon": volumes[2],
-        # Per-axon profiles (re-profiled on aligned volumes)
+        # Per-axon profiles and transformed skeletons
         "arc_lengths": np.array([a["arc_lengths"] for a in rep_axons], dtype=object),
         "radii": np.array([a["radii"] for a in rep_axons], dtype=object),
+        "aligned_skeletons": np.array(aligned_skeletons, dtype=object),
         "cv": np.array([a["cv"] for a in rep_axons]),
         "mean_radii": np.array([a["mean_radius"] for a in rep_axons]),
         "lengths": np.array([a["length"] for a in rep_axons]),

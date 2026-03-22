@@ -38,6 +38,8 @@ def load_data(npz_path: Path) -> dict:
     mean_radii = data["mean_radii"]
     lengths = data["lengths"]
 
+    aligned_skeletons = data["aligned_skeletons"] if "aligned_skeletons" in data else [None] * len(cv_values)
+
     rep_axons = []
     for i in range(len(cv_values)):
         rep_axons.append({
@@ -46,13 +48,10 @@ def load_data(npz_path: Path) -> dict:
             "cv": float(cv_values[i]),
             "mean_radius": float(mean_radii[i]),
             "length": float(lengths[i]),
+            "aligned_skeleton": np.array(aligned_skeletons[i]) if aligned_skeletons[i] is not None else None,
         })
 
     volumes = [np.array(data[k]) for k in VOLUME_KEYS]
-
-    # Rotate high-CV axon 90° around Z (swap X↔Y) so diameter
-    # variations are visible from the default viewing angle
-    volumes[2] = np.swapaxes(volumes[2], 1, 2)
 
     return {
         "rep_axons": rep_axons,
@@ -62,8 +61,8 @@ def load_data(npz_path: Path) -> dict:
 
 
 def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
-                        max_points=20000):
-    """Render a single axon volume as 3D surface scatter, colored by local radius."""
+                        z_offset=0.0, max_points=20000):
+    """Render a single axon volume as 3D surface scatter, colored by per-slice radius."""
     mask = vol > 0
     if not mask.any():
         return None
@@ -75,9 +74,15 @@ def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
     if len(coords_vox) == 0:
         return None
 
-    # Color by local radius (distance transform on this small volume)
-    dist = ndimage.distance_transform_edt(mask)
-    local_radii = dist[coords_vox[:, 0], coords_vox[:, 1], coords_vox[:, 2]] * voxel_size
+    # Per-Z-slice equivalent radius (= local axon thickness)
+    slice_radius = np.zeros(vol.shape[0])
+    for z in range(vol.shape[0]):
+        n = np.count_nonzero(mask[z])
+        if n > 0:
+            slice_radius[z] = np.sqrt(n * voxel_size**2 / np.pi)
+
+    # Map each surface voxel to its slice's radius
+    local_radii = slice_radius[coords_vox[:, 0]]
 
     # Subsample
     if len(coords_vox) > max_points:
@@ -86,18 +91,18 @@ def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
         local_radii = local_radii[idx]
 
     # Volume axes: (Z, X, Y) → plot as (x=X, y=Y, z=Z)
-    z_um = coords_vox[:, 0] * voxel_size
+    z_um = coords_vox[:, 0] * voxel_size + z_offset
     x_um = coords_vox[:, 1] * voxel_size + x_offset
     y_um = coords_vox[:, 2] * voxel_size
 
-    r_min, r_max = np.percentile(local_radii, [5, 95])
+    r_min, r_max = np.percentile(local_radii[local_radii > 0], [2, 98])
     if r_max > r_min:
         norm = np.clip((local_radii - r_min) / (r_max - r_min), 0, 1)
     else:
         norm = np.ones(len(coords_vox)) * 0.5
 
-    intensities = 0.25 + 0.75 * norm
-    point_sizes = 2 + 8 * norm
+    intensities = 0.35 + 0.65 * norm
+    point_sizes = 2 + 10 * norm
     base_color = np.array(to_rgb(color))
     point_colors = np.outer(intensities, base_color)
 
@@ -116,10 +121,20 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
     x_offset = 0.0
     spacing_um = 8.0
 
+    # Align volumes so skeleton arc_length=0 maps to same Z
+    z_offsets = []
+    for axon in rep_axons:
+        skel = axon.get("aligned_skeleton")
+        if skel is not None and len(skel) > 0:
+            z_offsets.append(-skel[0, 0])  # shift so first skeleton point → Z=0
+        else:
+            z_offsets.append(0.0)
+
     axon_extents = []  # (x_lo, x_hi, y_center, z_min, z_max) per axon
 
     for i, (vol, color) in enumerate(zip(volumes, colors)):
-        pts = render_axon_surface(vol, color, voxel_size, ax, x_offset=x_offset)
+        pts = render_axon_surface(vol, color, voxel_size, ax, x_offset=x_offset,
+                                  z_offset=z_offsets[i])
         if pts is not None:
             all_points.append(pts)
 
@@ -142,35 +157,58 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
 
         x_offset += vol.shape[1] * voxel_size + spacing_um
 
-    # Arc length tick lines + connecting lines between axons
+    # Arc length tick lines using transformed skeleton coords
     if axon_extents:
-        z_min_all = min(e[3] for e in axon_extents if e)
-        z_max_all = max(e[4] for e in axon_extents if e)
         first_ext = next(e for e in axon_extents if e is not None)
-        tick_count = 0
-        for z_tick in np.arange(z_min_all + arc_interval, z_max_all, arc_interval):
-            tick_count += 1
-            arc_um = tick_count * arc_interval
-            for j, ext in enumerate(axon_extents):
+
+        # Compute Z position for each arc length tick from aligned skeletons
+        # Use the first axon's skeleton to determine which arc lengths to show
+        max_arc = max(a["length"] for a in rep_axons)
+        tick_arcs = np.arange(arc_interval, max_arc, arc_interval)
+
+        for arc_um in tick_arcs:
+            z_positions = []  # Z position of this tick for each axon
+            for j, (ext, axon) in enumerate(zip(axon_extents, rep_axons)):
                 if ext is None:
+                    z_positions.append(None)
                     continue
-                x_lo, x_hi, y_c, z_lo, z_hi = ext
-                if z_lo <= z_tick <= z_hi:
-                    ax.plot([x_lo, x_hi], [y_c, y_c],
-                            [z_tick, z_tick], color="black", linewidth=0.8,
-                            alpha=0.6, zorder=10)
-                    # Connect to next axon
-                    if j + 1 < len(axon_extents) and axon_extents[j + 1] is not None:
-                        ext_next = axon_extents[j + 1]
-                        if ext_next[3] <= z_tick <= ext_next[4]:
-                            ax.plot([x_hi, ext_next[0]],
-                                    [y_c, ext_next[2]],
-                                    [z_tick, z_tick], color="black",
-                                    linewidth=0.5, alpha=0.3, zorder=5)
+                skel = axon.get("aligned_skeleton")
+                if skel is None:
+                    z_positions.append(None)
+                    continue
+                # Cumulative arc length along aligned skeleton
+                diffs = np.diff(skel, axis=0)
+                seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
+                cum_arc = np.concatenate([[0], np.cumsum(seg_lens)])
+                if arc_um > cum_arc[-1]:
+                    z_positions.append(None)
+                    continue
+                # Interpolate Z at this arc length (apply same z_offset as rendering)
+                z_tick = float(np.interp(arc_um, cum_arc, skel[:, 0])) + z_offsets[j]
+                z_positions.append(z_tick)
+
+            # Draw tick lines and connections
+            for j, ext in enumerate(axon_extents):
+                if ext is None or z_positions[j] is None:
+                    continue
+                x_lo, x_hi, y_c, _, _ = ext
+                z_tick = z_positions[j]
+                ax.plot([x_lo, x_hi], [y_c, y_c],
+                        [z_tick, z_tick], color="black", linewidth=0.8,
+                        alpha=0.6, zorder=10)
+                # Connect to next axon
+                if j + 1 < len(axon_extents) and axon_extents[j + 1] is not None and z_positions[j + 1] is not None:
+                    ext_next = axon_extents[j + 1]
+                    ax.plot([x_hi, ext_next[0]],
+                            [y_c, ext_next[2]],
+                            [z_tick, z_positions[j + 1]], color="black",
+                            linewidth=0.5, alpha=0.3, zorder=5)
+
             # Label left of first axon
-            ax.text(first_ext[0] - 1.5, first_ext[2], z_tick,
-                    f"{arc_um:.0f}", fontsize=7, ha="right", va="center",
-                    color="black", zorder=10)
+            if z_positions[0] is not None:
+                ax.text(first_ext[0] - 1.5, first_ext[2], z_positions[0],
+                        f"{arc_um:.0f}", fontsize=7, ha="right", va="center",
+                        color="black", zorder=10)
 
     if not all_points:
         return
@@ -193,15 +231,17 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
 
     # Vertical arrow with label to the left of tick numbers
     if axon_extents:
+        z_lo_all = min(e[3] for e in axon_extents if e)
+        z_hi_all = max(e[4] for e in axon_extents if e)
         arrow_x = first_ext[0] - 8.0
         arrow_y = first_ext[2]
         ax.plot([arrow_x, arrow_x], [arrow_y, arrow_y],
-                [z_min_all, z_max_all], color="black", linewidth=1.2, zorder=10)
+                [z_lo_all, z_hi_all], color="black", linewidth=1.2, zorder=10)
         # Arrowhead
         head_len = 1.5
         ax.plot([arrow_x - 0.4, arrow_x, arrow_x + 0.4],
                 [arrow_y, arrow_y, arrow_y],
-                [z_max_all - head_len, z_max_all, z_max_all - head_len],
+                [z_hi_all - head_len, z_hi_all, z_hi_all - head_len],
                 color="black", linewidth=1.2, zorder=10)
         # Label
         ax.text2D(0.27, 0.5, r"Arc length [$\mu$m]", fontsize=12,
