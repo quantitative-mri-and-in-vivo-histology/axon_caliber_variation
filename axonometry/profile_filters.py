@@ -18,7 +18,8 @@ MIN_SEGMENT_LENGTH_UM = 0.0  # Minimum segment length in μm
 
 def load_and_filter_3d(npz_path: Union[str, Path],
                        endpoint_trim: int = ENDPOINT_TRIM_POINTS,
-                       min_segment_length_um: float = MIN_SEGMENT_LENGTH_UM) -> dict:
+                       min_segment_length_um: float = MIN_SEGMENT_LENGTH_UM,
+                       longest_segment_only: bool = False) -> dict:
     """
     Load 3D axon profile data and apply quality filters.
 
@@ -27,6 +28,7 @@ def load_and_filter_3d(npz_path: Union[str, Path],
         endpoint_trim: Number of points to trim from each segment end
                        (mitigates unreliable tangent vectors at endpoints)
         min_segment_length_um: Minimum segment length in μm to include
+        longest_segment_only: If True, keep only the longest segment per axon
 
     Returns:
         dict with:
@@ -54,7 +56,14 @@ def load_and_filter_3d(npz_path: Union[str, Path],
         axon_segs_r = []
         axon_segs_l = []
 
-        for j in range(len(segs_r)):
+        if longest_segment_only and len(segs_l) > 0:
+            lengths = [float(sl) for sl in segs_l]
+            best = int(np.argmax(lengths))
+            iter_indices = [best]
+        else:
+            iter_indices = range(len(segs_r))
+
+        for j in iter_indices:
             r = np.asarray(segs_r[j])
             seg_len = float(segs_l[j])
 

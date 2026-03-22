@@ -133,9 +133,9 @@ def compute_per_slice_pdfs(data: Dict, bin_centers: np.ndarray) -> np.ndarray:
 
 
 def load_3d_radii(npz_path: Path) -> np.ndarray:
-    """Load pooled 3D radii with endpoint trimming."""
+    """Load pooled 3D radii with endpoint trimming, longest segment only."""
     from axonometry.profile_filters import load_and_filter_3d
-    d = load_and_filter_3d(npz_path)
+    d = load_and_filter_3d(npz_path, longest_segment_only=True)
     radii = d['all_radii_um']
     radii = radii[radii >= MIN_RADIUS_UM]
     return radii
@@ -677,6 +677,22 @@ def main():
     logger.info(f"\nSaved to {args.output}")
 
     # Save metadata
+    per_roi = []
+    for m2d, m3d, sn in all_metrics:
+        r_arith_ratio = m2d['r_arith_median'] / m3d['r_arith'] if m3d['r_arith'] > 0 else float('nan')
+        r_eff_ratio = m2d['r_eff_median'] / m3d['r_eff'] if m3d['r_eff'] > 0 else float('nan')
+        per_roi.append({
+            'name': sn,
+            '2d_r_arith_median': round(float(m2d['r_arith_median']), 4),
+            '3d_r_arith': round(float(m3d['r_arith']), 4),
+            'r_arith_ratio_2d_over_3d': round(float(r_arith_ratio), 4),
+            '2d_r_eff_median': round(float(m2d['r_eff_median']), 4),
+            '3d_r_eff': round(float(m3d['r_eff']), 4),
+            'r_eff_ratio_2d_over_3d': round(float(r_eff_ratio), 4),
+        })
+    # Sort by largest r_eff difference
+    per_roi.sort(key=lambda x: abs(1 - x['r_eff_ratio_2d_over_3d']), reverse=True)
+
     meta = {
         'n_pairs': len(all_metrics),
         'radius_type': args.radius_type,
@@ -686,6 +702,7 @@ def main():
             'min_solidity': MIN_SOLIDITY,
             'min_axon_count_per_slice': MIN_AXON_COUNT,
         },
+        'per_roi': per_roi,
         'monte_carlo': {
             'n_iterations': mc_results['n_iterations'],
             'n_rois': mc_results['n_rois'],
