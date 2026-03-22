@@ -82,8 +82,12 @@ fonts:
   label_size: 8        # xlabel, ylabel
   tick_size: 7         # tick labels
   title_size: 10       # panel titles (if used)
-  legend_size: 7        # legend text
+  legend_size: 6        # legend text
   weight: "normal"
+
+# Legend settings
+legend:
+  frame_linewidth: 0.5
 
 # Grid and frame settings
 grid:
@@ -115,6 +119,6 @@ histogram:
 
 # Line plot settings
 line:
-  linewidth: 2
+  linewidth: 0.8
   marker_size: 5
   fill_alpha: 0.2

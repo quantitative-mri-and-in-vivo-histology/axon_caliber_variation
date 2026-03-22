@@ -183,6 +183,12 @@ def style_axis(
     else:
         ax.grid(False)
 
+    # Apply legend frame width
+    legend_settings = settings._settings.get('legend', {})
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.get_frame().set_linewidth(legend_settings.get('frame_linewidth', 0.5))
+
     # Apply frame/box settings
     if frame_settings.get('box', True):
         for spine in ax.spines.values():

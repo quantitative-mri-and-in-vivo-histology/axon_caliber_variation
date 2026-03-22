@@ -102,7 +102,7 @@ def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
         norm = np.ones(len(coords_vox)) * 0.5
 
     intensities = 0.35 + 0.65 * norm
-    point_sizes = 0.1 + 0.4 * norm
+    point_sizes = 0.05 + 0.2 * norm
     base_color = np.array(to_rgb(color))
     point_colors = np.outer(intensities, base_color)
 
@@ -122,8 +122,10 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
     spacing_um = 2.0
 
     axon_extents = []  # (x_lo, x_hi, y_center, z_min, z_max) per axon
+    x_offsets = []
 
     for i, (vol, color) in enumerate(zip(volumes, colors)):
+        x_offsets.append(x_offset)
         pts = render_axon_surface(vol, color, voxel_size, ax, x_offset=x_offset)
         if pts is not None:
             all_points.append(pts)
@@ -135,13 +137,6 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
             z_top = pts[:, 2].max()
 
             axon_extents.append((x_lo, x_hi, y_center, z_min_ax, z_top))
-
-            # CV label
-            x_center = pts[:, 0].mean()
-            ax.text(x_center, y_center, z_top + 2,
-                    f"CoV = {rep_axons[i]['cv']:.2f}", fontsize=settings.fonts["legend_size"],
-                    ha="center", va="bottom", color=color,
-                    fontweight="bold", zorder=10)
         else:
             axon_extents.append(None)
 
@@ -151,13 +146,11 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
     if axon_extents:
         first_ext = next(e for e in axon_extents if e is not None)
 
-        # Compute Z position for each arc length tick from aligned skeletons
-        # Use the first axon's skeleton to determine which arc lengths to show
         max_arc = max(a["length"] for a in rep_axons)
         tick_arcs = np.arange(arc_interval, max_arc, arc_interval)
 
         for arc_um in tick_arcs:
-            z_positions = []  # Z position of this tick for each axon
+            z_positions = []
             for j, (ext, axon) in enumerate(zip(axon_extents, rep_axons)):
                 if ext is None:
                     z_positions.append(None)
@@ -166,7 +159,6 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                 if skel is None:
                     z_positions.append(None)
                     continue
-                # Cumulative arc length along aligned skeleton
                 skel = np.asarray(skel, dtype=np.float64)
                 diffs = np.diff(skel, axis=0)
                 seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
@@ -174,32 +166,48 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                 if arc_um > cum_arc[-1]:
                     z_positions.append(None)
                     continue
-                # Interpolate Z at this arc length
                 z_tick = float(np.interp(arc_um, cum_arc, skel[:, 0]))
                 z_positions.append(z_tick)
 
-            # Draw tick lines and connections
+            # Draw short tick lines centered on skeleton X at this arc length
+            tick_half = 1.5  # μm half-width
+            tick_centers = []
             for j, ext in enumerate(axon_extents):
                 if ext is None or z_positions[j] is None:
+                    tick_centers.append(None)
                     continue
-                x_lo, x_hi, y_c, _, _ = ext
+                _, _, y_c, _, _ = ext
+                skel = np.asarray(rep_axons[j].get("aligned_skeleton"), dtype=np.float64)
+                diffs = np.diff(skel, axis=0)
+                seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
+                cum_arc = np.concatenate([[0], np.cumsum(seg_lens)])
+                # Skeleton X (axis 1 in volume) at this arc length + render x_offset
+                x_center = float(np.interp(arc_um, cum_arc, skel[:, 1])) + x_offsets[j]
+                tick_centers.append(x_center)
                 z_tick = z_positions[j]
-                ax.plot([x_lo, x_hi], [y_c, y_c],
-                        [z_tick, z_tick], color="black", linewidth=0.8,
-                        alpha=0.6, zorder=10)
+                ax.plot([x_center - tick_half, x_center + tick_half], [y_c, y_c],
+                        [z_tick, z_tick], color="black", linewidth=0.5,
+                        alpha=0.5, zorder=10)
                 # Connect to next axon
                 if j + 1 < len(axon_extents) and axon_extents[j + 1] is not None and z_positions[j + 1] is not None:
-                    ext_next = axon_extents[j + 1]
-                    ax.plot([x_hi, ext_next[0]],
-                            [y_c, ext_next[2]],
-                            [z_tick, z_positions[j + 1]], color="black",
-                            linewidth=0.5, alpha=0.3, zorder=5)
+                    # Will draw connection after computing next tick_center
+                    pass
 
-            # Label left of first axon
+            # Draw connections between axons
+            for j in range(len(tick_centers) - 1):
+                if tick_centers[j] is not None and tick_centers[j + 1] is not None:
+                    y_c = axon_extents[j][2]
+                    y_c_next = axon_extents[j + 1][2]
+                    ax.plot([tick_centers[j] + tick_half, tick_centers[j + 1] - tick_half],
+                            [y_c, y_c_next],
+                            [z_positions[j], z_positions[j + 1]], color="black",
+                            linewidth=0.3, alpha=0.2, zorder=5)
+
+            # Tick label left of first axon
             if z_positions[0] is not None:
                 ax.text(first_ext[0] - 1.5, first_ext[2], z_positions[0],
-                        f"{arc_um:.0f}", fontsize=settings.fonts["tick_size"], ha="right", va="center",
-                        color="black", zorder=10)
+                        f"{arc_um:.0f}", fontsize=settings.fonts["tick_size"] / 2,
+                        ha="right", va="center", color="black", zorder=10)
 
     if not all_points:
         return
@@ -209,39 +217,14 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
     pt_max = all_pts.max(axis=0)
     extent = pt_max - pt_min
     pad = 1.0
-    pad_top = 8.0
 
-    left_pad = 12  # space for arrow + tick labels
-    ax.set_xlim(pt_min[0] - pad - left_pad, pt_max[0] + pad)
+    ax.set_xlim(pt_min[0] - pad, pt_max[0] + pad)
     ax.set_ylim(pt_min[1] - pad, pt_max[1] + pad)
-    ax.set_zlim(pt_min[2] - pad, pt_max[2] + pad_top)
-
-    # Equal scaling so rendering is true to size
-    box_extent = np.array([
-        extent[0] + 2 * pad + left_pad,
-        extent[1] + 2 * pad,
-        extent[2] + pad + pad_top,
-    ])
-    ax.set_box_aspect(box_extent)
-
-    # Vertical arrow with label to the left of tick numbers
-    if axon_extents:
-        z_lo_all = min(e[3] for e in axon_extents if e)
-        z_hi_all = max(e[4] for e in axon_extents if e)
-        arrow_x = first_ext[0] - 8.0
-        arrow_y = first_ext[2]
-        ax.plot([arrow_x, arrow_x], [arrow_y, arrow_y],
-                [z_lo_all, z_hi_all], color="black", linewidth=1.2, zorder=10)
-        # Arrowhead
-        head_len = 1.5
-        ax.plot([arrow_x - 0.4, arrow_x, arrow_x + 0.4],
-                [arrow_y, arrow_y, arrow_y],
-                [z_hi_all - head_len, z_hi_all, z_hi_all - head_len],
-                color="black", linewidth=1.2, zorder=10)
-        # Label
-        ax.text2D(0.24, 0.5, r"Arc length [$\mu$m]", fontsize=settings.fonts["label_size"],
-                  ha="center", va="center", color="black",
-                  transform=ax.transAxes, rotation=90)
+    ax.set_zlim(pt_min[2] - pad, pt_max[2] + pad)
+    # Shrink Y in box aspect since elev≈0 makes it nearly invisible
+    box = extent + 2 * pad
+    box[1] = box[0]  # make Y same as X so it doesn't inflate the projection
+    ax.set_box_aspect(box)
 
     ax.view_init(elev=5, azim=-85)
     ax.set_axis_off()
@@ -273,12 +256,12 @@ def main():
 
     # Figure 1: 3D rendering (tall)
     fig_vol = plt.figure(figsize=(60 * mm, 115 * mm))
-    ax_vol = fig_vol.add_axes([0.15, -0.35, 0.83, 1.3], projection="3d")
+    ax_vol = fig_vol.add_axes([0, 0, 1, 1], projection="3d")
     render_axons_3d(volumes, colors, voxel_size, ax_vol, rep_axons,
                     arc_interval=10.0)
     vol_path = args.output.with_stem(args.output.stem + "_rendering")
-    plt.savefig(vol_path, dpi=settings.figure["dpi"])
-    plt.savefig(vol_path.with_suffix(".png"), dpi=300)
+    plt.savefig(vol_path, dpi=800)
+    plt.savefig(vol_path.with_suffix(".png"), dpi=800)
     plt.close()
     logger.info(f"Saved rendering to {vol_path}")
 
@@ -286,7 +269,7 @@ def main():
     fig_prof, ax_prof = plt.subplots(figsize=(60 * mm, 57 * mm))
     for i, axon in enumerate(rep_axons):
         ax_prof.plot(axon["arc_lengths"], axon["radii"], color=colors[i],
-                     linewidth=1.0, label=f'CoV = {axon["cv"]:.2f}')
+                     linewidth=settings.line["linewidth"], label=f'CoV = {axon["cv"]:.2f}')
 
     style_axis(ax_prof, xlabel=r"Arc length [$\mu$m]", ylabel=r"Axon radius [$\mu$m]")
     ax_prof.legend(loc="upper right", fontsize=settings.fonts["legend_size"], handlelength=1.5)
