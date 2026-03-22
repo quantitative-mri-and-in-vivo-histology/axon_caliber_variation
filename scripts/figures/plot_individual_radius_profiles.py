@@ -252,10 +252,8 @@ def main():
               settings.colors["example_3"]]   # Purple (high CV)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    mm = 1 / 25.4  # mm to inches
-
     # Figure 1: 3D rendering (tall)
-    fig_vol = plt.figure(figsize=(60 * mm, 115 * mm))
+    fig_vol = plt.figure(figsize=(5, 9))
     ax_vol = fig_vol.add_axes([0, 0, 1, 1], projection="3d")
     render_axons_3d(volumes, colors, voxel_size, ax_vol, rep_axons,
                     arc_interval=10.0)
@@ -266,7 +264,7 @@ def main():
     logger.info(f"Saved rendering to {vol_path}")
 
     # Figure 2: Radius profiles
-    fig_prof, ax_prof = plt.subplots(figsize=(60 * mm, 57 * mm))
+    fig_prof, ax_prof = plt.subplots(figsize=(5, 4.5))
     for i, axon in enumerate(rep_axons):
         ax_prof.plot(axon["arc_lengths"], axon["radii"], color=colors[i],
                      linewidth=settings.line["linewidth"], label=f'CoV = {axon["cv"]:.2f}')

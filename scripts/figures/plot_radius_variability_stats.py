@@ -98,8 +98,7 @@ def main():
     font_s = settings.fonts
     line_s = settings.line
 
-    mm = 1 / 25.4
-    fig, axes = plt.subplots(1, 3, figsize=(184 * mm, 58 * mm))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
     ax_hist, ax_cv, ax_vel = axes
 
     # --- (a) CV histogram ---
