@@ -79,15 +79,11 @@ panel_labels:
 
 # Font settings
 fonts:
-  label_size: 8        # xlabel, ylabel
-  tick_size: 7         # tick labels
-  title_size: 10       # panel titles (if used)
-  legend_size: 6        # legend text
+  label_size: 14       # xlabel, ylabel
+  tick_size: 12        # tick labels
+  title_size: 16       # panel titles (if used)
+  legend_size: 11      # legend text
   weight: "normal"
-
-# Legend settings
-legend:
-  frame_linewidth: 0.5
 
 # Grid and frame settings
 grid:
@@ -96,13 +92,7 @@ grid:
 
 frame:
   box: true            # Show all four spines (box around plot)
-  linewidth: 0.5       # Spine linewidth
-
-# Tick settings
-ticks:
-  width: 0.5
-  length: 3
-  direction: "out"
+  linewidth: 1.0       # Spine linewidth
 
 # Error bar settings
 error_bars:
@@ -119,6 +109,6 @@ histogram:
 
 # Line plot settings
 line:
-  linewidth: 0.8
-  marker_size: 3
+  linewidth: 2
+  marker_size: 5
   fill_alpha: 0.2
