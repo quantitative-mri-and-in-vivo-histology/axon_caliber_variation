@@ -104,7 +104,7 @@ def load_axon_data(npz_file: Path, min_length: float = 20.0):
 # Axon selection
 # ---------------------------------------------------------------------------
 
-def select_representative_axons(all_data, files, min_arc=50.0, max_arc=70.0):
+def select_representative_axons(all_data, files, min_arc=55.0, max_arc=70.0):
     """
     Pick 3 representative axons at the 10th, 50th, and 90th CV percentile.
 
@@ -136,9 +136,9 @@ def select_representative_axons(all_data, files, min_arc=50.0, max_arc=70.0):
     n = len(candidates)
 
     selected = [
-        candidates[int(n * 0.001)],   # 10th percentile CV
-        candidates[int(n * 0.5)],   # 50th percentile CV
-        candidates[int(n * 0.99)],   # 90th percentile CV
+        candidates[int(n * 0.001)],  
+        candidates[int(n * 0.5)],  
+        candidates[int(n * 0.99)],  
     ]
 
     for s in selected:
@@ -294,11 +294,12 @@ def extract_aligned_axons(selected, all_data, files, zarr_dir):
         if len(aligned_skel_vox) > 2 * ENDPOINT_TRIM_POINTS:
             aligned_skel_vox = aligned_skel_vox[ENDPOINT_TRIM_POINTS:-ENDPOINT_TRIM_POINTS]
 
-        # Zero out volume beyond trimmed skeleton range
+        # Zero out volume beyond trimmed skeleton range and shift so Z=0
+        # at first skeleton point
         z_start = max(0, int(aligned_skel_vox[0, 0]))
         z_end = min(aligned.shape[0], int(aligned_skel_vox[-1, 0]) + 1)
-        aligned[:z_start] = 0
-        aligned[z_end:] = 0
+        aligned = aligned[z_start:z_end]
+        aligned_skel_vox[:, 0] -= z_start
 
         # Convert to μm
         aligned_skel_um = aligned_skel_vox * VOXEL_SIZE
@@ -352,7 +353,7 @@ def main():
         profile = np.asarray(d["radii_profiles"][idx])
 
         # Compute arc length from aligned (trimmed) skeleton
-        skel = aligned_skeletons[i_sel]
+        skel = np.asarray(aligned_skeletons[i_sel], dtype=np.float64)
         diffs = np.diff(skel, axis=0)
         cum_arc = np.concatenate([[0], np.cumsum(np.sqrt(np.sum(diffs**2, axis=1)))])
         # Profile and skeleton should have same length after trimming

@@ -63,8 +63,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/processing/compute_2d_slice_profiles.py",
             "args": [
-                "data/raw/rat/HM/*_myelin.zarr",
-                "data/processed/rat/HM/",
+                "data/raw/rat/hm/*_myelin.zarr",
+                "data/processed/rat/hm/",
                 "--n-jobs", "-1"
             ],
             "console": "integratedTerminal",
@@ -80,9 +80,9 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/processing/compute_3d_axon_profiles.py",
             "args": [
-                "data/raw/rat/LM/*_myelin.zarr",
-                "data/processed/rat/LM/",
-                "--max-axon-radius", "5.0",
+                "data/raw/rat/lm/*_myelin.zarr",
+                "data/processed/rat/lm/",
+                "--max-axon-radius", "10.0",
                 "--step-size", "0.05",
                 "--n-jobs", "-1",
                 "--output-suffix", "_axon_profiles"
@@ -103,9 +103,9 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/processing/compute_3d_axon_profiles.py",
             "args": [
-                "data/raw/rat/HM/*_myelin.zarr",
-                "data/processed/rat/HM/",
-                "--max-axon-radius", "5.0",
+                "data/raw/rat/hm/*_myelin.zarr",
+                "data/processed/rat/hm/",
+                "--max-axon-radius", "10.0",
                 "--step-size", "0.05",
                 "--n-jobs", "-1",
                 "--output-suffix", "_axon_profiles"
@@ -309,7 +309,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/exploratory/monte_carlo_2d_sampling.py",
             "args": [
-                "data/processed/LM/*_slice_profiles.npz",
+                "data/processed/lm/*_slice_profiles.npz",
                 "fig/monte_carlo_2d_sampling.png",
                 "--n-iterations",
                 "1000",
@@ -351,7 +351,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_radius_vs_nucleus_distance.py",
             "args": [
-                "data/processed/LM/sham_25_ipsi_axon_profiles.npz",
+                "data/processed/lm/sham_25_ipsi_axon_profiles.npz",
                 "fig/sham_25_ipsi_radius_vs_nucleus.png",
                 "--nucleus-dir",
                 "data/raw",
@@ -371,7 +371,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_radius_vs_nucleus_distance.py",
             "args": [
-                "data/processed/LM/*_axon_profiles.npz",
+                "data/processed/lm/*_axon_profiles.npz",
                 "fig/lm_radius_vs_nucleus_pooled.png",
                 "--nucleus-dir",
                 "data/raw",
@@ -392,7 +392,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_neighbor_profile_correlation.py",
             "args": [
-                "data/processed/LM/*_axon_profiles.npz",
+                "data/processed/lm/*_axon_profiles.npz",
                 "fig/neighbor_profile_correlation_LM_pooled.png",
                 "--d-max",
                 "10.0",
@@ -416,7 +416,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/exploratory/spatial_correlations/analyze_local_area_correlation.py",
             "args": [
-                "data/processed/LM/sham_25_ipsi_axon_profiles.npz",
+                "data/processed/lm/sham_25_ipsi_axon_profiles.npz",
                 "fig/local_area_correlation_LM_sham25.png",
                 "--max-points",
                 "100000"

@@ -157,8 +157,14 @@ def style_axis(
     grid_settings = settings.grid
     frame_settings = settings.frame
 
-    # Apply tick label size
-    ax.tick_params(labelsize=fonts.get('tick_size', 12))
+    # Apply tick settings
+    tick_settings = settings._settings.get('ticks', {})
+    ax.tick_params(
+        labelsize=fonts.get('tick_size', 12),
+        width=tick_settings.get('width', 0.5),
+        length=tick_settings.get('length', 3),
+        direction=tick_settings.get('direction', 'out'),
+    )
 
     # Apply axis labels if provided
     if xlabel is not None:

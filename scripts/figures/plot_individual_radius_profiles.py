@@ -48,7 +48,7 @@ def load_data(npz_path: Path) -> dict:
             "cv": float(cv_values[i]),
             "mean_radius": float(mean_radii[i]),
             "length": float(lengths[i]),
-            "aligned_skeleton": np.array(aligned_skeletons[i]) if aligned_skeletons[i] is not None else None,
+            "aligned_skeleton": np.asarray(aligned_skeletons[i], dtype=np.float64) if aligned_skeletons[i] is not None else None,
         })
 
     volumes = [np.array(data[k]) for k in VOLUME_KEYS]
@@ -61,7 +61,7 @@ def load_data(npz_path: Path) -> dict:
 
 
 def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
-                        z_offset=0.0, max_points=20000):
+                        max_points=20000):
     """Render a single axon volume as 3D surface scatter, colored by per-slice radius."""
     mask = vol > 0
     if not mask.any():
@@ -91,7 +91,7 @@ def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
         local_radii = local_radii[idx]
 
     # Volume axes: (Z, X, Y) → plot as (x=X, y=Y, z=Z)
-    z_um = coords_vox[:, 0] * voxel_size + z_offset
+    z_um = coords_vox[:, 0] * voxel_size
     x_um = coords_vox[:, 1] * voxel_size + x_offset
     y_um = coords_vox[:, 2] * voxel_size
 
@@ -102,7 +102,7 @@ def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
         norm = np.ones(len(coords_vox)) * 0.5
 
     intensities = 0.35 + 0.65 * norm
-    point_sizes = 2 + 10 * norm
+    point_sizes = 0.1 + 0.4 * norm
     base_color = np.array(to_rgb(color))
     point_colors = np.outer(intensities, base_color)
 
@@ -119,22 +119,12 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
     """Render individual axon volumes side by side along X in 3D."""
     all_points = []
     x_offset = 0.0
-    spacing_um = 8.0
-
-    # Align volumes so skeleton arc_length=0 maps to same Z
-    z_offsets = []
-    for axon in rep_axons:
-        skel = axon.get("aligned_skeleton")
-        if skel is not None and len(skel) > 0:
-            z_offsets.append(-skel[0, 0])  # shift so first skeleton point → Z=0
-        else:
-            z_offsets.append(0.0)
+    spacing_um = 2.0
 
     axon_extents = []  # (x_lo, x_hi, y_center, z_min, z_max) per axon
 
     for i, (vol, color) in enumerate(zip(volumes, colors)):
-        pts = render_axon_surface(vol, color, voxel_size, ax, x_offset=x_offset,
-                                  z_offset=z_offsets[i])
+        pts = render_axon_surface(vol, color, voxel_size, ax, x_offset=x_offset)
         if pts is not None:
             all_points.append(pts)
 
@@ -149,7 +139,7 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
             # CV label
             x_center = pts[:, 0].mean()
             ax.text(x_center, y_center, z_top + 2,
-                    f"CoV = {rep_axons[i]['cv']:.2f}", fontsize=10,
+                    f"CoV = {rep_axons[i]['cv']:.2f}", fontsize=settings.fonts["legend_size"],
                     ha="center", va="bottom", color=color,
                     fontweight="bold", zorder=10)
         else:
@@ -177,14 +167,15 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                     z_positions.append(None)
                     continue
                 # Cumulative arc length along aligned skeleton
+                skel = np.asarray(skel, dtype=np.float64)
                 diffs = np.diff(skel, axis=0)
                 seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
                 cum_arc = np.concatenate([[0], np.cumsum(seg_lens)])
                 if arc_um > cum_arc[-1]:
                     z_positions.append(None)
                     continue
-                # Interpolate Z at this arc length (apply same z_offset as rendering)
-                z_tick = float(np.interp(arc_um, cum_arc, skel[:, 0])) + z_offsets[j]
+                # Interpolate Z at this arc length
+                z_tick = float(np.interp(arc_um, cum_arc, skel[:, 0]))
                 z_positions.append(z_tick)
 
             # Draw tick lines and connections
@@ -207,7 +198,7 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
             # Label left of first axon
             if z_positions[0] is not None:
                 ax.text(first_ext[0] - 1.5, first_ext[2], z_positions[0],
-                        f"{arc_um:.0f}", fontsize=7, ha="right", va="center",
+                        f"{arc_um:.0f}", fontsize=settings.fonts["tick_size"], ha="right", va="center",
                         color="black", zorder=10)
 
     if not all_points:
@@ -220,14 +211,18 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
     pad = 1.0
     pad_top = 8.0
 
-    ax.set_xlim(pt_min[0] - pad - 15, pt_max[0] + pad)
+    left_pad = 12  # space for arrow + tick labels
+    ax.set_xlim(pt_min[0] - pad - left_pad, pt_max[0] + pad)
     ax.set_ylim(pt_min[1] - pad, pt_max[1] + pad)
     ax.set_zlim(pt_min[2] - pad, pt_max[2] + pad_top)
 
-    extent_padded = extent.copy()
-    extent_padded[0] += 15
-    extent_padded[2] += pad_top - pad
-    ax.set_box_aspect(extent_padded + 2 * pad)
+    # Equal scaling so rendering is true to size
+    box_extent = np.array([
+        extent[0] + 2 * pad + left_pad,
+        extent[1] + 2 * pad,
+        extent[2] + pad + pad_top,
+    ])
+    ax.set_box_aspect(box_extent)
 
     # Vertical arrow with label to the left of tick numbers
     if axon_extents:
@@ -244,7 +239,7 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                 [z_hi_all - head_len, z_hi_all, z_hi_all - head_len],
                 color="black", linewidth=1.2, zorder=10)
         # Label
-        ax.text2D(0.27, 0.5, r"Arc length [$\mu$m]", fontsize=12,
+        ax.text2D(0.24, 0.5, r"Arc length [$\mu$m]", fontsize=settings.fonts["label_size"],
                   ha="center", va="center", color="black",
                   transform=ax.transAxes, rotation=90)
 
@@ -274,27 +269,27 @@ def main():
               settings.colors["example_3"]]   # Purple (high CV)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    width = 6
+    mm = 1 / 25.4  # mm to inches
 
     # Figure 1: 3D rendering (tall)
-    fig_vol = plt.figure(figsize=(width, width * 2))
-    ax_vol = fig_vol.add_subplot(111, projection="3d")
+    fig_vol = plt.figure(figsize=(60 * mm, 115 * mm))
+    ax_vol = fig_vol.add_axes([0.15, -0.35, 0.83, 1.3], projection="3d")
     render_axons_3d(volumes, colors, voxel_size, ax_vol, rep_axons,
                     arc_interval=10.0)
     vol_path = args.output.with_stem(args.output.stem + "_rendering")
-    plt.savefig(vol_path, dpi=settings.figure["dpi"], bbox_inches="tight")
-    plt.savefig(vol_path.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight")
+    plt.savefig(vol_path, dpi=settings.figure["dpi"])
+    plt.savefig(vol_path.with_suffix(".png"), dpi=300)
     plt.close()
     logger.info(f"Saved rendering to {vol_path}")
 
     # Figure 2: Radius profiles
-    fig_prof, ax_prof = plt.subplots(figsize=(width, width))
+    fig_prof, ax_prof = plt.subplots(figsize=(60 * mm, 57 * mm))
     for i, axon in enumerate(rep_axons):
         ax_prof.plot(axon["arc_lengths"], axon["radii"], color=colors[i],
-                     linewidth=1.5, label=f'CoV = {axon["cv"]:.2f}')
+                     linewidth=1.0, label=f'CoV = {axon["cv"]:.2f}')
 
     style_axis(ax_prof, xlabel=r"Arc length [$\mu$m]", ylabel=r"Axon radius [$\mu$m]")
-    ax_prof.legend(loc="upper right", fontsize=settings.fonts["legend_size"], ncol=2)
+    ax_prof.legend(loc="upper right", fontsize=settings.fonts["legend_size"], handlelength=1.5)
     max_arc = max(a["arc_lengths"].max() for a in rep_axons)
     x_max = int(np.ceil(max_arc / 10) * 10)
     ax_prof.set_xticks(range(0, x_max + 1, 10))
@@ -302,11 +297,10 @@ def main():
     ymin, ymax = ax_prof.get_ylim()
     ax_prof.set_ylim(ymin, ymax * 1.15)
     ax_prof.set_box_aspect(1)
-
     plt.tight_layout()
     prof_path = args.output.with_stem(args.output.stem + "_profiles")
-    plt.savefig(prof_path, dpi=settings.figure["dpi"], bbox_inches="tight")
-    plt.savefig(prof_path.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight")
+    plt.savefig(prof_path, dpi=settings.figure["dpi"], bbox_inches="tight", pad_inches=0.02)
+    plt.savefig(prof_path.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight", pad_inches=0.02)
     plt.close()
     logger.info(f"Saved profiles to {prof_path}")
 
