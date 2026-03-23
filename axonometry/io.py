@@ -12,7 +12,7 @@ Supports:
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Union, Optional, Any
+from typing import Dict, List, Set, Tuple, Union, Optional, Any
 
 import numpy as np
 import h5py
@@ -519,3 +519,174 @@ def write_ome_zarr_pyramid(
     logger.info(f"  Wrote OME-Zarr ({num_levels} levels) to {output_path}")
 
     return output_path
+
+
+# ── Profile loading ───────────────────────────────────────────────────────
+
+MASKS_DIR = Path('data/masks')
+ENDPOINT_TRIM_POINTS = 20    # Points to trim from each segment end
+MIN_SEGMENT_LENGTH_UM = 0.0  # Minimum segment length in μm
+
+
+def find_excluded_labels(npz_path: Path) -> Set[int]:
+    """Auto-discover excluded labels file for a given NPZ.
+
+    Maps NPZ path to exclusion file by replacing the data/processed prefix
+    with data/masks and stripping suffixes like _axon_profiles, _slice_profiles,
+    _myelin.
+
+    Example:
+        data/processed/rat/lm/sham_25_ipsi_cc_myelin_axon_profiles.npz
+        -> data/masks/rat/lm/sham_25_ipsi_cc_excluded_labels.json
+    """
+    stem = npz_path.stem
+    for suffix in ('_axon_profiles', '_slice_profiles', '_myelin'):
+        stem = stem.replace(suffix, '')
+    try:
+        rel = npz_path.parent.relative_to(Path('data/processed'))
+    except ValueError:
+        return set()
+    excl_path = MASKS_DIR / rel / f"{stem}_excluded_labels.json"
+    if excl_path.exists():
+        with open(excl_path) as f:
+            labels = json.load(f)
+        logger.info(f"Excluding {len(labels)} labels from {excl_path.name}")
+        return set(labels)
+    return set()
+
+
+def load_3d_profiles(npz_path: Union[str, Path],
+                     endpoint_trim: int = ENDPOINT_TRIM_POINTS,
+                     min_segment_length_um: float = MIN_SEGMENT_LENGTH_UM,
+                     exclude_labels: bool = True) -> dict:
+    """
+    Load 3D axon profile data and apply quality filters.
+
+    Args:
+        npz_path: Path to axon_profiles.npz file
+        endpoint_trim: Number of points to trim from each segment end
+        min_segment_length_um: Minimum segment length in μm to include
+        exclude_labels: If True, auto-discover and exclude labels from
+                        corresponding file in data/masks/
+
+    Returns:
+        dict with:
+            labels: (N,) axon label IDs
+            segment_radii_um: per-axon list of per-segment radius arrays
+            segment_lengths_um: per-axon list of per-segment lengths
+            all_radii_um: pooled radii from all filtered segments
+            n_segments: (N,) number of segments per axon after filtering
+            voxel_size_um: scalar
+    """
+    npz_path = Path(npz_path)
+    data = np.load(npz_path, allow_pickle=True)
+
+    labels = data['labels']
+    raw_seg_radii = data['segment_radii_um']
+    raw_seg_lengths = data['segment_lengths_um']
+    voxel_size = float(data['voxel_size_um'])
+
+    excluded = find_excluded_labels(npz_path) if exclude_labels else set()
+
+    filtered_seg_radii = []
+    filtered_seg_lengths = []
+    all_radii = []
+    kept_labels = []
+
+    for i in range(len(labels)):
+        if int(labels[i]) in excluded:
+            continue
+        segs_r = raw_seg_radii[i]
+        segs_l = raw_seg_lengths[i]
+        axon_segs_r = []
+        axon_segs_l = []
+
+        for j in range(len(segs_r)):
+            r = np.asarray(segs_r[j])
+            seg_len = float(segs_l[j])
+
+            if seg_len < min_segment_length_um:
+                continue
+
+            if endpoint_trim > 0 and len(r) > 2 * endpoint_trim:
+                r = r[endpoint_trim:-endpoint_trim]
+
+            if len(r) == 0:
+                continue
+
+            axon_segs_r.append(r)
+            axon_segs_l.append(seg_len)
+            all_radii.append(r)
+
+        filtered_seg_radii.append(axon_segs_r)
+        filtered_seg_lengths.append(axon_segs_l)
+        kept_labels.append(labels[i])
+
+    all_radii = np.concatenate(all_radii).astype(np.float64) if all_radii else np.array([], dtype=np.float64)
+
+    return {
+        'labels': np.array(kept_labels),
+        'segment_radii_um': filtered_seg_radii,
+        'segment_lengths_um': filtered_seg_lengths,
+        'all_radii_um': all_radii,
+        'n_segments': np.array([len(s) for s in filtered_seg_radii]),
+        'voxel_size_um': voxel_size,
+    }
+
+
+def load_2d_profiles(npz_path: Union[str, Path],
+                     radius_type: str = 'circular',
+                     min_radius_um: float = 0.0,
+                     max_eccentricity: float = 1.0,
+                     min_solidity: float = 0.5,
+                     exclude_labels: bool = True) -> dict:
+    """
+    Load 2D slice profiles and apply quality filters.
+
+    Args:
+        npz_path: Path to slice_profiles.npz file
+        radius_type: Which radius measure ('circular' or 'minor')
+        min_radius_um: Minimum radius filter
+        max_eccentricity: Maximum eccentricity filter
+        min_solidity: Minimum solidity filter
+        exclude_labels: If True, auto-discover and exclude labels
+
+    Returns:
+        dict with:
+            radii: filtered radius array
+            slice_index: corresponding slice indices
+            n_slices: total number of slices
+    """
+    npz_path = Path(npz_path)
+    d = np.load(npz_path)
+
+    radius_key = f'radius_{radius_type}_um'
+    radii = d[radius_key]
+    slices = d['slice_index']
+    ecc = d['eccentricity']
+    sol = d['solidity']
+    labels = d['label']
+
+    excluded = find_excluded_labels(npz_path) if exclude_labels else set()
+
+    mask = (
+        (radii >= min_radius_um) &
+        (ecc <= max_eccentricity) &
+        (sol >= min_solidity)
+    )
+    if excluded:
+        label_mask = np.isin(labels, list(excluded), invert=True)
+        mask &= label_mask
+
+    radii = radii[mask]
+    slices = slices[mask]
+    n_slices = int(d['n_slices'])
+
+    logger.info(f"  {npz_path.stem}: {mask.sum():,}/{len(mask):,} instances after filter "
+                f"({mask.sum()/len(mask)*100:.1f}%)")
+
+    return {
+        'radii': radii,
+        'slice_index': slices,
+        'n_slices': n_slices,
+    }

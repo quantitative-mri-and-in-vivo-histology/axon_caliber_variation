@@ -361,11 +361,11 @@ def load_rat_data(
     all_counts = []
     all_names = []
 
-    from axonometry.profile_filters import load_and_filter_3d
+    from axonometry.io import load_3d_profiles
 
     for npz_file in npz_files:
         volume_name = npz_file.stem.replace('_axon_profiles', '')
-        data = load_and_filter_3d(npz_file)
+        data = load_3d_profiles(npz_file)
         radii = data['all_radii_um']
         n_axons = len(data['labels'])
         if n_axons < min_axons:

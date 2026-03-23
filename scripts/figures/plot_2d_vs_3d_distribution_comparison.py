@@ -47,38 +47,12 @@ MAX_RADIUS_UM = 5.0       # Max radius for histograms
 # ── Data loading ───────────────────────────────────────────────────────────
 
 def load_and_filter_2d(npz_path: Path, radius_type: str = 'circular') -> Dict:
-    """
-    Load 2D slice profiles and apply quality filters.
-
-    Returns dict with filtered arrays: slice_index, radius, and per-slice stats.
-    """
-    d = np.load(npz_path)
-
-    radius_key = f'radius_{radius_type}_um'
-    radii = d[radius_key]
-    slices = d['slice_index']
-    ecc = d['eccentricity']
-    sol = d['solidity']
-
-    # Apply quality filters
-    mask = (
-        (radii >= MIN_RADIUS_UM) &
-        (ecc <= MAX_ECCENTRICITY) &
-        (sol >= MIN_SOLIDITY)
-    )
-    radii = radii[mask]
-    slices = slices[mask]
-
-    n_slices = int(d['n_slices'])
-
-    logger.info(f"  {npz_path.stem}: {mask.sum():,}/{len(mask):,} instances after filter "
-                f"({mask.sum()/len(mask)*100:.1f}%)")
-
-    return {
-        'radii': radii,
-        'slice_index': slices,
-        'n_slices': n_slices,
-    }
+    """Load 2D slice profiles with quality and label exclusion filters."""
+    from axonometry.io import load_2d_profiles
+    return load_2d_profiles(npz_path, radius_type=radius_type,
+                            min_radius_um=MIN_RADIUS_UM,
+                            max_eccentricity=MAX_ECCENTRICITY,
+                            min_solidity=MIN_SOLIDITY)
 
 
 def compute_per_slice_stats(data: Dict) -> Dict:
@@ -133,9 +107,9 @@ def compute_per_slice_pdfs(data: Dict, bin_centers: np.ndarray) -> np.ndarray:
 
 
 def load_3d_radii(npz_path: Path) -> np.ndarray:
-    """Load pooled 3D radii with endpoint trimming, longest segment only."""
-    from axonometry.profile_filters import load_and_filter_3d
-    d = load_and_filter_3d(npz_path, longest_segment_only=True)
+    """Load pooled 3D radii with endpoint trimming."""
+    from axonometry.io import load_3d_profiles
+    d = load_3d_profiles(npz_path)
     radii = d['all_radii_um']
     radii = radii[radii >= MIN_RADIUS_UM]
     return radii

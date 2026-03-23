@@ -40,10 +40,10 @@ G_BAR = 0.6  # g-ratio for conduction velocity
 
 def load_axon_data(npz_file: Path, min_length: float = 20.0):
     """Load axon profiles from NPZ and compute per-axon stats from main segment."""
-    from axonometry.profile_filters import load_and_filter_3d
+    from axonometry.io import load_3d_profiles
 
     raw = np.load(npz_file, allow_pickle=True)
-    filtered = load_and_filter_3d(npz_file)
+    filtered = load_3d_profiles(npz_file)
 
     labels = filtered["labels"]
     seg_radii = filtered["segment_radii_um"]
@@ -290,7 +290,7 @@ def extract_aligned_axons(selected, all_data, files, zarr_dir):
             aligned_skel_vox = aligned_skel_vox - trim_min
 
         # Trim skeleton endpoints to match profile trimming (20 points)
-        from axonometry.profile_filters import ENDPOINT_TRIM_POINTS
+        from axonometry.io import ENDPOINT_TRIM_POINTS
         if len(aligned_skel_vox) > 2 * ENDPOINT_TRIM_POINTS:
             aligned_skel_vox = aligned_skel_vox[ENDPOINT_TRIM_POINTS:-ENDPOINT_TRIM_POINTS]
 

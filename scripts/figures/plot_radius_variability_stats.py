@@ -30,14 +30,14 @@ def load_axon_stats(data_dir: Path, min_length_um: float = 5.0) -> dict:
 
     Each segment longer than min_length_um contributes one entry.
     """
-    from axonometry.profile_filters import load_and_filter_3d
+    from axonometry.io import load_3d_profiles
 
     all_mean_radii = []
     all_cv = []
     all_slowdown = []
 
     for npz_path in sorted(data_dir.glob("*_axon_profiles.npz")):
-        filtered = load_and_filter_3d(npz_path)
+        filtered = load_3d_profiles(npz_path)
 
         for i in range(len(filtered['labels'])):
             seg_radii = filtered['segment_radii_um'][i]

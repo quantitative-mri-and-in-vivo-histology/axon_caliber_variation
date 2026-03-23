@@ -80,11 +80,11 @@
             "request": "launch",
             "program": "${workspaceFolder}/scripts/processing/compute_3d_axon_profiles.py",
             "args": [
-                "data/raw/rat/lm/*_myelin.zarr",
+                "data/raw/rat/lm/tbi_2_*_cg_myelin.zarr",
                 "data/processed/rat/lm/",
                 "--max-axon-radius", "10.0",
                 "--step-size", "0.05",
-                "--n-jobs", "-1",
+                "--n-jobs", "12",
                 "--output-suffix", "_axon_profiles"
             ],
             "console": "integratedTerminal",
@@ -183,8 +183,8 @@
             "program": "${workspaceFolder}/scripts/figures/plot_2d_vs_3d_distribution_comparison.py",
             "args": [
                 "--data-dir", "data/processed/rat/lm",
-                "--output", "fig/main/distribution_2d_vs_3d_comparison.svg",
-                "--radius-type", "minor",
+                "--output", "fig/main/distribution_2d_vs_3d_comparison_circ.svg",
+                "--radius-type", "circular",
                 "--min-radius", "0.0",
                 "--max-eccentricity", "1.0",
                 "--min-solidity", "0.5"
@@ -481,7 +481,7 @@
             }
         },
         {
-            "name": "Visualization: ROI BBoxes (LM tbi_28_contra extracted)",
+            "name": "Visualization: ROI BBoxes (LM tbi_28_cotbi_2_ipsi_CGntra extracted)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/visualization/visualize_3d.py",
