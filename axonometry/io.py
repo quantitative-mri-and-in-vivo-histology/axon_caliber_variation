@@ -183,95 +183,64 @@ def load_volume_with_metadata(
     return volume, voxel_size_tuple, metadata
 
 
-def construct_output_path(
-    input_file: Path,
-    output_root: Path,
-    output_suffix: str = "",
-    organize_by_microscopy: bool = False
-) -> Path:
+def load_volume_downsampled(mat_file, downsample: int = 4) -> Tuple[np.ndarray, Dict]:
     """
-    Construct output path for batch processing with proper filename extraction.
-
-    When organize_by_microscopy is True:
-    - Extracts condition (Sham/TBI) from parent directory name (converted to lowercase)
-    - Extracts microscopy type (HM/LM) from filename prefix
-    - Organizes output into microscopy type subdirectories
-    - Removes "_myelinated_axons" suffix from filename (redundant)
-    - Constructs filename as: {condition}_{ratid}_{hemisphere}{suffix}.npz (all lowercase)
-
-    Example:
-        Input: data/raw/Sham_25_ipsi/HM_25_ipsi_myelinated_axons.mat
-        Output (organize_by_microscopy=True, suffix='_axon_profiles'):
-               data/processed/HM/sham_25_ipsi_axon_profiles.npz
-        Output (organize_by_microscopy=False):
-               data/processed/Sham_25_ipsi/HM_25_ipsi_myelinated_axons_axon_profiles.npz
+    Load labeled volume with optional downsampling.
 
     Args:
-        input_file: Input .mat file path
-        output_root: Output root directory
-        output_suffix: Suffix to append before .npz extension (e.g., '_axon_profiles')
-        organize_by_microscopy: If True, organize by microscopy type (HM/LM) subdirectories
+        mat_file: Path to .mat file
+        downsample: Downsampling factor (default: 4)
 
     Returns:
-        Full output path for the processed file
+        Tuple of (volume, metadata)
     """
-    filename = input_file.stem  # e.g., "HM_25_ipsi_myelinated_axons"
-    parent_name = input_file.parent.name  # e.g., "Sham_25_ipsi"
+    logger.info(f"Loading volume: {mat_file.name}")
 
-    if not organize_by_microscopy:
-        # Standard mode: preserve directory structure
-        output_dir = output_root / parent_name
-        output_filename = filename + output_suffix + '.npz'
+    volume_full, _, _ = load_volume_with_metadata(mat_file, voxel_size_override=None)
+    logger.info(f"Original shape: {volume_full.shape}")
+
+    if downsample > 1:
+        volume = volume_full[::downsample, ::downsample, ::downsample].copy()
+        logger.info(f"Downsampled to: {volume.shape} (factor {downsample})")
     else:
-        # Microscopy organization mode
-        # Extract microscopy type from filename prefix
-        if filename.startswith('HM_'):
-            microscopy_type = 'HM'
-            # Remove HM_ prefix: "HM_25_ipsi_myelinated_axons" -> "25_ipsi_myelinated_axons"
-            filename_without_microscopy = filename[3:]
-        elif filename.startswith('LM_'):
-            microscopy_type = 'LM'
-            # Remove LM_ prefix: "LM_25_ipsi_myelinated_axons" -> "25_ipsi_myelinated_axons"
-            filename_without_microscopy = filename[3:]
-        else:
-            # No recognized prefix - fallback to standard mode
-            logger.warning(f"Filename '{filename}' does not start with HM_ or LM_. "
-                         f"Using standard directory structure.")
-            output_dir = output_root / parent_name
-            output_filename = filename + output_suffix + '.npz'
-            return output_dir / output_filename
+        volume = volume_full.copy()
 
-        # Remove "_myelinated_axons" suffix if present
-        # "25_ipsi_myelinated_axons" -> "25_ipsi"
-        if filename_without_microscopy.endswith('_myelinated_axons'):
-            filename_base = filename_without_microscopy[:-len('_myelinated_axons')]
-        else:
-            filename_base = filename_without_microscopy
+    metadata = {
+        'original_shape': list(volume_full.shape),
+        'downsampled_shape': list(volume.shape),
+        'downsample_factor': downsample,
+        'source_file': str(mat_file)
+    }
 
-        # Extract condition from parent directory name
-        # Parent name format: "{Condition}_{RatID}_{Hemisphere}"
-        # e.g., "Sham_25_ipsi" -> condition = "sham"
-        # e.g., "TBI_49_contra" -> condition = "tbi"
-        parent_parts = parent_name.split('_')
-        if len(parent_parts) >= 1:
-            condition = parent_parts[0].lower()  # "sham" or "tbi" (lowercase)
-        else:
-            # Fallback if parent doesn't match expected pattern
-            logger.warning(f"Parent directory '{parent_name}' doesn't match expected format. "
-                         f"Cannot extract condition.")
-            condition = ""
+    return volume, metadata
 
-        # Construct output directory: output_root / microscopy_type
-        output_dir = output_root / microscopy_type
 
-        # Construct filename: {condition}_{ratid}_{hemisphere}{suffix}.npz
-        # Example: "sham_25_ipsi_axon_profiles.npz" or "tbi_24_ipsi_slice_profiles.npz"
-        if condition:
-            output_filename = f"{condition}_{filename_base}{output_suffix}.npz"
-        else:
-            output_filename = f"{filename_base}{output_suffix}.npz"
+def precompute_axon_voxels(volume: np.ndarray) -> Dict[int, np.ndarray]:
+    """
+    Pre-compute voxel coordinates for all axons.
 
-    return output_dir / output_filename
+    Args:
+        volume: Labeled volume array
+
+    Returns:
+        Dictionary mapping axon label to voxel coordinates
+    """
+    logger.info("Pre-computing voxel coordinates for all axons...")
+    import time
+    start = time.time()
+
+    all_coords = np.argwhere(volume > 0)
+    axon_voxels = {}
+    for coord in all_coords:
+        axon_id = volume[tuple(coord)]
+        if axon_id not in axon_voxels:
+            axon_voxels[axon_id] = []
+        axon_voxels[axon_id].append(coord)
+
+    axon_voxels = {aid: np.array(coords) for aid, coords in axon_voxels.items()}
+    logger.info(f"Pre-computed coordinates for {len(axon_voxels)} axons in {time.time() - start:.2f}s")
+
+    return axon_voxels
 
 
 def resample_to_isotropic(volume: np.ndarray,

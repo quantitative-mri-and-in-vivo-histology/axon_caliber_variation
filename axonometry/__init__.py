@@ -12,9 +12,10 @@ from .io import (
     load_mat_volume,
     load_json_metadata,
     load_volume_with_metadata,
+    load_volume_downsampled,
+    precompute_axon_voxels,
     parse_voxel_size,
     resample_to_isotropic,
-    construct_output_path,
     load_zarr_volume,
     write_ome_zarr_pyramid,
     downsample_nearest,
@@ -22,17 +23,10 @@ from .io import (
 )
 
 from .populations import (
-    load_volume_downsampled,
-    precompute_axon_voxels,
     compute_all_orientations,
     classify_by_dominant_axis,
     filter_sparse_axons,
     create_populations,
-)
-
-from .morphometry import (
-    assign_myelin_to_axons,
-    compute_fiber_metrics,
 )
 
 from .plotting import (
@@ -52,7 +46,10 @@ __all__ = [
     "load_volume_with_metadata",
     "parse_voxel_size",
     "resample_to_isotropic",
-    "construct_output_path",
+    "load_zarr_volume",
+    "write_ome_zarr_pyramid",
+    "downsample_nearest",
+    "downsample_mean",
     # Populations
     "load_volume_downsampled",
     "precompute_axon_voxels",
@@ -60,14 +57,6 @@ __all__ = [
     "classify_by_dominant_axis",
     "filter_sparse_axons",
     "create_populations",
-    # Morphometry
-    "assign_myelin_to_axons",
-    "compute_fiber_metrics",
-    # Zarr I/O
-    "load_zarr_volume",
-    "write_ome_zarr_pyramid",
-    "downsample_nearest",
-    "downsample_mean",
     # Plotting
     "load_plot_settings",
     "PlotSettings",

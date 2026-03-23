@@ -12,70 +12,7 @@ import numpy as np
 from scipy.spatial import KDTree
 from tqdm import tqdm
 
-from .io import load_volume_with_metadata
-
 logger = logging.getLogger(__name__)
-
-
-def load_volume_downsampled(mat_file, downsample: int = 4) -> Tuple[np.ndarray, Dict]:
-    """
-    Load labeled volume with optional downsampling.
-
-    Args:
-        mat_file: Path to .mat file
-        downsample: Downsampling factor (default: 4)
-
-    Returns:
-        Tuple of (volume, metadata)
-    """
-    logger.info(f"Loading volume: {mat_file.name}")
-
-    # Use axonometry library instead of direct h5py
-    volume_full, _, _ = load_volume_with_metadata(mat_file, voxel_size_override=None)
-    logger.info(f"Original shape: {volume_full.shape}")
-
-    if downsample > 1:
-        volume = volume_full[::downsample, ::downsample, ::downsample].copy()
-        logger.info(f"Downsampled to: {volume.shape} (factor {downsample})")
-    else:
-        volume = volume_full.copy()
-
-    metadata = {
-        'original_shape': list(volume_full.shape),
-        'downsampled_shape': list(volume.shape),
-        'downsample_factor': downsample,
-        'source_file': str(mat_file)
-    }
-
-    return volume, metadata
-
-
-def precompute_axon_voxels(volume: np.ndarray) -> Dict[int, np.ndarray]:
-    """
-    Pre-compute voxel coordinates for all axons.
-
-    Args:
-        volume: Labeled volume array
-
-    Returns:
-        Dictionary mapping axon label to voxel coordinates
-    """
-    logger.info("Pre-computing voxel coordinates for all axons...")
-    import time
-    start = time.time()
-
-    all_coords = np.argwhere(volume > 0)
-    axon_voxels = {}
-    for coord in all_coords:
-        axon_id = volume[tuple(coord)]
-        if axon_id not in axon_voxels:
-            axon_voxels[axon_id] = []
-        axon_voxels[axon_id].append(coord)
-
-    axon_voxels = {aid: np.array(coords) for aid, coords in axon_voxels.items()}
-    logger.info(f"Pre-computed coordinates for {len(axon_voxels)} axons in {time.time() - start:.2f}s")
-
-    return axon_voxels
 
 
 def compute_axon_orientation_from_coords(coords: np.ndarray) -> Tuple[np.ndarray, float, int]:
