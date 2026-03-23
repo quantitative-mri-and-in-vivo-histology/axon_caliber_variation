@@ -36,9 +36,6 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 # ── Constants ──────────────────────────────────────────────────────────────
-MIN_RADIUS_UM = 0.0       # Minimum radius filter (disabled)
-MAX_ECCENTRICITY = 0.9    # Max eccentricity (filter elongated non-axon cross-sections)
-MIN_SOLIDITY = 0.5        # Min solidity (filter irregular shapes)
 MIN_AXON_COUNT = 30       # Min axons per slice for valid statistics
 BIN_WIDTH_UM = 0.02       # Histogram bin width in μm
 MAX_RADIUS_UM = 5.0       # Max radius for histograms
@@ -49,10 +46,7 @@ MAX_RADIUS_UM = 5.0       # Max radius for histograms
 def load_and_filter_2d(npz_path: Path, radius_type: str = 'circular') -> Dict:
     """Load 2D slice profiles with quality and label exclusion filters."""
     from axonometry.io import load_2d_profiles
-    return load_2d_profiles(npz_path, radius_type=radius_type,
-                            min_radius_um=MIN_RADIUS_UM,
-                            max_eccentricity=MAX_ECCENTRICITY,
-                            min_solidity=MIN_SOLIDITY)
+    return load_2d_profiles(npz_path, radius_type=radius_type)
 
 
 def compute_per_slice_stats(data: Dict) -> Dict:
@@ -110,9 +104,7 @@ def load_3d_radii(npz_path: Path) -> np.ndarray:
     """Load pooled 3D radii with endpoint trimming."""
     from axonometry.io import load_3d_profiles
     d = load_3d_profiles(npz_path)
-    radii = d['all_radii_um']
-    radii = radii[radii >= MIN_RADIUS_UM]
-    return radii
+    return d['all_radii_um']
 
 
 def compute_r_eff(radii: np.ndarray) -> float:
@@ -318,7 +310,7 @@ def plot_wasserstein_panel(ax, pairs: List[Tuple[Path, Path, str]],
     parts = ax.violinplot([within_distances, between_distances], positions=[1, 2],
                            showmeans=False, showmedians=True, widths=0.7)
 
-    colors = [settings.colors['binary_a'], settings.colors['binary_b']]
+    colors = [settings.colors['category_a_violin'], settings.colors['category_b_violin']]
     for i, pc in enumerate(parts['bodies']):
         pc.set_facecolor(colors[i])
         pc.set_alpha(0.8)
@@ -512,12 +504,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='Compare 2D vs 3D radius distributions (new canonical data format)')
 
-    parser.add_argument('--data-dir', type=Path, default=Path('data/processed/rat/LM'),
+    parser.add_argument('--data-dir', type=Path, default=Path('data/processed/rat/lm'),
                         help='Directory containing slice and axon profiles')
     parser.add_argument('--output', type=Path,
                         default=Path('fig/main/distribution_2d_vs_3d_comparison.svg'),
                         help='Output figure path')
-    parser.add_argument('--radius-type', type=str, default='circular',
+    parser.add_argument('--radius-type', type=str, default='minor',
                         choices=['circular', 'minor'], help='Radius type to use')
     parser.add_argument('--x-max', type=float, default=1.5,
                         help='Max x-axis for PDF panel')
@@ -527,21 +519,7 @@ def main():
     parser.add_argument('--representative', type=str, default=None,
                         help='Stem of representative sample for panel (a), '
                              'e.g. "sham_25_ipsi_cg_myelin" (default: auto-select)')
-    parser.add_argument('--min-radius', type=float, default=MIN_RADIUS_UM,
-                        help=f'Minimum radius filter in μm (default: {MIN_RADIUS_UM})')
-    parser.add_argument('--max-eccentricity', type=float, default=MAX_ECCENTRICITY,
-                        help=f'Max eccentricity filter (default: {MAX_ECCENTRICITY})')
-    parser.add_argument('--min-solidity', type=float, default=MIN_SOLIDITY,
-                        help=f'Min solidity filter (default: {MIN_SOLIDITY})')
-
     args = parser.parse_args()
-
-    # Override module-level constants with CLI args
-    import sys
-    mod = sys.modules[__name__]
-    mod.MIN_RADIUS_UM = args.min_radius
-    mod.MAX_ECCENTRICITY = args.max_eccentricity
-    mod.MIN_SOLIDITY = args.min_solidity
 
     logger.info("=" * 80)
     logger.info("2D vs 3D Distribution Comparison (v2 — canonical data)")
@@ -638,7 +616,7 @@ def main():
     plot_scatter_panel(axes[1, 1], all_metrics, 'r_eff', mc_results)
 
     plt.tight_layout(w_pad=2.5, h_pad=2.5)
-    add_panel_labels(axes)
+    # add_panel_labels(axes)  # Labels added in manuscript layout
 
     # Save
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -671,9 +649,6 @@ def main():
         'n_pairs': len(all_metrics),
         'radius_type': args.radius_type,
         'filters': {
-            'min_radius_um': MIN_RADIUS_UM,
-            'max_eccentricity': MAX_ECCENTRICITY,
-            'min_solidity': MIN_SOLIDITY,
             'min_axon_count_per_slice': MIN_AXON_COUNT,
         },
         'per_roi': per_roi,

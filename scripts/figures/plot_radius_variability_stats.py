@@ -25,49 +25,61 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 
-def load_axon_stats(data_dir: Path, min_length_um: float = 5.0) -> dict:
-    """Load per-segment statistics from all axon profile NPZ files in data_dir.
+def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
+    """Load per-axon statistics from all axon profile NPZ files in data_dir.
 
-    Each segment longer than min_length_um contributes one entry.
+    Radius samples from all segments of each axon are pooled.
+    Only axons with total length >= min_length_um are included.
     """
     from axonometry.io import load_3d_profiles
 
     all_mean_radii = []
     all_cv = []
     all_slowdown = []
+    total_axons = 0
 
     for npz_path in sorted(data_dir.glob("*_axon_profiles.npz")):
         filtered = load_3d_profiles(npz_path)
+        total_axons += len(filtered['labels'])
 
         for i in range(len(filtered['labels'])):
             seg_radii = filtered['segment_radii_um'][i]
             seg_lengths = filtered['segment_lengths_um'][i]
-            for radii, seg_length in zip(seg_radii, seg_lengths):
-                r = np.asarray(radii, dtype=np.float64)
-                if len(r) < 3 or seg_length < min_length_um:
-                    continue
+            if not seg_radii:
+                continue
 
-                mean_r = np.mean(r)
-                if mean_r <= 0:
-                    continue
+            total_len = sum(float(sl) for sl in seg_lengths)
+            if total_len < min_length_um:
+                continue
 
-                cv = np.std(r) / mean_r
-                # Conduction velocity slowdown: v_actual/v_ideal = <r^2> / <r>^2
-                r2_mean = np.mean(r ** 2)
-                r_mean2 = mean_r ** 2
-                slowdown = r_mean2 / r2_mean if r2_mean > 0 else 1.0
+            # Pool all radius samples across segments
+            all_r = np.concatenate([np.asarray(r, dtype=np.float64) for r in seg_radii])
+            if len(all_r) < 3:
+                continue
 
-                all_mean_radii.append(mean_r)
-                all_cv.append(cv)
-                all_slowdown.append(slowdown)
+            mean_r = np.mean(all_r)
+            if mean_r <= 0:
+                continue
+
+            cv = np.std(all_r) / mean_r
+            r2_mean = np.mean(all_r ** 2)
+            r_mean2 = mean_r ** 2
+            slowdown = r_mean2 / r2_mean if r2_mean > 0 else 1.0
+
+            all_mean_radii.append(mean_r)
+            all_cv.append(cv)
+            all_slowdown.append(slowdown)
 
         logger.info(f"  {npz_path.name}: {len(filtered['labels'])} axons")
 
-    logger.info(f"Total segments loaded: {len(all_mean_radii)}")
+    logger.info(f"Total axons: {total_axons}, axons used: {len(all_mean_radii)} "
+                f"(length >= {min_length_um} μm)")
     return {
         "all_mean_radii": np.array(all_mean_radii),
         "all_cv": np.array(all_cv),
         "all_slowdown": np.array(all_slowdown),
+        "total_axons": total_axons,
+        "n_axons_used": len(all_mean_radii),
     }
 
 
@@ -77,7 +89,7 @@ def main():
                         default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
                         default=Path("fig/main/radius_variability_stats.svg"))
-    parser.add_argument("--min-length", type=float, default=5.0,
+    parser.add_argument("--min-length", type=float, default=20.0,
                         help="Minimum segment length in μm")
     args = parser.parse_args()
 
@@ -126,7 +138,7 @@ def main():
 
     for i in range(n_bins):
         mask = (all_r >= bin_edges[i]) & (all_r < bin_edges[i + 1])
-        if np.sum(mask) >= 100:
+        if np.sum(mask) >= 50:
             bin_med[i] = np.median(all_cv[mask])
             bin_q25[i] = np.percentile(all_cv[mask], 25)
             bin_q75[i] = np.percentile(all_cv[mask], 75)
@@ -156,7 +168,7 @@ def main():
 
     for i in range(size_bins):
         mask = (all_r >= sb_edges[i]) & (all_r < sb_edges[i + 1])
-        if np.sum(mask) >= 100:
+        if np.sum(mask) >= 50:
             slow_med[i] = np.median(all_slow[mask])
             slow_q25[i] = np.percentile(all_slow[mask], 25)
             slow_q75[i] = np.percentile(all_slow[mask], 75)

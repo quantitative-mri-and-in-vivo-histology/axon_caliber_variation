@@ -22,39 +22,62 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 
-def load_axon_data(npz_file: Path, min_length: float = 20.0) -> Tuple[np.ndarray, np.ndarray, str]:
+def load_axon_data(npz_file: Path, min_length: float = 20.0) -> Tuple[np.ndarray, np.ndarray, str, int]:
     """
-    Load axon data from NPZ file.
+    Load per-axon data from NPZ file.
+
+    Radius samples from all segments are pooled per axon.
+    Only axons with total length >= min_length are included.
 
     Args:
         npz_file: Path to 3D axon profiles NPZ file
-        min_length: Minimum axon length in μm (default 20.0)
+        min_length: Minimum total axon length in μm (default 20.0)
 
     Returns:
-        Tuple of (mean_radii, std_radii, sample_name)
+        Tuple of (mean_radii, std_radii, sample_name, n_axons_total)
     """
-    data = np.load(npz_file, allow_pickle=True)
+    from axonometry.io import load_3d_profiles
 
-    mean_radii = data['mean_radii_um']
-    std_radii = data['std_radii_um']
-    lengths = data['lengths_um']
+    data = load_3d_profiles(npz_file)
+    seg_radii = data['segment_radii_um']
+    seg_lengths = data['segment_lengths_um']
+    n_axons_total = len(seg_radii)
 
-    # Extract sample name from filename
-    sample_name = npz_file.stem.replace('_axon_profiles', '')
+    mean_radii_list = []
+    std_radii_list = []
+    for i in range(len(seg_radii)):
+        segs_r = seg_radii[i]
+        segs_l = seg_lengths[i]
+        if not segs_r:
+            continue
+        total_len = sum(float(sl) for sl in segs_l)
+        if total_len < min_length:
+            continue
+        all_r = np.concatenate([np.atleast_1d(s).astype(float) for s in segs_r])
+        if len(all_r) < 3:
+            continue
+        mean_radii_list.append(np.mean(all_r))
+        std_radii_list.append(np.std(all_r))
 
-    # Filter valid data with minimum length
-    valid = (mean_radii > 0) & np.isfinite(std_radii) & (lengths >= min_length)
+    mean_radii = np.array(mean_radii_list)
+    std_radii = np.array(std_radii_list)
+
+    sample_name = npz_file.stem.replace('_myelin_axon_profiles', '')
+
+    valid = (mean_radii > 0) & np.isfinite(std_radii)
     mean_radii = mean_radii[valid]
     std_radii = std_radii[valid]
 
-    logger.info(f"Loaded {len(mean_radii)} axons from {npz_file.name} (length >= {min_length} μm)")
+    logger.info(f"Loaded {len(mean_radii)}/{n_axons_total} axons from {npz_file.name} "
+                f"(length >= {min_length} μm)")
 
-    return mean_radii, std_radii, sample_name
+    return mean_radii, std_radii, sample_name, n_axons_total
 
 
 def plot_std_vs_radius(
     all_data: List[Tuple[np.ndarray, np.ndarray, str]],
     output_file: Path,
+    total_axons: int = 0,
 ):
     """
     Plot standard deviation of radius vs mean radius.
@@ -62,6 +85,7 @@ def plot_std_vs_radius(
     Args:
         all_data: List of (mean_radii, std_radii, sample_name) tuples
         output_file: Output PNG file path
+        total_axons: Total number of axons across all files (before filtering)
     """
     # 62 mm width, square aspect ratio
     width_mm = 62
@@ -92,7 +116,7 @@ def plot_std_vs_radius(
     for i in range(n_bins):
         mask = (all_x >= bin_edges[i]) & (all_x < bin_edges[i + 1])
         count = np.sum(mask)
-        if count >= 100:
+        if count >= 50:
             bin_medians.append(np.median(all_std[mask]))
             bin_q25.append(np.percentile(all_std[mask], 25))
             bin_q75.append(np.percentile(all_std[mask], 75))
@@ -133,7 +157,7 @@ def plot_std_vs_radius(
     logger.info("=" * 60)
     logger.info("Summary Statistics")
     logger.info("=" * 60)
-    logger.info(f"Total axons: {len(all_x)}")
+    logger.info(f"Total axons: {total_axons}, axons used: {len(all_x)}")
     logger.info(f"Mean radius: {np.mean(all_x):.3f} +/- {np.std(all_x):.3f} μm")
     logger.info(f"Mean std of radius: {np.mean(all_std):.3f} +/- {np.std(all_std):.3f} μm")
     logger.info(f"Correlation (mean radius vs std): {np.corrcoef(all_x, all_std)[0, 1]:.3f}")
@@ -183,12 +207,14 @@ def main():
 
     # Load all data
     all_data = []
+    total_axons = 0
     for npz_file in input_files:
-        mean_radii, std_radii, sample_name = load_axon_data(npz_file, min_length=args.min_length)
+        mean_radii, std_radii, sample_name, n_axons = load_axon_data(npz_file, min_length=args.min_length)
         all_data.append((mean_radii, std_radii, sample_name))
+        total_axons += n_axons
 
     # Create plot
-    plot_std_vs_radius(all_data, args.output_file)
+    plot_std_vs_radius(all_data, args.output_file, total_axons=total_axons)
 
 
 if __name__ == '__main__':

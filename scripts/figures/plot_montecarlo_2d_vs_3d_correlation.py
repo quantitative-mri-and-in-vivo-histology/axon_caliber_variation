@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FormatStrFormatter
 import numpy as np
+from matplotlib.ticker import FormatStrFormatter
 from scipy import stats
 
 from axonometry import get_plot_settings, style_axis
@@ -42,41 +42,17 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 # ── Constants ──────────────────────────────────────────────────────────────
-MIN_RADIUS_UM = 0.0
-MAX_ECCENTRICITY = 0.9
-MIN_SOLIDITY = 0.5
 MIN_AXON_COUNT = 30        # Min axons per slice for valid statistics
 BIN_WIDTH_UM = 0.02
 MAX_RADIUS_UM = 5.0
 
 
-# ── Data loading (new canonical format) ───────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────────────────
 
 def load_and_filter_2d(npz_path: Path, radius_type: str = "circular") -> Dict:
-    """Load 2D slice profiles and apply quality filters."""
-    d = np.load(npz_path)
-
-    radius_key = f"radius_{radius_type}_um"
-    radii = d[radius_key]
-    slices = d["slice_index"]
-    ecc = d["eccentricity"]
-    sol = d["solidity"]
-
-    mask = (
-        (radii >= MIN_RADIUS_UM)
-        & (ecc <= MAX_ECCENTRICITY)
-        & (sol >= MIN_SOLIDITY)
-    )
-    radii = radii[mask]
-    slices = slices[mask]
-    n_slices = int(d["n_slices"])
-
-    logger.info(
-        f"  {npz_path.stem}: {mask.sum():,}/{len(mask):,} instances after filter "
-        f"({mask.sum() / len(mask) * 100:.1f}%)"
-    )
-
-    return {"radii": radii, "slice_index": slices, "n_slices": n_slices}
+    """Load 2D slice profiles with quality and label exclusion filters."""
+    from axonometry.io import load_2d_profiles
+    return load_2d_profiles(npz_path, radius_type=radius_type)
 
 
 def compute_per_slice_stats(data: Dict) -> Dict:
@@ -111,10 +87,10 @@ def compute_per_slice_stats(data: Dict) -> Dict:
 
 
 def load_3d_radii(npz_path: Path) -> np.ndarray:
-    """Load pooled 3D radii."""
-    d = np.load(npz_path, allow_pickle=True)
-    radii = d['all_radii_um']
-    return radii[radii >= MIN_RADIUS_UM]
+    """Load pooled 3D radii with label exclusion."""
+    from axonometry.io import load_3d_profiles
+    d = load_3d_profiles(npz_path)
+    return d['all_radii_um']
 
 
 def compute_r_eff(radii: np.ndarray) -> float:
@@ -137,22 +113,15 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str]]:
 
     Returns list of (slice_file, axon_file, sample_name) tuples.
     """
-    EXCLUDED_SAMPLES = {"tbi_2_ipsi"}
-
     pairs = []
     for sf in sorted(data_dir.glob("*_myelin_slice_profiles.npz")):
         stem = sf.stem.replace("_slice_profiles", "")  # e.g. sham_25_ipsi_cc_myelin
         af = data_dir / f"{stem}_axon_profiles.npz"
 
-        # Extract sample base for exclusion check
         parts = stem.replace("_myelin", "").rsplit("_", 1)  # ['sham_25_ipsi', 'cc']
         base_name = parts[0] if len(parts) == 2 else stem
         pop = parts[1].upper() if len(parts) == 2 else ""
         sample_name = f"{base_name}_{pop}" if pop else base_name
-
-        if base_name in EXCLUDED_SAMPLES:
-            logger.info(f"  Skipping excluded: {sample_name}")
-            continue
 
         if not af.exists():
             logger.warning(f"  No 3D file for {sf.name}, skipping")
@@ -223,8 +192,8 @@ def run_monte_carlo(roi_stats: List[Dict], roi_3d_cdfs: List[np.ndarray],
             r_slice = roi["valid_slice_radii"][slice_idx]
             slice_wass[j, it] = compute_wasserstein(r_slice, cdf_3d, bin_centers, bin_width)
 
-            # i.i.d. sampling: sample N radii from pooled 2D
-            n_samples = roi["mean_axons_per_slice"]
+            # Random sampling: sample same N radii as the drawn slice
+            n_samples = len(r_slice)
             iid_radii = rng_iid.choice(roi["pooled_radii"], size=n_samples, replace=True)
             iid_mean[j, it] = np.mean(iid_radii)
             iid_reff[j, it] = compute_r_eff(iid_radii)
@@ -310,7 +279,7 @@ def plot_wasserstein_violin(ax, slice_wass: np.ndarray, iid_wass: np.ndarray):
 
     ax.set_xticks([1, 2])
     ax.set_xticklabels(
-        ["2D slice\nsampling", "i.i.d.\nsampling"],
+        ["2D slice-wise\nsampling", "2D random\nsampling"],
         fontsize=settings.fonts["tick_size"] - 1,
     )
     style_axis(ax, ylabel="Wasserstein distance [μm]")
@@ -356,12 +325,12 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
     ax.errorbar(x_3d, actual_mean, yerr=actual_std, fmt="o", color=color_actual,
                 markersize=6, capsize=err_s["capsize"], capthick=err_s["capthick"],
                 elinewidth=err_s["linewidth"], markeredgecolor="black",
-                markeredgewidth=0.5, alpha=0.8, label="2D slice sampling", zorder=10)
+                markeredgewidth=0.5, alpha=0.8, label="2D slice-wise sampling", zorder=10)
 
-    ax.errorbar(x_3d, fake_mean, yerr=fake_std, fmt="s", color=color_fake,
-                markersize=6, capsize=err_s["capsize"], capthick=err_s["capthick"],
-                elinewidth=err_s["linewidth"], markeredgecolor="black",
-                markeredgewidth=0.5, alpha=0.8, label="i.i.d. sampling", zorder=10)
+    ax.errorbar(x_3d, fake_mean, yerr=fake_std, fmt="x", color=color_fake,
+                markersize=5, capsize=err_s["capsize"], capthick=err_s["capthick"],
+                elinewidth=err_s["linewidth"], markeredgecolor=color_fake,
+                markeredgewidth=1.5, alpha=0.8, label="2D random sampling", zorder=10)
 
     all_vals = np.concatenate([x_3d, actual_mean, fake_mean])
     lo = np.nanmin(all_vals) * 0.95
@@ -411,7 +380,7 @@ def main():
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/montecarlo_2d_vs_3d_correlation.png"))
+                        default=Path("fig/supplementary/montecarlo_2d_vs_3d_correlation.png"))
     parser.add_argument("--n-iterations", type=int, default=100)
     parser.add_argument("--radius-type", type=str, default="circular",
                         choices=["circular", "minor"])
