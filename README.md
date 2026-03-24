@@ -1,0 +1,106 @@
+# 3D Histology Validates 2D Histology for Axon Radius Distributions and Conduction Velocities
+
+Laurin Mordhorst, Nikolaus Weiskopf, Markus Morawski, Siawoosh Mohammadi
+
+**Paper:** [DOI forthcoming]
+
+This repository contains the analysis code and figure generation scripts for the above manuscript. It is intended for reproducing the published results.
+
+## Data
+
+### Rat brain 3D segmentation data
+
+Download the 10 labeled volumes of myelinated axons from:
+
+> Sierra, A., Abdollahzadeh, A., Belevich, I., Jokitalo, E., & Tohka, J. (2021). *Segmentation of brain ultrastructures in 3D electron microscopy.* [doi:10.23729/BAD417CA-553F-4FA6-AE0A-22EDDD29A230](https://etsin.fairdata.fi/dataset/f8ccc23a-1f1a-4c98-86b7-b63652a809c3)
+
+Place the `.mat` files in `data/source/rat/`, organized by condition and hemisphere:
+
+```
+data/source/rat/
+├── Sham_2_ipsi/LM_2_ipsi_myelinated_axons.mat
+├── Sham_2_contra/LM_2_contra_myelinated_axons.mat
+├── Sham_24_ipsi/LM_24_ipsi_myelinated_axons.mat
+├── Sham_24_contra/LM_24_contra_myelinated_axons.mat
+├── Sham_28_ipsi/LM_28_ipsi_myelinated_axons.mat
+├── Sham_28_contra/LM_28_contra_myelinated_axons.mat
+├── TBI_25_ipsi/LM_25_ipsi_myelinated_axons.mat
+├── TBI_25_contra/LM_25_contra_myelinated_axons.mat
+├── TBI_49_ipsi/LM_49_ipsi_myelinated_axons.mat
+└── TBI_49_contra/LM_49_contra_myelinated_axons.mat
+```
+
+### Human corpus callosum 2D light microscopy data
+
+Download the pre-processed histogram data from:
+
+> Mordhorst, L., et al. (2025). *Ex-vivo dataset for validation of MRI-based axon radius mapping.* Zenodo. [doi:10.5281/zenodo.17431227](https://zenodo.org/records/17431227)
+
+Place the files in `data/raw/human/lm/`:
+
+```
+data/raw/human/lm/
+├── desc-binCenters_radii.tsv
+├── desc-binEdges_radii.tsv
+├── desc-countsCircularEq_radii.tsv
+├── desc-countsMajorAxis_radii.tsv
+├── desc-countsMinorAxis_radii.tsv
+├── desc-polygons_roicoords.tsv
+├── roiinfo.tsv
+├── sub-ev01/
+│   ├── sub-ev01.png
+│   └── sub-ev01_label-cc_mask.nii.gz
+└── sub-ev02/
+    ├── sub-ev02.png
+    └── sub-ev02_label-cc_mask.nii.gz
+```
+
+## Setup
+
+Requires Python >= 3.10.
+
+```bash
+pip install -e ".[full]"
+```
+
+## Reproducing figures
+
+### Processing pipeline
+
+Figures depend on preprocessed data. Run the pipeline stages in order:
+
+1. **Preparation** (`scripts/preparation/`)
+   - `identify_lm_rois.py` — classifies axons into CC and CG populations via PCA-based orientation clustering; finds the optimal spatial separation plane between tracts
+   - `extract_lm_rois.py` — crops each population's ROI from the raw `.mat` volumes, permutes axes so Z = fiber direction, and writes OME-Zarr volumes
+
+2. **Processing** (`scripts/processing/`)
+   - `compute_2d_slice_profiles.py` — extracts per-instance regionprops (area, eccentricity, radii, ...) for every cross-sectional slice along the fiber axis
+   - `compute_3d_axon_profiles.py` — traces each axon along its 3D skeleton, measuring radius variation along the bundle
+   - `extract_representative_3d_axons.py` — selects representative axons (low, mid, high CoV) for visualization in Fig 2
+
+3. **Figures** — generate manuscript figures from the processed data (`scripts/figures/`)
+
+### Figure scripts
+
+| Figure   | Script                                                          | Description                                                       |
+|:---------|:----------------------------------------------------------------|:------------------------------------------------------------------|
+| Fig 2a–c | `scripts/figures/plot_individual_radius_profiles.py`            | 3D rendering and radius profiles for representative axons         |
+| Fig 2d–f | `scripts/figures/plot_individual_radius_variation_stats.py`     | CoV histogram, CoV vs mean radius, slowdown reduction             |
+| Fig 3    | `scripts/figures/plot_2d_vs_3d_distribution_comparison.py`     | 2D/3D PDF stability, Wasserstein distance, mean and r_eff scatter |
+| Fig 4    | `scripts/figures/plot_parametric_distribution_fits.py`          | Parametric distribution fits and AIC for Human CC and Rat WM      |
+| Fig 5    | `scripts/figures/plot_sample_size_effect.py`                   | Sample size effect on radius estimation error                     |
+| Fig S1   | `scripts/figures/plot_individual_radius_std_vs_mean.py`        | Radius standard deviation vs mean radius                          |
+| Fig S2   | `scripts/figures/plot_2d_vs_3d_distribution_comparison.py`     | 2D vs 3D comparison (circular radius approximation)               |
+| Fig S3   | `scripts/figures/plot_2d_slice_vs_random_distribution_comparison.py` | Monte Carlo 2D vs 3D correlation                             |
+
+Each script can be run standalone, e.g.:
+
+```bash
+python scripts/figures/plot_individual_radius_profiles.py
+```
+
+Use `--help` for available options.
+
+## License
+
+MIT
