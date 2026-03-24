@@ -46,7 +46,7 @@ settings = get_plot_settings()
 # Constants
 DEFAULT_BIN_WIDTH = 0.05  # μm
 SAMPLE_SIZES = [100, 300, 1_000, 3_000, 10_000, 30_000, 100_000]
-N_SUBSAMPLES = 10000
+N_SUBSAMPLES = 1000
 
 SAMPLE_SIZE_LABELS = {
     100: r'$10^2$',
