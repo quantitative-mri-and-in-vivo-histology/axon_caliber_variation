@@ -1436,8 +1436,8 @@ def _plot_dumbbell(
     r_eff_bias = (r_eff - emp_r_eff) / emp_r_eff * 100
 
     # Clip extreme values for visualization
-    x_max = 150  # Cap at 150%
-    x_min = -50  # Allow negative bias
+    x_max = 100
+    x_min = -100
     r_eff_bias_clipped = np.clip(r_eff_bias, x_min, x_max)
 
     # Plot connecting lines (dumbbells)
@@ -1512,7 +1512,7 @@ def _plot_radius_bias_both_species(
         human_emp_per_sample = human_metrics.empirical_r_eff_per_sample
         rat_emp_per_sample = rat_metrics.empirical_r_eff_per_sample
         xlabel = r'$r_{\mathrm{MRI}}$ error [%]'
-        x_lim = 50  # ±50%
+        x_lim = 100  # ±100%
 
     # Compute per-sample bias for each distribution
     box_width = 0.4
@@ -1672,7 +1672,7 @@ def _plot_radius_bias_both_species(
     if radius_type == 'r_arith':
         ax.set_xticks([-5, -2.5, 0, 2.5, 5])
     else:  # r_eff
-        ax.set_xticks([-50, -25, 0, 25, 50])
+        ax.set_xticks([-100, -50, 0, 50, 100])
     ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 

@@ -62,9 +62,18 @@ def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
                 continue
 
             cv = np.std(all_r) / mean_r
-            r2_mean = np.mean(all_r ** 2)
-            r_mean2 = mean_r ** 2
-            slowdown = r_mean2 / r2_mean if r2_mean > 0 else 1.0
+
+            # Conduction velocity reduction (Eq. 4 with g-ratio model Eq. 5)
+            # v(r) ∝ r * sqrt(-ln(g(r))), g(r) = r/(r+dm), dm = r̄*(1-ḡ)/ḡ
+            g_bar = 0.6
+            dm = mean_r * (1 - g_bar) / g_bar  # = 2*mean_r/3
+            g_r = all_r / (all_r + dm)
+            v_r = all_r * np.sqrt(-np.log(g_r))
+            v_ideal = mean_r * np.sqrt(-np.log(g_bar))
+            # v_eff = 1 / <1/v(r)>
+            slowness = 1.0 / v_r
+            v_eff = 1.0 / np.mean(slowness)
+            slowdown = v_eff / v_ideal  # ratio < 1 means reduction
 
             all_mean_radii.append(mean_r)
             all_cv.append(cv)
@@ -190,15 +199,19 @@ def main():
     cond_color = settings.colors["binary_a"]
     diff_color = settings.colors["binary_b"]
 
+    med_cond = (1 - np.median(all_slow)) * 100
+    med_diff = np.median(1.0 / (1.0 + 4.0 * all_cv ** 2))
+    med_diff_pct = (1 - med_diff) * 100
+
     ax_vel.plot(sb_centers[vb], cond_med[vb], color=cond_color, linestyle="-",
                 linewidth=line_s["linewidth"], marker="o", markersize=line_s["marker_size"],
-                label="Conduction velocity")
+                label=f"Conduction velocity\n(median: {med_cond:.1f}%)")
     ax_vel.fill_between(sb_centers[vb], cond_lo[vb], cond_hi[vb],
                         color=cond_color, alpha=line_s["fill_alpha"])
 
     ax_vel.plot(sb_centers[vb], diff_med_pct[vb], color=diff_color, linestyle="-",
                 linewidth=line_s["linewidth"], marker="s", markersize=line_s["marker_size"],
-                label="Diffusion (along-axon)")
+                label=f"Diffusion along-axon\n(median: {med_diff_pct:.1f}%)")
     ax_vel.fill_between(sb_centers[vb], diff_lo[vb], diff_hi[vb],
                         color=diff_color, alpha=line_s["fill_alpha"])
 
