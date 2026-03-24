@@ -84,8 +84,9 @@ def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
     local_radii = slice_radius[coords_vox[:, 0]]
 
     # Subsample
+    rng = np.random.default_rng(seed=42)
     if len(coords_vox) > max_points:
-        idx = np.random.choice(len(coords_vox), size=max_points, replace=False)
+        idx = rng.choice(len(coords_vox), size=max_points, replace=False)
         coords_vox = coords_vox[idx]
         local_radii = local_radii[idx]
 
@@ -94,11 +95,15 @@ def render_axon_surface(vol, color, voxel_size, ax, x_offset=0.0,
     x_um = coords_vox[:, 1] * voxel_size + x_offset
     y_um = coords_vox[:, 2] * voxel_size
 
-    r_min, r_max = np.percentile(local_radii[local_radii > 0], [2, 98])
-    if r_max > r_min:
-        norm = np.clip((local_radii - r_min) / (r_max - r_min), 0, 1)
-    else:
+    positive = local_radii[local_radii > 0]
+    if len(positive) == 0:
         norm = np.ones(len(coords_vox)) * 0.5
+    else:
+        r_min, r_max = np.percentile(positive, [2, 98])
+        if r_max > r_min:
+            norm = np.clip((local_radii - r_min) / (r_max - r_min), 0, 1)
+        else:
+            norm = np.ones(len(coords_vox)) * 0.5
 
     intensities = 0.35 + 0.65 * norm
     point_sizes = 0.05 + 0.2 * norm
@@ -148,20 +153,29 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
         max_arc = max(a["length"] for a in rep_axons)
         tick_arcs = np.arange(arc_interval, max_arc, arc_interval)
 
+        # Precompute skeleton cumulative arc lengths once per axon
+        skeleton_arcs = []
+        for j, (ext, axon) in enumerate(zip(axon_extents, rep_axons)):
+            if ext is None:
+                skeleton_arcs.append(None)
+                continue
+            skel = axon.get("aligned_skeleton")
+            if skel is None:
+                skeleton_arcs.append(None)
+                continue
+            skel = np.asarray(skel, dtype=np.float64)
+            diffs = np.diff(skel, axis=0)
+            seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
+            cum_arc = np.concatenate([[0], np.cumsum(seg_lens)])
+            skeleton_arcs.append((skel, cum_arc))
+
         for arc_um in tick_arcs:
             z_positions = []
-            for j, (ext, axon) in enumerate(zip(axon_extents, rep_axons)):
-                if ext is None:
+            for j in range(len(axon_extents)):
+                if skeleton_arcs[j] is None:
                     z_positions.append(None)
                     continue
-                skel = axon.get("aligned_skeleton")
-                if skel is None:
-                    z_positions.append(None)
-                    continue
-                skel = np.asarray(skel, dtype=np.float64)
-                diffs = np.diff(skel, axis=0)
-                seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
-                cum_arc = np.concatenate([[0], np.cumsum(seg_lens)])
+                skel, cum_arc = skeleton_arcs[j]
                 if arc_um > cum_arc[-1]:
                     z_positions.append(None)
                     continue
@@ -176,21 +190,13 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                     tick_centers.append(None)
                     continue
                 _, _, y_c, _, _ = ext
-                skel = np.asarray(rep_axons[j].get("aligned_skeleton"), dtype=np.float64)
-                diffs = np.diff(skel, axis=0)
-                seg_lens = np.sqrt(np.sum(diffs**2, axis=1))
-                cum_arc = np.concatenate([[0], np.cumsum(seg_lens)])
-                # Skeleton X (axis 1 in volume) at this arc length + render x_offset
+                skel, cum_arc = skeleton_arcs[j]
                 x_center = float(np.interp(arc_um, cum_arc, skel[:, 1])) + x_offsets[j]
                 tick_centers.append(x_center)
                 z_tick = z_positions[j]
                 ax.plot([x_center - tick_half, x_center + tick_half], [y_c, y_c],
                         [z_tick, z_tick], color="black", linewidth=0.5,
                         alpha=0.5, zorder=10)
-                # Connect to next axon
-                if j + 1 < len(axon_extents) and axon_extents[j + 1] is not None and z_positions[j + 1] is not None:
-                    # Will draw connection after computing next tick_center
-                    pass
 
             # Draw connections between axons
             for j in range(len(tick_centers) - 1):
