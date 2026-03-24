@@ -295,13 +295,13 @@ Examples: Ideal vs With slowdown, Intra-ROI vs Inter-ROI, CV vs radius (single l
 **Figure conventions:**
 - **No suptitles**: Do not add figure-level titles (`fig.suptitle()`)
 - **No subplot titles**: Do not add individual panel titles (`ax.set_title()`)
-- **Panel labels**: Add lowercase letter labels (a, b, c, ...) to each panel
+- **No panel labels**: Do not add subplot panel labels (a, b, c, ...) — these are added manually during figure assembly
 - **Units in square brackets**: Use square brackets for units in axis labels (e.g., `Radius [μm]`, not `Radius (μm)`)
 - **Radius notation**: Use `$\bar{r}$` for arithmetic mean radius, `$r_{\mathrm{MRI}}$` for effective MRI-visible radius
 
 **Usage in plot scripts:**
 ```python
-from axonometry import get_plot_settings, add_panel_labels
+from axonometry import get_plot_settings
 
 settings = get_plot_settings()
 
@@ -358,12 +358,6 @@ ax.plot(..., linewidth=settings.line['linewidth'],
         markersize=settings.line['marker_size'])
 ax.fill_between(..., alpha=settings.line['fill_alpha'])
 
-# Panel labels (a, b, c, ...) - add after tight_layout()
-fig, axes = plt.subplots(2, 3)
-# ... create plots ...
-plt.tight_layout()
-add_panel_labels(axes)  # Adds 'a' through 'f' with consistent styling
-
 # Figure DPI
 plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
 ```
@@ -372,7 +366,6 @@ plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
 - `colors`: Species (human, rat), condition (sham, tbi), examples (example_1/2/3), binary comparisons (category_a/b)
 - `markers`: Population markers (cc, cg, default)
 - `figure`: DPI, default figure size, suptitle/subplot_titles flags
-- `panel_labels`: Enabled, fontsize, fontweight, position, alignment
 - `fonts`: label_size (14), tick_size (12), title_size (16), legend_size (11)
 - `grid`: enabled (false), alpha
 - `frame`: box (true), linewidth - controls plot border
