@@ -112,13 +112,11 @@ This means **processing scripts can always assume `slice_axis=0`** to get cross-
 
 **Step 1: Identify ROIs**
 
-- **LM** (`identify_lm_rois.py`): Identifies CC and CG populations via PCA-based orientation classification. Finds an optimal spatial separation plane between the two populations. Outputs `*_population_rois.json` with ROI bounds, dominant axes, and separation metadata.
-- **HM** (`identify_hm_rois.py`): Determines the single fiber direction by comparing cross-section eccentricity along each axis (lowest eccentricity = perpendicular to fibers). Outputs `*_roi.json` with dominant axis.
+ROI bounding boxes for CC and CG populations were identified via PCA-based orientation classification and manually refined. The resulting `*_population_rois.json` files (with ROI bounds, dominant axes, and separation metadata) are stored under `data/`.
 
 **Step 2: Extract volumes**
 
-- **LM** (`extract_lm_rois.py`): Reads `*_population_rois.json`, crops each population's ROI, permutes the **separation axis → Z**, and writes OME-Zarr. LM data is already isotropic (0.05 μm). Outputs per-population: `*_cc_myelin.zarr`, `*_cg_myelin.zarr` (+ grayscale companions).
-- **HM** (`extract_hm_rois.py`): Reads `*_roi.json`, permutes the **dominant axis → Z**, resamples anisotropic voxels to isotropic, and writes OME-Zarr. Outputs: `*_myelin.zarr` (+ grayscale companion).
+- `extract_rois.py`: Reads `*_population_rois.json`, crops each population's ROI, permutes the **separation axis → Z**, and writes OME-Zarr. LM data is already isotropic (0.05 μm). Outputs per-population: `*_cc_myelin.zarr`, `*_cg_myelin.zarr` (+ grayscale companions).
 
 **Axis permutation logic** (same in both):
 ```

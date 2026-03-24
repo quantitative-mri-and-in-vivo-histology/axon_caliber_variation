@@ -70,8 +70,7 @@ pip install -e ".[full]"
 Figures depend on preprocessed data. Run the pipeline stages in order:
 
 1. **Preparation** (`scripts/preparation/`)
-   - `identify_lm_rois.py` — classifies axons into CC and CG populations via PCA-based orientation clustering; finds the optimal spatial separation plane between tracts
-   - `extract_lm_rois.py` — crops each population's ROI from the raw `.mat` volumes, permutes axes so Z = fiber direction, and writes OME-Zarr volumes
+   - `extract_rois.py` — crops each population's ROI from the raw `.mat` volumes using pre-computed `*_population_rois.json` bounding boxes, permutes axes so Z = fiber direction, and writes OME-Zarr volumes for both the labeled segmentation and companion grayscale data (if available as `.h5` files alongside the `.mat` sources)
 
 2. **Processing** (`scripts/processing/`)
    - `compute_2d_slice_profiles.py` — extracts per-instance regionprops (area, eccentricity, radii, ...) for every cross-sectional slice along the fiber axis

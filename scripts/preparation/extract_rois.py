@@ -6,10 +6,10 @@ in source_dir, and extracts cropped, axis-aligned volumes.
 
 Example usage:
     # Use defaults (data/source/rat, data/raw/rat/lm)
-    python scripts/preparation/extract_lm_rois.py
+    python scripts/preparation/extract_rois.py
 
     # Custom directories
-    python scripts/preparation/extract_lm_rois.py \
+    python scripts/preparation/extract_rois.py \
         --source-dir data/source/rat \
         --roi-dir data/raw/rat/lm
 """
