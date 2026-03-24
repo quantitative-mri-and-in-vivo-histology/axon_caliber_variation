@@ -1,22 +1,22 @@
 """
-Monte Carlo comparison: 2D slice sampling vs i.i.d. sampling.
+Monte Carlo comparison: 2D slice sampling vs random sampling.
 
 Compares two approaches for estimating 3D population statistics from 2D samples:
 1. 2D slice sampling: Randomly pick one physical 2D slice per ROI
-2. i.i.d. sampling: Sample mean_axons_per_slice radii from the pooled 2D distribution
+2. random sampling: Sample mean_axons_per_slice radii from the pooled 2D distribution
 
 Both methods use the same underlying 2D radii (with minor axis bias from
 ellipse fitting), ensuring a fair comparison of sampling strategies.
 
 Creates a 1x3 figure showing:
-(a) Wasserstein distance violin: slice sampling vs i.i.d. sampling
+(a) Wasserstein distance violin: slice sampling vs random sampling
 (b) Mean radius scatter: 2D vs 3D
 (c) Effective radius scatter: 2D vs 3D
 
 Median and IQR are computed over Monte Carlo iterations.
 
 Usage:
-    python scripts/exploratory/2d_vs_3d/plot_montecarlo_2d_vs_3d_correlation.py \
+    python scripts/figures/plot_2d_slice_vs_random_distribution_comparison.py \
         --data-dir data/processed/rat/lm \
         --output fig/montecarlo_2d_vs_3d_correlation.png \
         --n-iterations 100
@@ -33,7 +33,7 @@ import numpy as np
 from matplotlib.ticker import FormatStrFormatter
 from scipy import stats
 
-from axonometry import get_plot_settings, style_axis, compute_r_eff
+from axonometry import compute_r_eff, get_plot_settings, style_axis
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -69,9 +69,7 @@ def compute_per_slice_stats(data: Dict) -> Dict:
             continue
         counts.append(len(r_z))
         r_arith.append(np.mean(r_z))
-        r2 = np.mean(r_z ** 2)
-        r6 = np.mean(r_z ** 6)
-        r_eff.append((r6 / r2) ** 0.25 if r2 > 0 else np.nan)
+        r_eff.append(compute_r_eff(r_z))
         valid_slice_radii.append(r_z)
 
     return {
@@ -126,12 +124,18 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str]]:
 
 # ── Monte Carlo ───────────────────────────────────────────────────────────
 
+def make_bins() -> Tuple[np.ndarray, np.ndarray, float]:
+    """Standard bin centers, edges, and width for histogram comparison."""
+    bin_centers = np.arange(BIN_WIDTH_UM / 2, MAX_RADIUS_UM, BIN_WIDTH_UM)
+    bin_width = bin_centers[1] - bin_centers[0]
+    bin_edges = np.concatenate([[bin_centers[0] - bin_width / 2],
+                                 bin_centers + bin_width / 2])
+    return bin_centers, bin_edges, bin_width
+
+
 def compute_wasserstein(radii_sample: np.ndarray, cdf_3d: np.ndarray,
-                        bin_centers: np.ndarray, bin_width: float) -> float:
+                        bin_edges: np.ndarray, bin_width: float) -> float:
     """Compute Wasserstein distance between a 2D sample and 3D CDF."""
-    bin_edges = np.concatenate(
-        [[bin_centers[0] - bin_width / 2], bin_centers + bin_width / 2]
-    )
     hist, _ = np.histogram(radii_sample, bins=bin_edges)
     if hist.sum() == 0:
         return np.nan
@@ -139,35 +143,34 @@ def compute_wasserstein(radii_sample: np.ndarray, cdf_3d: np.ndarray,
     return np.sum(np.abs(cdf_2d - cdf_3d)) * bin_width
 
 
-def compute_3d_cdf(radii: np.ndarray, bin_centers: np.ndarray) -> np.ndarray:
-    """Compute 3D CDF at given bin centers."""
-    sorted_r = np.sort(radii)
-    cdf_y = np.arange(1, len(sorted_r) + 1) / len(sorted_r)
-    return np.interp(bin_centers, sorted_r, cdf_y, left=0, right=1)
+def compute_3d_cdf(radii: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    """Compute 3D CDF using histogram on standard bin edges."""
+    hist, _ = np.histogram(radii, bins=bin_edges)
+    return np.cumsum(hist) / hist.sum()
 
 
 def run_monte_carlo(roi_stats: List[Dict], roi_3d_cdfs: List[np.ndarray],
-                    bin_centers: np.ndarray, n_iterations: int,
+                    bin_edges: np.ndarray, n_iterations: int,
                     seed: int = 42) -> Tuple[Dict, Dict]:
     """
-    Run Monte Carlo simulation for both 2D slice sampling and i.i.d. sampling.
+    Run Monte Carlo simulation for both 2D slice sampling and random sampling.
 
     Returns:
-        Tuple of (slice_results, iid_results), each with keys:
+        Tuple of (slice_results, random_results), each with keys:
         mean_radius, r_eff, wasserstein — arrays of shape (n_rois, n_iterations)
     """
     n_rois = len(roi_stats)
-    bin_width = bin_centers[1] - bin_centers[0]
+    bin_width = bin_edges[1] - bin_edges[0]
 
     slice_mean = np.zeros((n_rois, n_iterations))
     slice_reff = np.zeros((n_rois, n_iterations))
     slice_wass = np.zeros((n_rois, n_iterations))
-    iid_mean = np.zeros((n_rois, n_iterations))
-    iid_reff = np.zeros((n_rois, n_iterations))
-    iid_wass = np.zeros((n_rois, n_iterations))
+    rand_mean = np.zeros((n_rois, n_iterations))
+    rand_reff = np.zeros((n_rois, n_iterations))
+    rand_wass = np.zeros((n_rois, n_iterations))
 
     rng_slice = np.random.default_rng(seed)
-    rng_iid = np.random.default_rng(seed + 1)
+    rng_random = np.random.default_rng(seed + 1)
 
     for it in range(n_iterations):
         for j in range(n_rois):
@@ -181,18 +184,18 @@ def run_monte_carlo(roi_stats: List[Dict], roi_3d_cdfs: List[np.ndarray],
 
             # Wasserstein for slice
             r_slice = roi["valid_slice_radii"][slice_idx]
-            slice_wass[j, it] = compute_wasserstein(r_slice, cdf_3d, bin_centers, bin_width)
+            slice_wass[j, it] = compute_wasserstein(r_slice, cdf_3d, bin_edges, bin_width)
 
             # Random sampling: sample same N radii as the drawn slice
             n_samples = len(r_slice)
-            iid_radii = rng_iid.choice(roi["pooled_radii"], size=n_samples, replace=True)
-            iid_mean[j, it] = np.mean(iid_radii)
-            iid_reff[j, it] = compute_r_eff(iid_radii)
-            iid_wass[j, it] = compute_wasserstein(iid_radii, cdf_3d, bin_centers, bin_width)
+            rand_radii = rng_random.choice(roi["pooled_radii"], size=n_samples, replace=True)
+            rand_mean[j, it] = np.mean(rand_radii)
+            rand_reff[j, it] = compute_r_eff(rand_radii)
+            rand_wass[j, it] = compute_wasserstein(rand_radii, cdf_3d, bin_edges, bin_width)
 
     return (
         {"mean_radius": slice_mean, "r_eff": slice_reff, "wasserstein": slice_wass},
-        {"mean_radius": iid_mean, "r_eff": iid_reff, "wasserstein": iid_wass},
+        {"mean_radius": rand_mean, "r_eff": rand_reff, "wasserstein": rand_wass},
     )
 
 
@@ -235,21 +238,21 @@ def compute_permutation_pvalue(x_3d: np.ndarray, roi_stats: List[Dict],
 
 # ── Plotting ──────────────────────────────────────────────────────────────
 
-def plot_wasserstein_violin(ax, slice_wass: np.ndarray, iid_wass: np.ndarray):
+def plot_wasserstein_violin(ax, slice_wass: np.ndarray, rand_wass: np.ndarray):
     """Panel (a): Wasserstein distance violin comparison."""
     slice_pooled = slice_wass.flatten()
-    iid_pooled = iid_wass.flatten()
+    random_pooled = rand_wass.flatten()
 
     color_slice = settings.colors["binary_a"]
-    color_iid = settings.colors["binary_b"]
+    color_random = settings.colors["binary_b"]
 
     parts = ax.violinplot(
-        [slice_pooled, iid_pooled], positions=[1, 2],
+        [slice_pooled, random_pooled], positions=[1, 2],
         showmeans=False, showmedians=True, widths=0.7,
     )
 
     for i, body in enumerate(parts["bodies"]):
-        body.set_facecolor([color_slice, color_iid][i])
+        body.set_facecolor([color_slice, color_random][i])
         body.set_edgecolor("black")
         body.set_alpha(0.7)
 
@@ -261,12 +264,12 @@ def plot_wasserstein_violin(ax, slice_wass: np.ndarray, iid_wass: np.ndarray):
     rng = np.random.default_rng(42)
     n_show = min(500, len(slice_pooled))
     idx_s = rng.choice(len(slice_pooled), n_show, replace=False)
-    idx_i = rng.choice(len(iid_pooled), n_show, replace=False)
+    idx_r = rng.choice(len(random_pooled), n_show, replace=False)
 
     ax.scatter(1 + rng.uniform(-0.15, 0.15, n_show), slice_pooled[idx_s],
                alpha=0.3, s=3, color=color_slice, zorder=0)
-    ax.scatter(2 + rng.uniform(-0.15, 0.15, n_show), iid_pooled[idx_i],
-               alpha=0.3, s=3, color=color_iid, zorder=0)
+    ax.scatter(2 + rng.uniform(-0.15, 0.15, n_show), random_pooled[idx_r],
+               alpha=0.3, s=3, color=color_random, zorder=0)
 
     ax.set_xticks([1, 2])
     ax.set_xticklabels(
@@ -279,51 +282,51 @@ def plot_wasserstein_violin(ax, slice_wass: np.ndarray, iid_wass: np.ndarray):
 
 
 def plot_scatter_comparison(ax, x_3d: np.ndarray,
-                            actual_results: np.ndarray,
-                            fake_results: np.ndarray, metric: str,
-                            p_actual: Optional[float] = None,
-                            p_fake: Optional[float] = None):
-    """Panel (b)/(c): 2D vs 3D scatter comparing slice and i.i.d. sampling."""
+                            slice_results: np.ndarray,
+                            random_results: np.ndarray, metric: str,
+                            p_slice: Optional[float] = None,
+                            p_random: Optional[float] = None):
+    """Panel (b)/(c): 2D vs 3D scatter comparing slice and random sampling."""
     font_s = settings.fonts
     err_s = settings.error_bars
 
-    color_actual = settings.colors["binary_a"]
-    color_fake = settings.colors["binary_b"]
+    color_slice = settings.colors["binary_a"]
+    color_random = settings.colors["binary_b"]
 
-    n_iterations = actual_results.shape[1]
+    n_iterations = slice_results.shape[1]
 
     # Compute R per MC iteration
-    r_actual_iter = np.array([
-        stats.pearsonr(x_3d, actual_results[:, it])[0]
+    r_slice_iter = np.array([
+        stats.pearsonr(x_3d, slice_results[:, it])[0]
         for it in range(n_iterations)
     ])
-    r_fake_iter = np.array([
-        stats.pearsonr(x_3d, fake_results[:, it])[0]
+    r_random_iter = np.array([
+        stats.pearsonr(x_3d, random_results[:, it])[0]
         for it in range(n_iterations)
     ])
 
-    r_actual_mean = np.mean(r_actual_iter)
-    r_actual_std = np.std(r_actual_iter)
-    r_fake_mean = np.mean(r_fake_iter)
-    r_fake_std = np.std(r_fake_iter)
+    r_slice_mean = np.mean(r_slice_iter)
+    r_slice_std = np.std(r_slice_iter)
+    r_random_mean = np.mean(r_random_iter)
+    r_random_std = np.std(r_random_iter)
 
     # Mean ± std over iterations per ROI
-    actual_mean = np.mean(actual_results, axis=1)
-    actual_std = np.std(actual_results, axis=1)
-    fake_mean = np.mean(fake_results, axis=1)
-    fake_std = np.std(fake_results, axis=1)
+    slice_mean = np.mean(slice_results, axis=1)
+    slice_std = np.std(slice_results, axis=1)
+    random_mean = np.mean(random_results, axis=1)
+    random_std = np.std(random_results, axis=1)
 
-    ax.errorbar(x_3d, actual_mean, yerr=actual_std, fmt="o", color=color_actual,
+    ax.errorbar(x_3d, slice_mean, yerr=slice_std, fmt="o", color=color_slice,
                 markersize=6, capsize=err_s["capsize"], capthick=err_s["capthick"],
                 elinewidth=err_s["linewidth"], markeredgecolor="black",
                 markeredgewidth=0.5, alpha=0.8, label="2D slice-wise sampling", zorder=10)
 
-    ax.errorbar(x_3d, fake_mean, yerr=fake_std, fmt="x", color=color_fake,
+    ax.errorbar(x_3d, random_mean, yerr=random_std, fmt="x", color=color_random,
                 markersize=5, capsize=err_s["capsize"], capthick=err_s["capthick"],
-                elinewidth=err_s["linewidth"], markeredgecolor=color_fake,
+                elinewidth=err_s["linewidth"], markeredgecolor=color_random,
                 markeredgewidth=1.5, alpha=0.8, label="2D random sampling", zorder=10)
 
-    all_vals = np.concatenate([x_3d, actual_mean, fake_mean])
+    all_vals = np.concatenate([x_3d, slice_mean, random_mean])
     lo = np.nanmin(all_vals) * 0.95
     hi = np.nanmax(all_vals) * 1.05
     ax.plot([lo, hi], [lo, hi], "k--", alpha=0.5, linewidth=1.5, zorder=0)
@@ -346,40 +349,40 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
     def _fmt_p(p):
         return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
 
-    text_actual = f"R = {r_actual_mean:.2f}±{r_actual_std:.2f}"
-    if p_actual is not None:
-        text_actual += f", {_fmt_p(p_actual)}"
-    ax.text(0.04, 0.78, text_actual, transform=ax.transAxes,
-            fontsize=font_s["legend_size"], ha="left", va="top", color=color_actual)
+    text_slice = f"R = {r_slice_mean:.2f}±{r_slice_std:.2f}"
+    if p_slice is not None:
+        text_slice += f", {_fmt_p(p_slice)}"
+    ax.text(0.04, 0.78, text_slice, transform=ax.transAxes,
+            fontsize=font_s["legend_size"], ha="left", va="top", color=color_slice)
 
-    text_fake = f"R = {r_fake_mean:.2f}±{r_fake_std:.2f}"
-    if p_fake is not None:
-        text_fake += f", {_fmt_p(p_fake)}"
-    ax.text(0.04, 0.72, text_fake, transform=ax.transAxes,
-            fontsize=font_s["legend_size"], ha="left", va="top", color=color_fake)
+    text_random = f"R = {r_random_mean:.2f}±{r_random_std:.2f}"
+    if p_random is not None:
+        text_random += f", {_fmt_p(p_random)}"
+    ax.text(0.04, 0.72, text_random, transform=ax.transAxes,
+            fontsize=font_s["legend_size"], ha="left", va="top", color=color_random)
 
     ax.set_box_aspect(1)
 
-    return r_actual_mean, r_fake_mean, r_actual_std, r_fake_std
+    return r_slice_mean, r_random_mean, r_slice_std, r_random_std
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monte Carlo comparison: 2D slice sampling vs i.i.d. sampling"
+        description="Monte Carlo comparison: 2D slice sampling vs random sampling"
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/supplementary/montecarlo_2d_vs_3d_correlation.png"))
-    parser.add_argument("--n-iterations", type=int, default=100)
-    parser.add_argument("--radius-type", type=str, default="circular",
-                        choices=["circular", "minor"])
+                        default=Path("fig/supplementary/montecarlo_2d_vs_3d_correlation.svg"))
+    parser.add_argument("--n-iterations", type=int, default=10000)
+    parser.add_argument("--radius-type", type=str, default="minor",
+                        choices=["minor", "circular"])
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     logger.info("=" * 70)
-    logger.info("Monte Carlo: 2D Slice Sampling vs i.i.d. Sampling")
+    logger.info("Monte Carlo: 2D Slice Sampling vs Random Sampling")
     logger.info("=" * 70)
 
     # Find matching pairs
@@ -393,7 +396,7 @@ def main():
     roi_stats = []
     roi_3d_cdfs = []
 
-    bin_centers = np.arange(BIN_WIDTH_UM / 2, MAX_RADIUS_UM, BIN_WIDTH_UM)
+    bin_centers, bin_edges, bin_width = make_bins()
 
     for sf, af, sn in all_pairs:
         logger.info(f"Processing {sn}...")
@@ -420,7 +423,7 @@ def main():
         x_3d_mean.append(np.mean(r3d))
         x_3d_reff.append(compute_r_eff(r3d))
         roi_stats.append(per_slice)
-        roi_3d_cdfs.append(compute_3d_cdf(r3d, bin_centers))
+        roi_3d_cdfs.append(compute_3d_cdf(r3d, bin_edges))
 
         logger.info(f"  {per_slice['n_valid']} valid slices, "
                     f"{len(per_slice['pooled_radii'])} pooled 2D radii, "
@@ -433,8 +436,8 @@ def main():
 
     # Monte Carlo
     logger.info(f"Running Monte Carlo ({args.n_iterations} iterations)...")
-    actual_results, fake_results = run_monte_carlo(
-        roi_stats, roi_3d_cdfs, bin_centers, args.n_iterations, seed=args.seed
+    slice_results, random_results = run_monte_carlo(
+        roi_stats, roi_3d_cdfs, bin_edges, args.n_iterations, seed=args.seed
     )
 
     # Permutation p-values (slice sampling)
@@ -446,62 +449,61 @@ def main():
         x_3d_reff, roi_stats, "r_eff", n_perm=10000, seed=args.seed + 102
     )
 
-    # Permutation p-values (i.i.d. sampling)
-    y_iid_mean = np.mean(fake_results["mean_radius"], axis=1)
-    y_iid_reff = np.mean(fake_results["r_eff"], axis=1)
+    # Permutation p-values (random sampling)
+    y_rand_mean = np.mean(random_results["mean_radius"], axis=1)
+    y_rand_reff = np.mean(random_results["r_eff"], axis=1)
     rng_perm = np.random.default_rng(args.seed + 200)
 
-    r_iid_mean_obs, _ = stats.pearsonr(x_3d_mean, y_iid_mean)
-    r_iid_reff_obs, _ = stats.pearsonr(x_3d_reff, y_iid_reff)
+    r_rand_mean_obs, _ = stats.pearsonr(x_3d_mean, y_rand_mean)
+    r_rand_reff_obs, _ = stats.pearsonr(x_3d_reff, y_rand_reff)
 
     n_perm = 10000
     count_mean, count_reff = 0, 0
     for _ in range(n_perm):
         perm = rng_perm.permutation(n_rois)
-        r_m, _ = stats.pearsonr(x_3d_mean[perm], y_iid_mean)
-        r_e, _ = stats.pearsonr(x_3d_reff[perm], y_iid_reff)
-        if r_m >= r_iid_mean_obs:
+        r_m, _ = stats.pearsonr(x_3d_mean[perm], y_rand_mean)
+        r_e, _ = stats.pearsonr(x_3d_reff[perm], y_rand_reff)
+        if r_m >= r_rand_mean_obs:
             count_mean += 1
-        if r_e >= r_iid_reff_obs:
+        if r_e >= r_rand_reff_obs:
             count_reff += 1
-    p_mean_iid = count_mean / n_perm
-    p_reff_iid = count_reff / n_perm
+    p_mean_random = count_mean / n_perm
+    p_reff_random = count_reff / n_perm
 
-    logger.info(f"  Mean radius p-values: slice={p_mean_slice:.4f}, i.i.d.={p_mean_iid:.4f}")
-    logger.info(f"  Effective radius p-values: slice={p_reff_slice:.4f}, i.i.d.={p_reff_iid:.4f}")
+    logger.info(f"  Mean radius p-values: slice={p_mean_slice:.4f}, random={p_mean_random:.4f}")
+    logger.info(f"  Effective radius p-values: slice={p_reff_slice:.4f}, random={p_reff_random:.4f}")
 
     # ── Figure ────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
     logger.info("\nPlotting panel (a): Wasserstein distance...")
-    plot_wasserstein_violin(axes[0], actual_results["wasserstein"],
-                            fake_results["wasserstein"])
+    plot_wasserstein_violin(axes[0], slice_results["wasserstein"],
+                            random_results["wasserstein"])
 
     logger.info("Plotting panel (b): Mean radius...")
-    r_mean_s, r_mean_i, r_mean_s_std, r_mean_i_std = plot_scatter_comparison(
-        axes[1], x_3d_mean, actual_results["mean_radius"],
-        fake_results["mean_radius"], "mean_radius",
-        p_actual=p_mean_slice, p_fake=p_mean_iid,
+    r_mean_s, r_mean_r, r_mean_s_std, r_mean_r_std = plot_scatter_comparison(
+        axes[1], x_3d_mean, slice_results["mean_radius"],
+        random_results["mean_radius"], "mean_radius",
+        p_slice=p_mean_slice, p_random=p_mean_random,
     )
 
     logger.info("Plotting panel (c): Effective radius...")
-    r_reff_s, r_reff_i, r_reff_s_std, r_reff_i_std = plot_scatter_comparison(
-        axes[2], x_3d_reff, actual_results["r_eff"],
-        fake_results["r_eff"], "r_eff",
-        p_actual=p_reff_slice, p_fake=p_reff_iid,
+    r_reff_s, r_reff_r, r_reff_s_std, r_reff_r_std = plot_scatter_comparison(
+        axes[2], x_3d_reff, slice_results["r_eff"],
+        random_results["r_eff"], "r_eff",
+        p_slice=p_reff_slice, p_random=p_reff_random,
     )
 
     plt.tight_layout()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.output, dpi=settings.figure["dpi"], bbox_inches="tight")
-    plt.savefig(args.output.with_suffix(".svg"), bbox_inches="tight")
     plt.close()
     logger.info(f"\nSaved figure to {args.output}")
 
     # Summary
-    wass_s = actual_results["wasserstein"].flatten()
-    wass_i = fake_results["wasserstein"].flatten()
+    wass_s = slice_results["wasserstein"].flatten()
+    wass_r = random_results["wasserstein"].flatten()
 
     def fmt_p(p):
         return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
@@ -512,15 +514,15 @@ def main():
     logger.info(f"Wasserstein distance (median, IQR):")
     logger.info(f"  2D slice sampling: {np.median(wass_s):.4f} "
                 f"({np.percentile(wass_s, 75) - np.percentile(wass_s, 25):.4f})")
-    logger.info(f"  i.i.d. sampling:   {np.median(wass_i):.4f} "
-                f"({np.percentile(wass_i, 75) - np.percentile(wass_i, 25):.4f})")
+    logger.info(f"  random sampling:   {np.median(wass_r):.4f} "
+                f"({np.percentile(wass_r, 75) - np.percentile(wass_r, 25):.4f})")
     logger.info(f"Correlation with 3D (mean ± std across MC iterations):")
     logger.info(f"  Mean radius:")
     logger.info(f"    slice: R = {r_mean_s:.2f} ± {r_mean_s_std:.2f}, {fmt_p(p_mean_slice)}")
-    logger.info(f"    i.i.d.: R = {r_mean_i:.2f} ± {r_mean_i_std:.2f}, {fmt_p(p_mean_iid)}")
+    logger.info(f"    random: R = {r_mean_r:.2f} ± {r_mean_r_std:.2f}, {fmt_p(p_mean_random)}")
     logger.info(f"  Effective radius:")
     logger.info(f"    slice: R = {r_reff_s:.2f} ± {r_reff_s_std:.2f}, {fmt_p(p_reff_slice)}")
-    logger.info(f"    i.i.d.: R = {r_reff_i:.2f} ± {r_reff_i_std:.2f}, {fmt_p(p_reff_iid)}")
+    logger.info(f"    random: R = {r_reff_r:.2f} ± {r_reff_r_std:.2f}, {fmt_p(p_reff_random)}")
 
     # Save metadata
     metadata = {
@@ -530,19 +532,19 @@ def main():
         "seed": args.seed,
         "wasserstein": {
             "slice_median": float(np.median(wass_s)),
-            "iid_median": float(np.median(wass_i)),
+            "random_median": float(np.median(wass_r)),
         },
         "mean_radius": {
             "r_slice": float(r_mean_s), "r_slice_std": float(r_mean_s_std),
             "p_slice": float(p_mean_slice),
-            "r_iid": float(r_mean_i), "r_iid_std": float(r_mean_i_std),
-            "p_iid": float(p_mean_iid),
+            "r_random": float(r_mean_r), "r_random_std": float(r_mean_r_std),
+            "p_random": float(p_mean_random),
         },
         "r_eff": {
             "r_slice": float(r_reff_s), "r_slice_std": float(r_reff_s_std),
             "p_slice": float(p_reff_slice),
-            "r_iid": float(r_reff_i), "r_iid_std": float(r_reff_i_std),
-            "p_iid": float(p_reff_iid),
+            "r_random": float(r_reff_r), "r_random_std": float(r_reff_r_std),
+            "p_random": float(p_reff_random),
         },
     }
 
