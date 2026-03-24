@@ -1,53 +1,46 @@
 """
 Extract representative axons for the individual axon stats figure.
 
-Selects 3 axons with low/mid/high CV from 3D axon profile data, extracts each
+Selects 3 axons with low/mid/high CoV from 3D axon profile data, extracts each
 from its zarr volume, PCA-aligns to Z axis, and places them side by side in a
 synthetic volume. Saves everything to a single NPZ file.
 
 Usage:
-    python scripts/processing/create_representative_axons.py
+    python scripts/processing/extract_representative_3d_axons.py
 """
 
 import argparse
-import glob as glob_module
+import glob
 import logging
-import sys
 from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import affine_transform
 
-from axonometry.io import load_zarr_volume
-
-# Find repo root (contains pyproject.toml)
-_root = Path(__file__).resolve().parent
-while not (_root / "pyproject.toml").exists():
-    _root = _root.parent
-sys.path.insert(0, str(_root))
+from axonometry.io import load_zarr_volume, ENDPOINT_TRIM_POINTS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 VOXEL_SIZE = 0.05  # μm per voxel (isotropic)
-G_BAR = 0.6  # g-ratio for conduction velocity
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_axon_data(npz_file: Path, min_length: float = 20.0):
+def load_axon_data(npz_file: Path):
     """Load axon profiles from NPZ and compute per-axon stats from main segment."""
     from axonometry.io import load_3d_profiles
 
-    raw = np.load(npz_file, allow_pickle=True)
     filtered = load_3d_profiles(npz_file)
 
     labels = filtered["labels"]
     seg_radii = filtered["segment_radii_um"]
     seg_lengths = filtered["segment_lengths_um"]
-    # Skeleton coords (unfiltered, for PCA alignment + jump detection)
+
+    # Skeleton coords are not in the filtered output — load directly
+    raw = np.load(npz_file, allow_pickle=True)
     raw_seg_skeletons = raw["segment_skeletons_um"]
 
     n_axons = len(labels)
@@ -78,14 +71,12 @@ def load_axon_data(npz_file: Path, min_length: float = 20.0):
         if mean_radii[i] > 0:
             cv[i] = std_radii[i] / mean_radii[i]
 
-        # Skeleton from raw (unfiltered) for PCA alignment
         raw_segs = raw_seg_skeletons[i]
         if len(raw_segs) > main_idx:
             main_skeleton_coords[i] = np.asarray(raw_segs[main_idx])
 
-    valid = np.isfinite(cv) & (lengths >= min_length)
-
-    logger.info(f"Loaded {npz_file.name}: {valid.sum()}/{n_axons} valid axons")
+    n_valid = np.sum(np.isfinite(cv))
+    logger.info(f"Loaded {npz_file.name}: {n_valid}/{n_axons} valid axons")
 
     return {
         "mean_radii": mean_radii,
@@ -95,7 +86,6 @@ def load_axon_data(npz_file: Path, min_length: float = 20.0):
         "labels": labels,
         "radii_profiles": main_radii_profiles,
         "skeleton_coords": main_skeleton_coords,
-        "valid_mask": valid,
     }
 
 
@@ -105,7 +95,7 @@ def load_axon_data(npz_file: Path, min_length: float = 20.0):
 
 def select_representative_axons(all_data, files, min_arc=55.0, max_arc=70.0):
     """
-    Pick 3 representative axons at the 10th, 50th, and 90th CV percentile.
+    Pick 3 representative axons at near-min (0.1th), median (50th), and near-max (99th) CoV percentile.
 
     All must have arc length in [min_arc, max_arc] μm.
     """
@@ -144,7 +134,7 @@ def select_representative_axons(all_data, files, min_arc=55.0, max_arc=70.0):
         fi = s["file_idx"]
         logger.info(
             f"  Selected: file={files[fi].name} label={_get_label(all_data, s)} "
-            f"CV={s['cv']:.3f} r={s['mean_radius']:.3f}μm len={s['length']:.1f}μm"
+            f"CoV={s['cv']:.3f} r={s['mean_radius']:.3f}μm len={s['length']:.1f}μm"
         )
     return selected
 
@@ -288,8 +278,7 @@ def extract_aligned_axons(selected, all_data, files, zarr_dir):
                               trim_min[2]:trim_max[2]]
             aligned_skel_vox = aligned_skel_vox - trim_min
 
-        # Trim skeleton endpoints to match profile trimming (20 points)
-        from axonometry.io import ENDPOINT_TRIM_POINTS
+        # Trim skeleton endpoints to match profile trimming
         if len(aligned_skel_vox) > 2 * ENDPOINT_TRIM_POINTS:
             aligned_skel_vox = aligned_skel_vox[ENDPOINT_TRIM_POINTS:-ENDPOINT_TRIM_POINTS]
 
@@ -321,18 +310,16 @@ def main():
     parser.add_argument("--zarr-dir", type=Path, default=Path("data/raw/rat/lm"))
     parser.add_argument("--output", type=Path,
                         default=Path("data/processed/rat/lm/representative_axons.npz"))
-    parser.add_argument("--min-length", type=float, default=20.0,
-                        help="Minimum length for pooled stats")
     args = parser.parse_args()
 
-    files = sorted(Path(f) for f in glob_module.glob(args.input, recursive=True))
+    files = sorted(Path(f) for f in glob.glob(args.input, recursive=True))
     if not files:
         logger.error(f"No files found: {args.input}")
         return
     logger.info(f"Found {len(files)} axon profile files")
 
     # Load all data
-    all_data = [load_axon_data(f, args.min_length) for f in files]
+    all_data = [load_axon_data(f) for f in files]
 
     # Select 3 representative axons
     logger.info("Selecting representative axons...")
@@ -386,45 +373,6 @@ def main():
     np.savez_compressed(args.output, **save_dict)
     sz = args.output.stat().st_size / 1e6
     logger.info(f"Saved to {args.output} ({sz:.1f} MB)")
-
-    # Quick sanity-check visualization
-    visualize_representative_axons(volumes, rep_axons)
-
-
-def visualize_representative_axons(volumes, rep_axons):
-    """Save a quick sanity-check PNG: ZY projections + radius profiles."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    colors = ["#6B9E6B", "#D9864A", "#8B6BAE"]  # green, orange, purple
-    fig, axes = plt.subplots(1, len(volumes) + 1, figsize=(16, 4),
-                             gridspec_kw={"width_ratios": [1] * len(volumes) + [1.5]})
-
-    for i, (vol, rep) in enumerate(zip(volumes, rep_axons)):
-        ax = axes[i]
-        proj = np.any(vol > 0, axis=1)  # ZY projection (collapse X)
-        ax.imshow(proj.T, cmap="gray_r", aspect="auto",
-                  interpolation="nearest", origin="lower")
-        ax.set_xlabel("Z [voxels]")
-        ax.set_ylabel("Y [voxels]")
-        ax.set_title(f"CV={rep['cv']:.2f} r={rep['mean_radius']:.2f}", fontsize=9)
-
-    ax = axes[-1]
-    for i, rep in enumerate(rep_axons):
-        ax.plot(rep["arc_lengths"], rep["radii"], color=colors[i],
-                label=f"CV={rep['cv']:.2f} r={rep['mean_radius']:.2f}")
-    ax.set_xlabel("Arc length [μm]")
-    ax.set_ylabel("Radius [μm]")
-    ax.legend(fontsize=8)
-
-    plt.tight_layout()
-    debug_dir = Path("fig/debug")
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    fig_path = debug_dir / "representative_axons.png"
-    plt.savefig(fig_path, dpi=120, bbox_inches="tight")
-    plt.close()
-    logger.info(f"Sanity check figure: {fig_path}")
 
 
 if __name__ == "__main__":
