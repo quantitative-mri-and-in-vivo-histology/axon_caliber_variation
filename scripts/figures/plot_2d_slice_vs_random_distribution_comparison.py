@@ -48,7 +48,7 @@ MAX_RADIUS_UM = 5.0
 
 # ── Data loading ──────────────────────────────────────────────────────────
 
-def load_and_filter_2d(npz_path: Path, radius_type: str = "circular") -> Dict:
+def load_and_filter_2d(npz_path: Path, radius_type: str = "minor") -> Dict:
     """Load 2D slice profiles with quality and label exclusion filters."""
     from axonometry.io import load_2d_profiles
     return load_2d_profiles(npz_path, radius_type=radius_type)
@@ -310,23 +310,29 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
     r_random_mean = np.mean(r_random_iter)
     r_random_std = np.std(r_random_iter)
 
-    # Mean ± std over iterations per ROI
-    slice_mean = np.mean(slice_results, axis=1)
-    slice_std = np.std(slice_results, axis=1)
-    random_mean = np.mean(random_results, axis=1)
-    random_std = np.std(random_results, axis=1)
+    # Median + IQR over iterations per ROI
+    slice_med = np.median(slice_results, axis=1)
+    slice_q25 = np.percentile(slice_results, 5, axis=1)
+    slice_q75 = np.percentile(slice_results, 95, axis=1)
+    random_med = np.median(random_results, axis=1)
+    random_q25 = np.percentile(random_results, 5, axis=1)
+    random_q75 = np.percentile(random_results, 95, axis=1)
 
-    ax.errorbar(x_3d, slice_mean, yerr=slice_std, fmt="o", color=color_slice,
+    ax.errorbar(x_3d, slice_med,
+                yerr=[slice_med - slice_q25, slice_q75 - slice_med],
+                fmt="o", color=color_slice,
                 markersize=6, capsize=err_s["capsize"], capthick=err_s["capthick"],
                 elinewidth=err_s["linewidth"], markeredgecolor="black",
                 markeredgewidth=0.5, alpha=0.8, label="2D slice-wise sampling", zorder=10)
 
-    ax.errorbar(x_3d, random_mean, yerr=random_std, fmt="x", color=color_random,
+    ax.errorbar(x_3d, random_med,
+                yerr=[random_med - random_q25, random_q75 - random_med],
+                fmt="x", color=color_random,
                 markersize=5, capsize=err_s["capsize"], capthick=err_s["capthick"],
                 elinewidth=err_s["linewidth"], markeredgecolor=color_random,
                 markeredgewidth=1.5, alpha=0.8, label="2D random sampling", zorder=10)
 
-    all_vals = np.concatenate([x_3d, slice_mean, random_mean])
+    all_vals = np.concatenate([x_3d, slice_med, random_med])
     lo = np.nanmin(all_vals) * 0.95
     hi = np.nanmax(all_vals) * 1.05
     ax.plot([lo, hi], [lo, hi], "k--", alpha=0.5, linewidth=1.5, zorder=0)
@@ -374,7 +380,7 @@ def main():
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/supplementary/montecarlo_2d_vs_3d_correlation.svg"))
+                        default=Path("fig/supplementary/2d_slice_vs_random_distribution_comparison.svg"))
     parser.add_argument("--n-iterations", type=int, default=10000)
     parser.add_argument("--radius-type", type=str, default="minor",
                         choices=["minor", "circular"])
@@ -409,15 +415,10 @@ def main():
             logger.warning(f"  Skipping - no valid slices")
             continue
 
-        # Skip ROIs with too few axons per slice on average
-        if per_slice["mean_axons_per_slice"] < 100:
-            logger.warning(f"  Skipping - mean {per_slice['mean_axons_per_slice']} axons/slice")
-            continue
-
         # 3D data
         r3d = load_3d_radii(af)
-        if len(r3d) < 100:
-            logger.warning(f"  Skipping - only {len(r3d)} 3D radii")
+        if len(r3d) == 0:
+            logger.warning(f"  Skipping - no 3D radii")
             continue
 
         x_3d_mean.append(np.mean(r3d))
