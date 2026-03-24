@@ -83,8 +83,8 @@ Figures depend on preprocessed data. Run the pipeline stages in order:
 
 | Figure   | Script                                                          | Description                                                       |
 |:---------|:----------------------------------------------------------------|:------------------------------------------------------------------|
-| Fig 2a–c | `scripts/figures/plot_individual_radius_profiles.py`            | 3D rendering and radius profiles for representative axons         |
-| Fig 2d–f | `scripts/figures/plot_individual_radius_variation_stats.py`     | CoV histogram, CoV vs mean radius, slowdown reduction             |
+| Fig 2a–b | `scripts/figures/plot_individual_radius_profiles.py`            | 3D rendering and radius profiles for representative axons         |
+| Fig 2c–e | `scripts/figures/plot_individual_radius_variation_stats.py`     | CoV histogram, CoV vs mean radius, slowdown reduction             |
 | Fig 3    | `scripts/figures/plot_2d_vs_3d_distribution_comparison.py`     | 2D/3D PDF stability, Wasserstein distance, mean and r_eff scatter |
 | Fig 4    | `scripts/figures/plot_parametric_distribution_fits.py`          | Parametric distribution fits and AIC for Human CC and Rat WM      |
 | Fig 5    | `scripts/figures/plot_sample_size_effect.py`                   | Sample size effect on radius estimation error                     |
