@@ -35,8 +35,8 @@ _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
-from axonometry import (compute_r_arith, compute_r_eff,
-                        get_plot_settings, rediscretize)
+from axonometry import (compute_r_arith, compute_r_eff, get_plot_settings,
+                        rediscretize)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ settings = get_plot_settings()
 # Constants
 DEFAULT_BIN_WIDTH = 0.05  # μm
 SAMPLE_SIZES = [100, 300, 1_000, 3_000, 10_000, 30_000, 100_000]
-N_SUBSAMPLES = 1000
+N_SUBSAMPLES = 10000
 
 SAMPLE_SIZE_LABELS = {
     100: r'$10^2$',
@@ -299,8 +299,8 @@ def plot_pdf_combined(
                 pdf_subsamples.append(pdf_sub_interp)
 
             pdf_subsamples = np.array(pdf_subsamples)
-            pdf_lo = np.percentile(pdf_subsamples, 2.5, axis=0)
-            pdf_hi = np.percentile(pdf_subsamples, 97.5, axis=0)
+            pdf_lo = np.percentile(pdf_subsamples, 25.0, axis=0)
+            pdf_hi = np.percentile(pdf_subsamples, 75.0, axis=0)
 
             # Smooth the CI bands
             sigma = 1
