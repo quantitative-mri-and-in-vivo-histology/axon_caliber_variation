@@ -53,6 +53,7 @@ def load_axon_data(npz_file: Path, min_length: float = 20.0) -> Tuple[np.ndarray
         if total_len < min_length:
             continue
         all_r = np.concatenate([np.atleast_1d(s).astype(float) for s in segs_r])
+        all_r = all_r[all_r > 0]
         if len(all_r) < 3:
             continue
         mean_radii_list.append(np.mean(all_r))
@@ -177,8 +178,8 @@ def main():
         'output_file',
         type=Path,
         nargs='?',
-        default=Path('fig/supplementary/std_vs_radius.svg'),
-        help='Output file path (default: fig/supplementary/std_vs_radius.svg)'
+        default=Path('fig/supplementary/radius_std_vs_mean.svg'),
+        help='Output file path (default: fig/supplementary/radius_std_vs_mean.svg)'
     )
     parser.add_argument(
         '--min-length',

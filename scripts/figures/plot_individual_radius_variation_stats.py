@@ -5,8 +5,8 @@ Loads axon profile NPZ files from a data directory and creates a 1×3
 panel figure using pooled statistics across all axons.
 
 Usage:
-    python scripts/figures/plot_radius_variability_stats.py
-    python scripts/figures/plot_radius_variability_stats.py --data-dir data/processed/rat/lm
+    python scripts/figures/plot_individual_radius_variation_stats.py
+    python scripts/figures/plot_individual_radius_variation_stats.py --data-dir data/processed/rat/lm
 """
 
 import argparse
@@ -34,7 +34,8 @@ def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
 
     all_mean_radii = []
     all_cv = []
-    all_slowdown = []
+    all_cond_reduction = []
+    all_diff_reduction = []
     total_axons = 0
 
     for npz_path in sorted(data_dir.glob("*_axon_profiles.npz")):
@@ -53,6 +54,7 @@ def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
 
             # Pool all radius samples across segments
             all_r = np.concatenate([np.asarray(r, dtype=np.float64) for r in seg_radii])
+            all_r = all_r[all_r > 0]
             if len(all_r) < 3:
                 continue
 
@@ -62,8 +64,11 @@ def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
 
             cv = np.std(all_r) / mean_r
 
-            # Conduction velocity reduction (Eq. 4 with g-ratio model Eq. 5)
-            # v(r) ∝ r * sqrt(-ln(g(r))), g(r) = r/(r+dm), dm = r̄*(1-ḡ)/ḡ
+            # Conduction velocity: v(r) ∝ r * sqrt(-ln(g(r)))
+            # (Rushton, J. Physiol. 1951, doi:10.1113/jphysiol.1951.sp004655)
+            # g-ratio model: g(r) = r/(r+dm), dm = r̄*(1-ḡ)/ḡ
+            # ḡ = 0.6 optimal for rat CNS
+            # (Chomiak & Hu, PLoS ONE 2009, doi:10.1371/journal.pone.0007754)
             g_bar = 0.6
             dm = mean_r * (1 - g_bar) / g_bar  # = 2*mean_r/3
             g_r = all_r / (all_r + dm)
@@ -72,11 +77,16 @@ def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
             # v_eff = 1 / <1/v(r)>
             slowness = 1.0 / v_r
             v_eff = 1.0 / np.mean(slowness)
-            slowdown = v_eff / v_ideal  # ratio < 1 means reduction
+            cond_reduction_pct = (1 - v_eff / v_ideal) * 100  # % reduction
+
+            # Along-axon diffusion reduction: 4*CV² / (1 + 4*CV²)
+            # (Lee et al., Commun. Biol. 2020, doi:10.1038/s42003-020-1050-x)
+            diff_reduction_pct = 4.0 * cv**2 / (1.0 + 4.0 * cv**2) * 100
 
             all_mean_radii.append(mean_r)
             all_cv.append(cv)
-            all_slowdown.append(slowdown)
+            all_cond_reduction.append(cond_reduction_pct)
+            all_diff_reduction.append(diff_reduction_pct)
 
         logger.info(f"  {npz_path.name}: {len(filtered['labels'])} axons")
 
@@ -85,7 +95,8 @@ def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
     return {
         "all_mean_radii": np.array(all_mean_radii),
         "all_cv": np.array(all_cv),
-        "all_slowdown": np.array(all_slowdown),
+        "all_cond_reduction": np.array(all_cond_reduction),
+        "all_diff_reduction": np.array(all_diff_reduction),
         "total_axons": total_axons,
         "n_axons_used": len(all_mean_radii),
     }
@@ -98,7 +109,7 @@ def main():
     parser.add_argument("--output", type=Path,
                         default=Path("fig/main/radius_variability_stats.svg"))
     parser.add_argument("--min-length", type=float, default=20.0,
-                        help="Minimum segment length in μm")
+                        help="Minimum total axon length in μm")
     args = parser.parse_args()
 
     if not args.data_dir.exists():
@@ -108,7 +119,8 @@ def main():
     d = load_axon_stats(args.data_dir, min_length_um=args.min_length)
     all_r = d["all_mean_radii"]
     all_cv = d["all_cv"]
-    all_slow = d["all_slowdown"]
+    all_cond = d["all_cond_reduction"]
+    all_diff = d["all_diff_reduction"]
 
     if len(all_r) == 0:
         logger.error("No axons loaded")
@@ -162,14 +174,14 @@ def main():
     ax_cv.set_xlim(0.1, 0.6)
     ax_cv.set_ylim(0, 0.385)
 
-    # --- (c) Slowdown reduction vs radius ---
+    # --- (c) Reduction vs radius (already in %) ---
     size_bins = 30
     sb_edges = np.linspace(0, x_max, size_bins + 1)
     sb_centers = (sb_edges[:-1] + sb_edges[1:]) / 2
 
-    slow_med = np.full(size_bins, np.nan)
-    slow_q25 = np.full(size_bins, np.nan)
-    slow_q75 = np.full(size_bins, np.nan)
+    cond_med = np.full(size_bins, np.nan)
+    cond_q25 = np.full(size_bins, np.nan)
+    cond_q75 = np.full(size_bins, np.nan)
     diff_med = np.full(size_bins, np.nan)
     diff_q25 = np.full(size_bins, np.nan)
     diff_q75 = np.full(size_bins, np.nan)
@@ -177,41 +189,31 @@ def main():
     for i in range(size_bins):
         mask = (all_r >= sb_edges[i]) & (all_r < sb_edges[i + 1])
         if np.sum(mask) >= 50:
-            slow_med[i] = np.median(all_slow[mask])
-            slow_q25[i] = np.percentile(all_slow[mask], 25)
-            slow_q75[i] = np.percentile(all_slow[mask], 75)
-            diff_slow = 1.0 / (1.0 + 4.0 * all_cv[mask] ** 2)
-            diff_med[i] = np.median(diff_slow)
-            diff_q25[i] = np.percentile(diff_slow, 25)
-            diff_q75[i] = np.percentile(diff_slow, 75)
+            cond_med[i] = np.median(all_cond[mask])
+            cond_q25[i] = np.percentile(all_cond[mask], 25)
+            cond_q75[i] = np.percentile(all_cond[mask], 75)
+            diff_med[i] = np.median(all_diff[mask])
+            diff_q25[i] = np.percentile(all_diff[mask], 25)
+            diff_q75[i] = np.percentile(all_diff[mask], 75)
 
-    vb = ~np.isnan(slow_med)
-
-    # Convert to reduction %
-    cond_med = (1 - slow_med) * 100
-    cond_lo = (1 - slow_q75) * 100   # flipped
-    cond_hi = (1 - slow_q25) * 100
-    diff_med_pct = (1 - diff_med) * 100
-    diff_lo = (1 - diff_q75) * 100
-    diff_hi = (1 - diff_q25) * 100
+    vb = ~np.isnan(cond_med)
 
     cond_color = settings.colors["binary_a"]
     diff_color = settings.colors["binary_b"]
 
-    med_cond = (1 - np.median(all_slow)) * 100
-    med_diff = np.median(1.0 / (1.0 + 4.0 * all_cv ** 2))
-    med_diff_pct = (1 - med_diff) * 100
+    med_cond = np.median(all_cond)
+    med_diff = np.median(all_diff)
 
     ax_vel.plot(sb_centers[vb], cond_med[vb], color=cond_color, linestyle="-",
                 linewidth=line_s["linewidth"], marker="o", markersize=line_s["marker_size"],
                 label=f"Conduction velocity\n(median: {med_cond:.1f}%)")
-    ax_vel.fill_between(sb_centers[vb], cond_lo[vb], cond_hi[vb],
+    ax_vel.fill_between(sb_centers[vb], cond_q25[vb], cond_q75[vb],
                         color=cond_color, alpha=line_s["fill_alpha"])
 
-    ax_vel.plot(sb_centers[vb], diff_med_pct[vb], color=diff_color, linestyle="-",
+    ax_vel.plot(sb_centers[vb], diff_med[vb], color=diff_color, linestyle="-",
                 linewidth=line_s["linewidth"], marker="s", markersize=line_s["marker_size"],
-                label=f"Diffusion along-axon\n(median: {med_diff_pct:.1f}%)")
-    ax_vel.fill_between(sb_centers[vb], diff_lo[vb], diff_hi[vb],
+                label=f"Diffusion along-axon\n(median: {med_diff:.1f}%)")
+    ax_vel.fill_between(sb_centers[vb], diff_q25[vb], diff_q75[vb],
                         color=diff_color, alpha=line_s["fill_alpha"])
 
     ax_vel.legend(loc="upper right", fontsize=font_s["legend_size"])
@@ -229,8 +231,8 @@ def main():
     plt.close()
 
     logger.info(f"Saved to {args.output}")
-    logger.info(f"  N={len(all_cv)} axons, mean CV={np.mean(all_cv):.3f}, "
-                f"mean reduction={100*(1-np.mean(all_slow)):.1f}%")
+    logger.info(f"  N={len(all_cv)} axons, mean CoV={np.mean(all_cv):.3f}, "
+                f"median cond. reduction={np.median(all_cond):.1f}%")
 
 
 if __name__ == "__main__":
