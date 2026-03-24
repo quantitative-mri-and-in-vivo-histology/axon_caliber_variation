@@ -354,6 +354,75 @@ def _unpack_params(params: Tuple) -> Tuple[Tuple, float, float]:
 # =============================================================================
 
 
+def _binned_nll(theta, dist, bin_edges, counts, fix_loc):
+    """Negative log-likelihood for binned data.
+
+    Args:
+        theta: Parameter vector (shape params + loc? + scale).
+        dist: scipy.stats distribution object.
+        bin_edges: Array of bin edges.
+        counts: Observed counts per bin.
+        fix_loc: If True, loc is fixed at 0 and not in theta.
+    """
+    # Reconstruct full parameter tuple
+    if fix_loc:
+        # theta = (*shape, scale)
+        shape_params = theta[:-1]
+        loc = 0.0
+        scale = theta[-1]
+    else:
+        # theta = (*shape, loc, scale)
+        shape_params = theta[:-2]
+        loc = theta[-2]
+        scale = theta[-1]
+
+    if scale <= 0:
+        return 1e20
+
+    try:
+        edge_cdfs = dist.cdf(bin_edges, *shape_params, loc=loc, scale=scale)
+        if np.any(np.isnan(edge_cdfs)):
+            return 1e20
+        bin_probs = np.diff(edge_cdfs)
+        bin_probs = np.maximum(bin_probs, MIN_BIN_PROB)
+        nll = -np.dot(counts, np.log(bin_probs))
+        return nll if np.isfinite(nll) else 1e20
+    except Exception:
+        return 1e20
+
+
+N_RESTARTS = 20  # Number of random restarts for binned MLE
+
+
+def _get_initial_params_multi(dist_name, dist, bin_centers, counts):
+    """Get multiple initial parameter estimates from different random seeds."""
+    total = counts.sum()
+    probs = counts / total
+    bin_width = bin_centers[1] - bin_centers[0]
+    n_init = min(int(total), 10_000)
+
+    all_params = []
+    for seed in range(N_RESTARTS):
+        rng = np.random.default_rng(seed)
+        sampled_bins = rng.choice(len(bin_centers), size=n_init, p=probs)
+        samples = bin_centers[sampled_bins] + rng.uniform(-bin_width / 2, bin_width / 2, n_init)
+        samples = samples[samples > 0]
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=RuntimeWarning)
+            warnings.filterwarnings('ignore', category=OptimizeWarning)
+            try:
+                if dist_name == 'genextreme':
+                    params = dist.fit(samples)
+                else:
+                    params = dist.fit(samples, floc=0)
+                all_params.append(params)
+            except Exception:
+                continue
+
+    return all_params
+
+
 def fit_distribution_mle(
     dist_name: str,
     dist: stats.rv_continuous,
@@ -361,62 +430,102 @@ def fit_distribution_mle(
     bin_edges: np.ndarray,
     counts: np.ndarray
 ) -> Optional[FitResult]:
-    """Fit distribution to histogram data using maximum likelihood."""
+    """Fit distribution to histogram data using proper binned MLE.
+
+    Maximizes the multinomial log-likelihood over bin probabilities
+    derived from the parametric CDF. Uses multiple random restarts
+    to avoid local optima.
+    """
+    from scipy.optimize import minimize
+
     total = counts.sum()
     if total == 0:
         return None
 
-    n_samples = int(total)
-    probs = counts / total
-    probs = probs / probs.sum()
-
-    # Deterministic seed per distribution for reproducible fits
-    DIST_SEEDS = {name: i * 12345 for i, (name, _) in enumerate(CANDIDATE_DISTRIBUTIONS)}
-    rng = np.random.default_rng(DIST_SEEDS.get(dist_name, 42))
-
     try:
-        bin_width = np.diff(bin_edges).mean()
-        jitter = bin_width / 2
-        sampled_bins = rng.choice(len(bin_centers), size=n_samples, p=probs)
-        samples = bin_centers[sampled_bins] + rng.uniform(-jitter, jitter, n_samples)
-        samples = samples[samples > 0]
-
-        if len(samples) < 10:
+        # Get multiple initial parameter estimates
+        all_init_params = _get_initial_params_multi(dist_name, dist, bin_centers, counts)
+        if not all_init_params:
             return None
+
+        fix_loc = (dist_name != 'genextreme')
+
+        # Bounds (same for all restarts)
+        shape_params_0, _, _ = _unpack_params(all_init_params[0])
+        n_shape = len(shape_params_0)
+        n_theta = n_shape + (1 if fix_loc else 2)
+        bounds = [(None, None)] * n_theta
+        if fix_loc:
+            bounds[-1] = (1e-8, None)  # scale > 0
+        else:
+            bounds[-2] = (None, None)  # loc
+            bounds[-1] = (1e-8, None)  # scale > 0
+
+        nll_args = (dist, bin_edges, counts, fix_loc)
+        best_result = None
 
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=RuntimeWarning)
-            warnings.filterwarnings('ignore', category=OptimizeWarning)
-            if dist_name == 'genextreme':
-                params = dist.fit(samples)
-                if params[1] < 0:
-                    params = dist.fit(samples, floc=0)
-            else:
-                params = dist.fit(samples, floc=0)
 
-        shape_params, loc, scale = _unpack_params(params)
-        pdf_values = dist.pdf(bin_centers, *shape_params, loc=loc, scale=scale)
+            for init_params in all_init_params:
+                shape_params_init, loc_init, scale_init = _unpack_params(init_params)
+                if fix_loc:
+                    theta0 = np.array([*shape_params_init, scale_init])
+                else:
+                    theta0 = np.array([*shape_params_init, loc_init, scale_init])
 
-        edge_cdfs = dist.cdf(bin_edges, *shape_params, loc=loc, scale=scale)
-        bin_probs = edge_cdfs[1:] - edge_cdfs[:-1]
-        bin_probs = np.maximum(bin_probs, MIN_BIN_PROB)
+                # Try L-BFGS-B first (fast, uses gradient)
+                result = minimize(
+                    _binned_nll, theta0, args=nll_args,
+                    method='L-BFGS-B', bounds=bounds,
+                    options={'maxiter': 1000, 'ftol': 1e-12}
+                )
 
-        nll = -np.dot(counts, np.log(bin_probs))
-        k = len(params)
+                # Fall back to Nelder-Mead if L-BFGS-B fails
+                if not np.isfinite(result.fun) or result.fun >= 1e19:
+                    result = minimize(
+                        _binned_nll, theta0, args=nll_args,
+                        method='Nelder-Mead',
+                        options={'maxiter': 5000, 'xatol': 1e-10, 'fatol': 1e-10}
+                    )
+
+                if np.isfinite(result.fun) and (best_result is None or result.fun < best_result.fun):
+                    best_result = result
+
+        if best_result is None or not np.isfinite(best_result.fun) or best_result.fun >= 1e19:
+            logger.debug(f"Optimization failed for {dist_name}")
+            return None
+
+        result = best_result
+
+        # Reconstruct full params tuple
+        if fix_loc:
+            shape_params = tuple(result.x[:-1])
+            loc = 0.0
+            scale = result.x[-1]
+        else:
+            shape_params = tuple(result.x[:-2])
+            loc = result.x[-2]
+            scale = result.x[-1]
+
+        params = (*shape_params, loc, scale)
+        nll = result.fun
+        k = len(result.x)  # only count free parameters (loc excluded when fixed)
         aic = 2 * k + 2 * nll
 
-        empirical_cdf = np.cumsum(counts) / total
-        fitted_cdf = dist.cdf(bin_centers, *shape_params, loc=loc, scale=scale)
+        bin_width = np.diff(bin_edges).mean()
+        pdf_values = dist.pdf(bin_centers, *shape_params, loc=loc, scale=scale)
 
-        # Wasserstein distance = integral of |CDF_empirical - CDF_fitted|
+        empirical_cdf = np.cumsum(counts) / total
+        fitted_cdf = dist.cdf(bin_edges[1:], *shape_params, loc=loc, scale=scale)
         wasserstein = np.sum(np.abs(empirical_cdf - fitted_cdf)) * bin_width
 
         x_fine = np.linspace(bin_centers[0], bin_centers[-1], 500)
         pdf_fine = dist.pdf(x_fine, *shape_params, loc=loc, scale=scale)
 
-        result = FitResult(
+        return FitResult(
             distribution_name=dist_name,
-            n_params=len(params),
+            n_params=k,
             params=params,
             nll=nll,
             aic=aic,
@@ -425,7 +534,6 @@ def fit_distribution_mle(
             pdf_x_fine=x_fine,
             pdf_values_fine=pdf_fine
         )
-        return result
 
     except (ValueError, RuntimeError) as e:
         logger.debug(f"Failed to fit {dist_name}: {e}")
@@ -1052,7 +1160,7 @@ def _plot_radius_bias_both_species(
         human_emp_per_sample = human_metrics.empirical_r_eff_per_sample
         rat_emp_per_sample = rat_metrics.empirical_r_eff_per_sample
         xlabel = r'$r_{\mathrm{MRI}}$ error [%]'
-        x_lim = 100  # ±100%
+        x_lim = 60  # ±60%
 
     # Compute per-sample bias for each distribution
     box_width = 0.4
@@ -1077,11 +1185,6 @@ def _plot_radius_bias_both_species(
             box_data_rat.append(rat_bias_valid)
         else:
             box_data_rat.append(np.array([]))
-
-    # Use renamed variable for annotation loop compatibility
-    violin_width = box_width
-    violin_data_human = box_data_human
-    violin_data_rat = box_data_rat
 
     # Plot boxplots for human (offset down)
     human_positions = [y_pos[i] - box_width/2 for i in range(len(box_data_human))]
@@ -1212,7 +1315,7 @@ def _plot_radius_bias_both_species(
     if radius_type == 'r_arith':
         ax.set_xticks([-5, -2.5, 0, 2.5, 5])
     else:  # r_eff
-        ax.set_xticks([-100, -50, 0, 50, 100])
+        ax.set_xticks([-60, -30, 0, 30, 60])
     ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
