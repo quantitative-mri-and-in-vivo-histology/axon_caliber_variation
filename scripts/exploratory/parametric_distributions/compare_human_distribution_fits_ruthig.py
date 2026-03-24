@@ -811,7 +811,7 @@ def create_combined_figure(
     _plot_pooled_pdf_with_fits(
         ax_a, em_pooled, em_metrics.pooled_results,
         species_color=EM_COLOR,
-        inset_xlim=(0.5, 1.2),  # EM tail
+        inset_xlim=(1.0, 3.0),  # EM tail
         distribution_order=dist_order
     )
 
