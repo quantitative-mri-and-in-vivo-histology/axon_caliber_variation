@@ -120,9 +120,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Compute fiber morphometry profiles using DeepACSON CSD approach'
     )
-    parser.add_argument('input', type=str,
+    parser.add_argument('input', type=str, nargs='?',
+                        default='data/raw/rat/lm/*_myelin.zarr',
                         help="Path to .zarr directory or glob pattern")
-    parser.add_argument('output', type=Path,
+    parser.add_argument('output', type=Path, nargs='?',
+                        default=Path('data/processed/rat/lm'),
                         help='Output .npz file (single file) OR output directory (batch mode)')
     parser.add_argument('--backend', type=str, default='fast',
                         choices=['fast', 'original'],

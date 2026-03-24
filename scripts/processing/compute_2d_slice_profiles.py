@@ -220,11 +220,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "input", type=str,
+        "input", type=str, nargs="?",
+        default="data/raw/rat/lm/*_myelin.zarr",
         help="Path to .zarr directory or glob pattern",
     )
     parser.add_argument(
-        "output", type=Path,
+        "output", type=Path, nargs="?",
+        default=Path("data/processed/rat/lm"),
         help="Output .npz file (single) or output directory (batch mode)",
     )
     parser.add_argument(
