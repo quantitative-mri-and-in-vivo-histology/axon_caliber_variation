@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Plot standard deviation of radius vs mean radius for axons.
 

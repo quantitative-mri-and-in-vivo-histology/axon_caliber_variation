@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Identify fiber direction and extract HM volumes as OME-Zarr.
 

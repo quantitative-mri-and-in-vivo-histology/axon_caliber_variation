@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Study the effect of sample size on radius estimation accuracy.
 
@@ -18,6 +17,7 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +25,9 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import to_rgba
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from scipy.ndimage import gaussian_filter1d
 
 # Find repo root (contains pyproject.toml)
@@ -42,9 +45,8 @@ settings = get_plot_settings()
 
 # Constants
 DEFAULT_BIN_WIDTH = 0.05  # μm
-# Sample sizes for bias plots (end at 10^5)
 SAMPLE_SIZES = [100, 300, 1_000, 3_000, 10_000, 30_000, 100_000]
-N_SUBSAMPLES = 500
+N_SUBSAMPLES = 1000
 
 SAMPLE_SIZE_LABELS = {
     100: r'$10^2$',
@@ -80,7 +82,7 @@ class DatasetSubsampleResults:
 
 
 # =============================================================================
-# Data Loading (reused from previous scripts)
+# Data Loading
 # =============================================================================
 
 def load_human_cc_histograms(
@@ -151,8 +153,7 @@ def load_rat_histograms(
 def subsample_histogram(
     counts: np.ndarray,
     bin_centers: np.ndarray,
-    bin_edges: np.ndarray,
-    sample_size: int
+    sample_size: int,
 ) -> np.ndarray:
     """Generate a subsample histogram from a full histogram."""
     total = counts.sum()
@@ -160,7 +161,6 @@ def subsample_histogram(
         return None
 
     probs = counts / total
-    bin_width = np.diff(bin_edges).mean()
 
     # Sample bin indices
     sampled_bins = np.random.choice(len(bin_centers), size=sample_size, p=probs)
@@ -213,7 +213,7 @@ def run_subsampling_analysis(
 
             # Subsampling
             for j in range(n_subsamples):
-                sub_counts = subsample_histogram(counts, bin_centers, bin_edges, sample_size)
+                sub_counts = subsample_histogram(counts, bin_centers, sample_size)
                 if sub_counts is None:
                     continue
                 r_arith[i, j] = compute_r_arith(counts=sub_counts, bin_centers=bin_centers)
@@ -238,8 +238,6 @@ def run_subsampling_analysis(
 # Plotting Functions
 # =============================================================================
 
-# Font size reduction for this figure (smaller than default)
-FONT_REDUCTION = 2
 
 
 def plot_pdf_combined(
@@ -254,9 +252,9 @@ def plot_pdf_combined(
 ) -> None:
     """Plot PDFs for both datasets with subsampling variability."""
     font_settings = settings.fonts
-    label_size = font_settings['label_size'] - FONT_REDUCTION
-    tick_size = font_settings['tick_size'] - FONT_REDUCTION
-    legend_size = font_settings['legend_size'] - FONT_REDUCTION
+    label_size = font_settings['label_size']
+    tick_size = font_settings['tick_size']
+    legend_size = font_settings['legend_size']
 
     # Species colors
     human_color = settings.colors['human']
@@ -304,8 +302,7 @@ def plot_pdf_combined(
             pdf_lo = np.percentile(pdf_subsamples, 2.5, axis=0)
             pdf_hi = np.percentile(pdf_subsamples, 97.5, axis=0)
 
-            # Smooth only the CI bands
-            sigma = max(1, 3 - idx)
+            # Smooth the CI bands
             sigma = 1
             pdf_lo = gaussian_filter1d(pdf_lo, sigma=sigma)
             pdf_hi = gaussian_filter1d(pdf_hi, sigma=sigma)
@@ -322,16 +319,10 @@ def plot_pdf_combined(
                    alpha=0.7, zorder=2 + idx)
 
         # Plot full distribution on top (solid line)
-        line, = ax.plot(x_eval, pdf_ref_interp, color=color, linewidth=1.5,
-                        linestyle='-', zorder=10)
+        ax.plot(x_eval, pdf_ref_interp, color=color, linewidth=1.5,
+                linestyle='-', zorder=10)
 
     # Build legend
-    import math
-
-    from matplotlib.colors import to_rgba
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-
     for bin_centers, pooled_counts, color, species_label in datasets:
         total_count = int(pooled_counts.sum())
 
@@ -396,9 +387,9 @@ def plot_within_vs_between_wasserstein(
         sample_sizes = [100, 1000, 10000]
 
     font_settings = settings.fonts
-    label_size = font_settings['label_size'] - FONT_REDUCTION
-    tick_size = font_settings['tick_size'] - FONT_REDUCTION
-    legend_size = font_settings['legend_size'] - FONT_REDUCTION
+    label_size = font_settings['label_size']
+    tick_size = font_settings['tick_size']
+    legend_size = font_settings['legend_size']
 
     # Species colors
     human_color = settings.colors['human']
@@ -492,9 +483,7 @@ def plot_within_vs_between_wasserstein(
     ax.axhline(between_median_per_species['Rat'], color=rat_color,
                linestyle='--', linewidth=2, label='Rat inter-ROI', zorder=1)
 
-    # Add legend manually
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
+    # Add legend
     handles = [
         Patch(facecolor=rat_color, alpha=0.7, label='Rat (sampling)'),
         Patch(facecolor=human_color, alpha=0.7, label='Human (sampling)'),
@@ -517,7 +506,7 @@ def plot_within_vs_between_wasserstein(
     ax.set_box_aspect(1)
 
 
-def plot_combined_bias(
+def plot_combined_rel_error(
     ax: plt.Axes,
     human_results: DatasetSubsampleResults,
     rat_results: DatasetSubsampleResults,
@@ -526,9 +515,9 @@ def plot_combined_bias(
 ) -> None:
     """Plot percentage error vs sample size for both datasets."""
     font_settings = settings.fonts
-    label_size = font_settings['label_size'] - FONT_REDUCTION
-    tick_size = font_settings['tick_size'] - FONT_REDUCTION
-    legend_size = font_settings['legend_size'] - FONT_REDUCTION
+    label_size = font_settings['label_size']
+    tick_size = font_settings['tick_size']
+    legend_size = font_settings['legend_size']
 
     # Species colors
     human_color = settings.colors['human']
@@ -545,9 +534,9 @@ def plot_combined_bias(
         if not sample_sizes_present:
             continue
 
-        bias_median = []
-        bias_lo = []
-        bias_hi = []
+        rel_error_median = []
+        rel_error_lo = []
+        rel_error_hi = []
 
         for sample_size in sample_sizes_present:
             results = dataset_results.results_by_size[sample_size]
@@ -559,25 +548,22 @@ def plot_combined_bias(
                 ref = results.reference_r_eff[:, np.newaxis]
                 values = results.r_eff
 
-            # Compute relative bias: (sub - ref) / ref * 100
-            bias = (values - ref) / ref * 100  # (n_rois, n_subs)
+            # Compute relative error: (sub - ref) / ref * 100
+            rel_error = ((values - ref) / ref * 100).ravel()
 
-            # Median bias per ROI across subsamples, then aggregate
-            roi_bias = np.nanmedian(bias, axis=1)  # (n_rois,)
+            rel_error_median.append(np.nanmedian(rel_error))
+            rel_error_lo.append(np.nanpercentile(rel_error, 25))
+            rel_error_hi.append(np.nanpercentile(rel_error, 75))
 
-            bias_median.append(np.nanmedian(roi_bias))
-            bias_lo.append(np.nanpercentile(roi_bias, 25))
-            bias_hi.append(np.nanpercentile(roi_bias, 75))
-
-        bias_median = np.array(bias_median)
-        bias_lo = np.array(bias_lo)
-        bias_hi = np.array(bias_hi)
+        rel_error_median = np.array(rel_error_median)
+        rel_error_lo = np.array(rel_error_lo)
+        rel_error_hi = np.array(rel_error_hi)
 
         # Plot IQR band
-        ax.fill_between(sample_sizes_present, bias_lo, bias_hi, alpha=0.2, color=color)
+        ax.fill_between(sample_sizes_present, rel_error_lo, rel_error_hi, alpha=0.2, color=color)
 
         # Plot line with markers at all sample sizes
-        ax.plot(sample_sizes_present, bias_median, color=color, marker=marker,
+        ax.plot(sample_sizes_present, rel_error_median, color=color, marker=marker,
                 markersize=6, linewidth=2, label=label)
 
     ax.axhline(0, color='black', linestyle='-', linewidth=1)
@@ -599,7 +585,7 @@ def create_figure(
     n_subsamples: int = N_SUBSAMPLES
 ) -> None:
     """Create the 2×2 figure."""
-    fig, axes = plt.subplots(2, 2, figsize=(7, 7))
+    fig, axes = plt.subplots(2, 2, figsize=(10, 9))
 
     # Sample sizes for subsampling visualization (10^3 only)
     pdf_sample_sizes = [1_000]
@@ -619,11 +605,11 @@ def create_figure(
                                         sample_sizes=[100, 1000, 10000, 100000], n_subsamples=n_subsamples)
 
     # (c) Arithmetic mean radius: percentage error vs sample size (both datasets)
-    plot_combined_bias(axes[1, 0], human_results, rat_results,
+    plot_combined_rel_error(axes[1, 0], human_results, rat_results,
                        'r_arith', r'$\bar{r}$ error [%]')
 
     # (d) Effective radius: percentage error vs sample size (both datasets)
-    plot_combined_bias(axes[1, 1], human_results, rat_results,
+    plot_combined_rel_error(axes[1, 1], human_results, rat_results,
                        'r_eff', r'$r_{\mathrm{MRI}}$ error [%]')
 
     # Set y-axis scale symmetric around 0 for each panel independently

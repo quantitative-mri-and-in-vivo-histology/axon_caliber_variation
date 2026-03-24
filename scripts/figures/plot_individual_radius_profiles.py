@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Plot 3D rendering and radius profiles for 3 representative axons.
 

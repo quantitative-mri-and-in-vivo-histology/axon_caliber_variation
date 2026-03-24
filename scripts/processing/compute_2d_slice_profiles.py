@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Compute per-instance 2D regionprops for all slices in a labeled volume.
 

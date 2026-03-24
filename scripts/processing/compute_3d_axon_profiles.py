@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Compute fiber morphometry profiles by sampling perpendicular cross-sections along skeletons.
 

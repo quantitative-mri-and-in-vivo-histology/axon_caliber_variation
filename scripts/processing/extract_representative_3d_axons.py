@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Extract representative axons for the individual axon stats figure.
 

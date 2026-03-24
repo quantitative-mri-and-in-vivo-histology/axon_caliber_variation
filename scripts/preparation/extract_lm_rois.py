@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Extract all LM ROI sub-volumes as OME-Zarr with multi-resolution pyramids.
 

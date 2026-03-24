@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Monte Carlo comparison: 2D slice sampling vs i.i.d. sampling.
 

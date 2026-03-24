@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Combined distribution fitting for Human CC and Rat white matter data.
 

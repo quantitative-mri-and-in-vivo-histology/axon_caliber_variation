@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Plot radius variability statistics: CV histogram, CV vs radius, slowdown reduction.
 

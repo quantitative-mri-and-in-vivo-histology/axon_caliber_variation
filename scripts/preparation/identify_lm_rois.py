@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Identify CC and CG population ROIs using orientation-based classification and spatial separation.
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Distribution fitting comparing raw vs EM-corrected human CC data.
 

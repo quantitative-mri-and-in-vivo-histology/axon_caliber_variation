@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Compare 2D slice-based vs 3D skeleton-based radius distributions.
 

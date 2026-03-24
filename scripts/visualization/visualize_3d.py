@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Unified 3D volume viewer for Neuroglancer.
 

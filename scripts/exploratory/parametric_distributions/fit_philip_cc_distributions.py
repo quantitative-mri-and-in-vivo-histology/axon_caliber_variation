@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Distribution fitting comparison: LM vs EM human corpus callosum data.
 
