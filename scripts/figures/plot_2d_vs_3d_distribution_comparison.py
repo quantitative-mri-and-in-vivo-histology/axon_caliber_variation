@@ -28,7 +28,7 @@ import numpy as np
 from matplotlib.lines import Line2D
 from scipy import stats
 
-from axonometry import get_plot_settings, style_axis, add_panel_labels
+from axonometry import get_plot_settings, style_axis, add_panel_labels, compute_r_eff
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -106,14 +106,6 @@ def load_3d_radii(npz_path: Path) -> np.ndarray:
     d = load_3d_profiles(npz_path)
     return d['all_radii_um']
 
-
-def compute_r_eff(radii: np.ndarray) -> float:
-    """Compute effective MRI-visible radius: r_eff = (⟨r⁶⟩/⟨r²⟩)^(1/4)."""
-    if len(radii) == 0:
-        return np.nan
-    r2 = np.mean(radii ** 2)
-    r6 = np.mean(radii ** 6)
-    return (r6 / r2) ** 0.25 if r2 > 0 else np.nan
 
 
 # ── File matching ──────────────────────────────────────────────────────────

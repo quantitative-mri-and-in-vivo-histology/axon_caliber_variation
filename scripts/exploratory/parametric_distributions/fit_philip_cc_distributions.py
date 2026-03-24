@@ -41,7 +41,7 @@ _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
-from axonometry import get_plot_settings, style_axis
+from axonometry import get_plot_settings, style_axis, rediscretize
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -195,26 +195,6 @@ def get_dist_color(dist_name: str) -> str:
 # Data Loading
 # =============================================================================
 
-def rediscretize_histogram(
-    bin_edges: np.ndarray,
-    counts: np.ndarray,
-    new_bin_width: float
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Rediscretize histogram to coarser bins."""
-    min_edge = bin_edges[0]
-    max_edge = bin_edges[-1]
-    new_bin_edges = np.arange(min_edge, max_edge + new_bin_width, new_bin_width)
-    old_bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    new_counts = np.zeros(len(new_bin_edges) - 1, dtype=counts.dtype)
-    for i, center in enumerate(old_bin_centers):
-        new_bin_idx = int((center - min_edge) / new_bin_width)
-        if 0 <= new_bin_idx < len(new_counts):
-            new_counts[new_bin_idx] += counts[i]
-
-    new_bin_centers = (new_bin_edges[:-1] + new_bin_edges[1:]) / 2
-    return new_bin_edges, new_bin_centers, new_counts
-
 
 def load_lm_data(
     data_dir: Path,
@@ -241,7 +221,7 @@ def load_lm_data(
     roi_names = roiinfo['roi_id'].tolist()
 
     # Rediscretize each ROI
-    first_edges, first_centers, _ = rediscretize_histogram(
+    first_edges, first_centers, _ = rediscretize(
         bin_edges_orig, counts_matrix_orig[0], bin_width
     )
 
@@ -254,7 +234,7 @@ def load_lm_data(
     counts_matrix = np.zeros((n_rois, n_bins), dtype=float)
 
     for i in range(n_rois):
-        _, _, rediscretized = rediscretize_histogram(
+        _, _, rediscretized = rediscretize(
             bin_edges_orig, counts_matrix_orig[i], bin_width
         )
         counts_matrix[i] = rediscretized[:n_bins]

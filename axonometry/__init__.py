@@ -29,6 +29,12 @@ from .populations import (
     create_populations,
 )
 
+from .histogram import (
+    rediscretize,
+    compute_r_arith,
+    compute_r_eff,
+)
+
 from .plotting import (
     load_plot_settings,
     PlotSettings,
@@ -57,6 +63,10 @@ __all__ = [
     "classify_by_dominant_axis",
     "filter_sparse_axons",
     "create_populations",
+    # Histogram
+    "rediscretize",
+    "compute_r_arith",
+    "compute_r_eff",
     # Plotting
     "load_plot_settings",
     "PlotSettings",
