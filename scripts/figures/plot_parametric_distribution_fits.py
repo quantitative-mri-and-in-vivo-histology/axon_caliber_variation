@@ -2,19 +2,19 @@
 Combined distribution fitting for Human CC and Rat white matter data.
 
 Creates a 2x2 figure showing:
-- (a) Human CC: histogram with fitted PDFs (largest ROI)
-- (b) Rat: histogram with fitted PDFs (largest volume)
+- (a) Human CC: pooled histogram with fitted PDFs
+- (b) Rat: pooled histogram with fitted PDFs
 - (c) Human CC: AIC comparison (summed across all ROIs)
-- (d) Rat: AIC comparison (summed across all volumes)
+- (d) Rat: AIC comparison (summed across all ROIs)
 
 This script focuses purely on AIC-based model comparison. Separate scripts
 handle r_eff and r_arith evaluation.
 
 Usage:
-    python fit_combined_distributions.py \\
-        --human-data data/raw_LM \\
-        --rat-data data/processed/LM \\
-        --output fig/combined_distribution_fits.png
+    python scripts/figures/plot_parametric_distribution_fits.py \\
+        --human-data data/raw/human/lm \\
+        --rat-data data/processed/rat/lm \\
+        --output fig/main/combined_distribution_fits.svg
 """
 
 import argparse
@@ -44,93 +44,9 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 # Constants
-MAX_SAMPLES_FOR_INIT = 10000
 MIN_BIN_PROB = 1e-300
 PLOT_XLIM_MAX = 3.0
-EPS = 1e-10
 DEFAULT_BIN_WIDTH = 0.05  # um
-
-
-# =============================================================================
-# EM Correction Functions
-# =============================================================================
-
-def load_em_radii(em_dir: Path, radius_column: str = 'r_circular_equivalent') -> np.ndarray:
-    """
-    Load EM (electron microscopy) radii from CSV files.
-
-    Args:
-        em_dir: Directory containing ROI subdirectories with *_axon_radii_rp.csv files
-        radius_column: Column name for radius measure (default: r_circular_equivalent)
-
-    Returns:
-        Array of all EM radii
-    """
-    import pandas as pd
-
-    radii = []
-    for roi_dir in em_dir.iterdir():
-        if roi_dir.is_dir():
-            csv_file = roi_dir / f'{roi_dir.name}_axon_radii_rp.csv'
-            if csv_file.exists():
-                df = pd.read_csv(csv_file)
-                if radius_column in df.columns:
-                    radii.extend(df[radius_column].values)
-    return np.array(radii)
-
-
-def apply_em_correction(
-    bin_centers: np.ndarray,
-    bin_edges: np.ndarray,
-    lm_counts: np.ndarray,
-    em_radii: np.ndarray,
-    threshold: float = 0.4,
-    scale_range: Tuple[float, float] = (0.5, 1.0)
-) -> np.ndarray:
-    """
-    Apply EM-based correction to LM counts for small radii.
-
-    For r < threshold: use scaled EM counts
-    For r >= threshold: use original LM counts
-
-    The scale factor is computed by matching total counts in the scale_range
-    where both LM and EM are reliable.
-
-    Args:
-        bin_centers: Histogram bin centers
-        bin_edges: Histogram bin edges
-        lm_counts: Original LM counts
-        em_radii: Array of EM radii (raw measurements)
-        threshold: Radius threshold for correction (default: 0.4 μm)
-        scale_range: (r_min, r_max) range for computing scale factor (default: 0.5-1.0 μm)
-
-    Returns:
-        Corrected counts array
-    """
-    # Create EM histogram with same bins
-    em_counts, _ = np.histogram(em_radii, bins=bin_edges)
-
-    # Compute scale factor in reliable range
-    scale_mask = (bin_centers >= scale_range[0]) & (bin_centers <= scale_range[1])
-    em_in_range = em_counts[scale_mask].sum()
-    lm_in_range = lm_counts[scale_mask].sum()
-
-    if em_in_range < 10:
-        logger.warning(f"Too few EM counts in scale range {scale_range}: {em_in_range}")
-        return lm_counts
-
-    scale_factor = lm_in_range / em_in_range
-    logger.info(f"EM correction: scale factor = {scale_factor:.1f} (matched at {scale_range[0]}-{scale_range[1]} μm)")
-
-    # Apply correction
-    em_scaled = em_counts * scale_factor
-    corrected = np.where(bin_centers < threshold, em_scaled, lm_counts)
-
-    # Log summary
-    n_added = corrected.sum() - lm_counts.sum()
-    logger.info(f"EM correction: threshold = {threshold} μm, added {n_added:.0f} counts ({100*n_added/lm_counts.sum():.1f}%)")
-
-    return corrected.astype(lm_counts.dtype)
 
 
 # =============================================================================
@@ -143,14 +59,14 @@ class HistogramData:
     bin_edges: np.ndarray
     bin_centers: np.ndarray
     counts: np.ndarray
-    n_samples: int  # number of ROIs or volumes
+    n_samples: int  # number of ROIs
     total_count: int
     name: str = ""
 
 
 @dataclass
 class PerSampleHistogramData:
-    """Container for per-sample (ROI or volume) histogram data."""
+    """Container for per-ROI histogram data."""
     bin_edges: np.ndarray
     bin_centers: np.ndarray
     counts_matrix: np.ndarray  # (n_samples, n_bins)
@@ -167,9 +83,6 @@ class FitResult:
     params: Tuple
     nll: float
     aic: float
-    bic: float
-    ks_statistic: float
-    rmse: float
     wasserstein: float = 0.0  # Wasserstein distance between empirical and fitted CDF
     pdf_values: np.ndarray = field(default_factory=lambda: np.array([]))
     pdf_x_fine: np.ndarray = field(default_factory=lambda: np.array([]))
@@ -181,30 +94,16 @@ class AggregatedMetrics:
     """Aggregated metrics from per-sample fitting."""
     distribution_names: List[str]
     summed_aic: np.ndarray
-    n_successful_fits: np.ndarray
     pooled_results: List[FitResult]
-    # Per-distribution radius estimates (mean ± std across ROIs)
-    r_arith_mean: Dict[str, float] = field(default_factory=dict)
-    r_arith_std: Dict[str, float] = field(default_factory=dict)
-    r_eff_mean: Dict[str, float] = field(default_factory=dict)
-    r_eff_std: Dict[str, float] = field(default_factory=dict)
-    # Empirical values (mean ± std across samples)
-    empirical_r_arith_mean: float = 0.0
-    empirical_r_arith_std: float = 0.0
-    empirical_r_eff_mean: float = 0.0
-    empirical_r_eff_std: float = 0.0
-    # Per-sample arrays for scatter plots: shape (n_distributions, n_samples)
+    # Per-sample arrays: shape (n_distributions, n_samples)
     all_r_arith: np.ndarray = field(default_factory=lambda: np.array([]))
     all_r_eff: np.ndarray = field(default_factory=lambda: np.array([]))
+    all_wasserstein: np.ndarray = field(default_factory=lambda: np.array([]))
     # Per-sample empirical values: shape (n_samples,)
     empirical_r_arith_per_sample: np.ndarray = field(default_factory=lambda: np.array([]))
     empirical_r_eff_per_sample: np.ndarray = field(default_factory=lambda: np.array([]))
-    # Distribution name to index mapping (for accessing all_r_arith/all_r_eff)
+    # Distribution name to index mapping
     dist_name_to_idx: Dict[str, int] = field(default_factory=dict)
-    # Per-sample AIC values: shape (n_distributions, n_samples)
-    all_aic: np.ndarray = field(default_factory=lambda: np.array([]))
-    # Per-sample Wasserstein distances: shape (n_distributions, n_samples)
-    all_wasserstein: np.ndarray = field(default_factory=lambda: np.array([]))
     # Win rate per distribution (fraction of samples where it has lowest AIC)
     win_rate: Dict[str, float] = field(default_factory=dict)
 
@@ -217,9 +116,6 @@ class AggregatedMetrics:
 def load_human_cc_data(
     data_dir: Path,
     bin_width: float = DEFAULT_BIN_WIDTH,
-    em_correction_dir: Optional[Path] = None,
-    em_correction_threshold: float = 0.4,
-    em_correction_scale_range: Tuple[float, float] = (0.5, 1.0)
 ) -> Tuple[HistogramData, PerSampleHistogramData]:
     """
     Load human corpus callosum histogram data (MinorAxis).
@@ -227,9 +123,6 @@ def load_human_cc_data(
     Args:
         data_dir: Directory containing human LM histogram files
         bin_width: Target bin width in μm for rediscretization
-        em_correction_dir: If provided, apply EM-based correction using data from this directory
-        em_correction_threshold: Radius threshold for EM correction (default: 0.4 μm)
-        em_correction_scale_range: Range for computing scale factor (default: 0.5-1.0 μm)
 
     Returns:
         Tuple of (pooled HistogramData, per-ROI PerSampleHistogramData)
@@ -263,27 +156,6 @@ def load_human_cc_data(
     total_count = int(pooled_counts.sum())
 
     logger.info(f"Human CC: {total_count:,} total axons, {n_bins} bins")
-
-    # Apply EM correction if requested (to pooled counts only for display)
-    if em_correction_dir is not None:
-        logger.info(f"Loading EM data from {em_correction_dir}")
-        em_radii = load_em_radii(em_correction_dir)
-        logger.info(f"Loaded {len(em_radii)} EM radii")
-        pooled_counts = apply_em_correction(
-            first_centers, first_edges, pooled_counts, em_radii,
-            threshold=em_correction_threshold,
-            scale_range=em_correction_scale_range
-        )
-        total_count = int(pooled_counts.sum())
-
-        # Also apply to per-ROI counts (for r_eff computation)
-        for i in range(n_rois):
-            counts_matrix[i] = apply_em_correction(
-                first_centers, first_edges, counts_matrix[i], em_radii,
-                threshold=em_correction_threshold,
-                scale_range=em_correction_scale_range
-            )
-        sample_counts = counts_matrix.sum(axis=1)
 
     pooled = HistogramData(
         bin_edges=first_edges,
@@ -319,18 +191,18 @@ def load_rat_data(
     """
     Load rat LM data from all NPZ files.
 
-    Each volume contributes one sample. Only includes volumes with at least
+    Each ROI contributes one sample. Only includes ROIs with at least
     min_axons axons.
 
     Returns:
-        Tuple of (pooled HistogramData, per-volume PerSampleHistogramData)
+        Tuple of (pooled HistogramData, per-ROI PerSampleHistogramData)
     """
     npz_files = sorted(data_dir.glob('*_axon_profiles.npz'))
     if not npz_files:
         raise ValueError(f"No *_axon_profiles.npz files found in {data_dir}")
 
-    n_volumes = len(npz_files)
-    logger.info(f"Rat: found {n_volumes} NPZ files")
+    n_rois = len(npz_files)
+    logger.info(f"Rat: found {n_rois} NPZ files")
 
     # Determine bin structure
     bin_edges = np.arange(0, r_max + bin_width, bin_width)
@@ -343,16 +215,16 @@ def load_rat_data(
     from axonometry.io import load_3d_profiles
 
     for npz_file in npz_files:
-        volume_name = npz_file.stem.replace('_axon_profiles', '')
+        roi_name = npz_file.stem.replace('_axon_profiles', '')
         data = load_3d_profiles(npz_file)
         radii = data['all_radii_um']
         n_axons = len(data['labels'])
         if n_axons < min_axons:
-            logger.debug(f"Skipping {volume_name}: only {n_axons} axons (min: {min_axons})")
+            logger.debug(f"Skipping {roi_name}: only {n_axons} axons (min: {min_axons})")
             continue
         counts, _ = np.histogram(radii, bins=bin_edges)
         all_counts.append(counts)
-        all_names.append(volume_name)
+        all_names.append(roi_name)
 
     n_samples = len(all_counts)
     counts_matrix = np.array(all_counts, dtype=float)
@@ -360,7 +232,7 @@ def load_rat_data(
     pooled_counts = counts_matrix.sum(axis=0)
     total_count = int(pooled_counts.sum())
 
-    logger.info(f"Rat: {n_samples} volumes with ≥{min_axons} axons, {total_count:,} total radii, {n_bins} bins")
+    logger.info(f"Rat: {n_samples} ROIs with ≥{min_axons} axons, {total_count:,} total radii, {n_bins} bins")
 
     pooled = HistogramData(
         bin_edges=bin_edges,
@@ -401,15 +273,8 @@ DIST_DISPLAY_NAMES = {
     'genextreme': 'Gen. Ext. Value',
     'lognorm': 'Log Normal',
     'invgauss': 'Inverse Gaussian',
-    'fisk': 'Log Logistic',
     'fatiguelife': 'Birnbaum-Saunders',
     'gamma': 'Gamma',
-    'nakagami': 'Nakagami',
-    'weibull_min': 'Weibull',
-    'rayleigh': 'Rayleigh',
-    'rice': 'Rician',
-    'genpareto': 'Gen. Pareto',
-    'expon': 'Exponential',
 }
 
 # Multi-line display names for y-axis labels in bottom row plots
@@ -417,15 +282,8 @@ DIST_DISPLAY_NAMES_MULTILINE = {
     'genextreme': 'Gen. Ext.\nValue',
     'lognorm': 'Log\nNormal',
     'invgauss': 'Inverse\nGaussian',
-    'fisk': 'Log\nLogistic',
     'fatiguelife': 'Birnbaum-\nSaunders',
     'gamma': 'Gamma',
-    'nakagami': 'Nakagami',
-    'weibull_min': 'Weibull',
-    'rayleigh': 'Rayleigh',
-    'rice': 'Rician',
-    'genpareto': 'Gen.\nPareto',
-    'expon': 'Exponential',
 }
 
 
@@ -508,7 +366,7 @@ def fit_distribution_mle(
     if total == 0:
         return None
 
-    n_samples = min(MAX_SAMPLES_FOR_INIT, int(total))
+    n_samples = int(total)
     probs = counts / total
     probs = probs / probs.sum()
 
@@ -545,19 +403,13 @@ def fit_distribution_mle(
 
         nll = -np.dot(counts, np.log(bin_probs))
         k = len(params)
-        n = total
         aic = 2 * k + 2 * nll
-        bic = k * np.log(n) + 2 * nll
 
         empirical_cdf = np.cumsum(counts) / total
         fitted_cdf = dist.cdf(bin_centers, *shape_params, loc=loc, scale=scale)
-        ks_stat = np.max(np.abs(empirical_cdf - fitted_cdf))
 
         # Wasserstein distance = integral of |CDF_empirical - CDF_fitted|
         wasserstein = np.sum(np.abs(empirical_cdf - fitted_cdf)) * bin_width
-
-        hist_density = counts / (total * bin_width)
-        rmse = np.sqrt(np.mean((pdf_values - hist_density) ** 2))
 
         x_fine = np.linspace(bin_centers[0], bin_centers[-1], 500)
         pdf_fine = dist.pdf(x_fine, *shape_params, loc=loc, scale=scale)
@@ -568,9 +420,6 @@ def fit_distribution_mle(
             params=params,
             nll=nll,
             aic=aic,
-            bic=bic,
-            ks_statistic=ks_stat,
-            rmse=rmse,
             wasserstein=wasserstein,
             pdf_values=pdf_values,
             pdf_x_fine=x_fine,
@@ -656,7 +505,6 @@ def fit_all_samples(
 
     # Aggregate AIC
     summed_aic = np.nansum(all_aics, axis=1)
-    n_successful_fits = np.sum(~np.isnan(all_aics), axis=1)
 
     # Compute win rate: fraction of samples where each distribution has lowest AIC
     win_counts = np.zeros(n_methods)
@@ -673,21 +521,6 @@ def fit_all_samples(
     sort_idx = np.argsort(summed_aic)
     sorted_names = [all_method_names[i] for i in sort_idx]
 
-    # Aggregate r_arith and r_eff (mean and std across samples)
-    r_arith_mean = {}
-    r_arith_std = {}
-    r_eff_mean = {}
-    r_eff_std = {}
-
-    for dist_idx, dist_name in enumerate(all_method_names):
-        valid_r_arith = all_r_arith[dist_idx, ~np.isnan(all_r_arith[dist_idx])]
-        valid_r_eff = all_r_eff[dist_idx, ~np.isnan(all_r_eff[dist_idx])]
-
-        r_arith_mean[dist_name] = np.mean(valid_r_arith) if len(valid_r_arith) > 0 else np.nan
-        r_arith_std[dist_name] = np.std(valid_r_arith) if len(valid_r_arith) > 0 else np.nan
-        r_eff_mean[dist_name] = np.mean(valid_r_eff) if len(valid_r_eff) > 0 else np.nan
-        r_eff_std[dist_name] = np.std(valid_r_eff) if len(valid_r_eff) > 0 else np.nan
-
     # Fit pooled data for PDF plotting
     pooled_results = fit_all_distributions(pooled_data)
 
@@ -700,23 +533,13 @@ def fit_all_samples(
     return AggregatedMetrics(
         distribution_names=sorted_names,
         summed_aic=summed_aic[sort_idx],
-        n_successful_fits=n_successful_fits[sort_idx],
         pooled_results=pooled_results,
-        r_arith_mean=r_arith_mean,
-        r_arith_std=r_arith_std,
-        r_eff_mean=r_eff_mean,
-        r_eff_std=r_eff_std,
-        empirical_r_arith_mean=np.nanmean(empirical_r_arith),
-        empirical_r_arith_std=np.nanstd(empirical_r_arith),
-        empirical_r_eff_mean=np.nanmean(empirical_r_eff),
-        empirical_r_eff_std=np.nanstd(empirical_r_eff),
         all_r_arith=all_r_arith,
         all_r_eff=all_r_eff,
+        all_wasserstein=all_wasserstein,
         empirical_r_arith_per_sample=empirical_r_arith,
         empirical_r_eff_per_sample=empirical_r_eff,
         dist_name_to_idx=dist_name_to_idx,
-        all_aic=all_aics,
-        all_wasserstein=all_wasserstein,
         win_rate=win_rate_dict
     )
 
@@ -732,14 +555,7 @@ DIST_COLORS = {
     'lognorm': '#ff7f0e',         # Orange
     'invgauss': '#9467bd',        # Purple
     'fatiguelife': '#8c564b',     # Brown
-    'gamma': '#008080',           # Teal (distinct from brown, avoids red/blue)
-    'fisk': '#bcbd22',            # Olive
-    'nakagami': '#e377c2',        # Pink
-    'weibull_min': '#7f7f7f',     # Gray
-    'rayleigh': '#98df8a',        # Light green
-    'rice': '#c49c94',            # Tan
-    'genpareto': '#f7b6d2',       # Light pink
-    'expon': '#c7c7c7',           # Light gray
+    'gamma': '#008080',           # Teal
 }
 
 
@@ -845,10 +661,8 @@ def _plot_pooled_pdf_with_fits(
 
 def create_combined_figure(
     human_pooled: HistogramData,
-    human_largest: HistogramData,
     human_metrics: AggregatedMetrics,
     rat_pooled: HistogramData,
-    rat_largest: HistogramData,
     rat_metrics: AggregatedMetrics,
     human_per_sample: PerSampleHistogramData,
     rat_per_sample: PerSampleHistogramData,
@@ -919,7 +733,6 @@ def create_combined_figure(
     handles, labels = ax_a.get_legend_handles_labels()
 
     # Create custom half-blue/half-red patch for empirical data
-    from matplotlib.patches import FancyBboxPatch
     from matplotlib.legend_handler import HandlerBase
 
     class SplitColorHandler(HandlerBase):
@@ -995,91 +808,6 @@ def create_combined_figure(
     plt.savefig(svg_file, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved figure to {output_file} and {svg_file}")
-
-
-def _plot_histogram_illustrative(
-    ax: plt.Axes,
-    hist_data: HistogramData,
-    fit_results: List[FitResult],
-    distributions: List[str] = ['genextreme', 'gamma', 'lognorm']
-) -> None:
-    """Plot histogram with selected fitted PDFs (illustrative panel)."""
-    bin_width = np.diff(hist_data.bin_edges).mean()
-    density = hist_data.counts / (hist_data.total_count * bin_width)
-
-    ax.bar(hist_data.bin_centers, density, width=bin_width * 0.9,
-           alpha=0.6, color='gray',
-           edgecolor='white', linewidth=0.5,
-           label='Data')
-
-    # Plot only specified distributions
-    for result in fit_results:
-        if result.distribution_name in distributions:
-            color = get_dist_color(result.distribution_name)
-            display_name = get_display_name(result.distribution_name)
-            ax.plot(result.pdf_x_fine, result.pdf_values_fine, '-',
-                    color=color, linewidth=2, label=display_name)
-
-    ax.set_xlim(0, PLOT_XLIM_MAX)
-    ax.set_xlabel('Axon radius [μm]', fontsize=settings.fonts['label_size'])
-    ax.set_ylabel('Probability density', fontsize=settings.fonts['label_size'])
-    ax.legend(fontsize=settings.fonts['legend_size'], loc='upper right')
-    ax.tick_params(labelsize=settings.fonts['tick_size'])
-
-
-def _plot_summed_delta_aic(
-    ax: plt.Axes,
-    human_metrics: AggregatedMetrics,
-    rat_metrics: AggregatedMetrics,
-    human_color: str,
-    rat_color: str,
-    human_total_count: int,
-    rat_total_count: int
-) -> None:
-    """Plot summed delta AIC dot plot with both species on same axes, normalized by observation count."""
-    # Get distribution names (use human order - sorted by AIC)
-    names = human_metrics.distribution_names
-    display_names = [get_display_name(n) for n in names]
-
-    # Get summed AIC for each species and compute delta from minimum
-    human_aic = np.array([
-        human_metrics.summed_aic[human_metrics.distribution_names.index(n)]
-        if n in human_metrics.distribution_names else np.nan
-        for n in names
-    ])
-    rat_aic = np.array([
-        rat_metrics.summed_aic[rat_metrics.distribution_names.index(n)]
-        if n in rat_metrics.distribution_names else np.nan
-        for n in names
-    ])
-
-    # Delta AIC from minimum, normalized by total observation count (per million obs)
-    human_delta = (human_aic - np.nanmin(human_aic)) / human_total_count * 1e6
-    rat_delta = (rat_aic - np.nanmin(rat_aic)) / rat_total_count * 1e6
-
-    y_pos = np.arange(len(names))
-
-    # Plot dots (rat first so human is on top)
-    ax.scatter(rat_delta, y_pos, color=rat_color, s=120, marker='s',
-               label='Rat', zorder=3, edgecolor='white', linewidth=0.5)
-    ax.scatter(human_delta, y_pos, color=human_color, s=120, marker='d',
-               label='Human', zorder=4, edgecolor='white', linewidth=0.5)
-
-    # Connect dots with lines
-    for i in range(len(names)):
-        ax.plot([human_delta[i], rat_delta[i]], [y_pos[i], y_pos[i]],
-                color='gray', linewidth=1, alpha=0.5, zorder=1)
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
-    ax.set_xlabel(r'$\Delta$AIC per $10^6$ obs.', fontsize=settings.fonts['label_size'])
-    # Add margin on left for markers at 0
-    x_max = max(np.nanmax(human_delta), np.nanmax(rat_delta))
-    ax.set_xlim(-x_max * 0.05, x_max * 1.05)
-    ax.set_ylim(len(names) - 0.5, -2.0)  # Inverted, with extra padding at top
-    ax.legend(loc='upper right', fontsize=settings.fonts['legend_size'], ncol=2,
-              frameon=True, edgecolor='gray', facecolor='white', framealpha=1.0)
-    ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
 def _plot_win_rate(
@@ -1287,155 +1015,6 @@ def _plot_wasserstein_both_species(
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
-def _compute_gev_quantiles(
-    per_sample_data: PerSampleHistogramData,
-    quantile_points: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute empirical and GEV-fitted quantiles for each sample.
-
-    Returns:
-        empirical_quantiles: (n_samples, n_quantiles)
-        gev_quantiles: (n_samples, n_quantiles)
-    """
-    n_samples = per_sample_data.n_samples
-    n_q = len(quantile_points)
-
-    empirical_q = np.full((n_samples, n_q), np.nan)
-    gev_q = np.full((n_samples, n_q), np.nan)
-
-    for i in range(n_samples):
-        counts = per_sample_data.counts_matrix[i]
-        total = counts.sum()
-        if total < 100:
-            continue
-
-        # Empirical quantiles
-        cdf = np.cumsum(counts) / total
-        empirical_q[i] = np.interp(quantile_points, cdf, per_sample_data.bin_centers)
-
-        # GEV fit
-        result = fit_distribution_mle(
-            'genextreme', stats.genextreme,
-            per_sample_data.bin_centers, per_sample_data.bin_edges, counts
-        )
-        if result is not None:
-            shape_params, loc, scale = _unpack_params(result.params)
-            gev_q[i] = stats.genextreme.ppf(quantile_points, *shape_params, loc=loc, scale=scale)
-
-    return empirical_q, gev_q
-
-
-def _plot_tail_deviation(
-    ax: plt.Axes,
-    human_per_sample: PerSampleHistogramData,
-    rat_per_sample: PerSampleHistogramData,
-    human_color: str,
-    rat_color: str
-) -> None:
-    """Plot tail deviation: (GEV fitted - empirical) quantiles vs empirical quantile."""
-    quantile_points = np.linspace(0.01, 0.99, 50)
-
-    # Compute quantiles for both species
-    human_emp, human_gev = _compute_gev_quantiles(human_per_sample, quantile_points)
-    rat_emp, rat_gev = _compute_gev_quantiles(rat_per_sample, quantile_points)
-
-    # Compute deviation: fitted - empirical
-    human_dev = human_gev - human_emp  # (n_samples, n_quantiles)
-    rat_dev = rat_gev - rat_emp
-
-    # Median empirical quantile across samples (x-axis)
-    human_emp_median = np.nanmedian(human_emp, axis=0)
-    rat_emp_median = np.nanmedian(rat_emp, axis=0)
-
-    # Median and IQR of deviation
-    human_dev_median = np.nanmedian(human_dev, axis=0)
-    human_dev_lo = np.nanpercentile(human_dev, 25, axis=0)
-    human_dev_hi = np.nanpercentile(human_dev, 75, axis=0)
-
-    rat_dev_median = np.nanmedian(rat_dev, axis=0)
-    rat_dev_lo = np.nanpercentile(rat_dev, 25, axis=0)
-    rat_dev_hi = np.nanpercentile(rat_dev, 75, axis=0)
-
-    # Plot
-    ax.fill_between(human_emp_median, human_dev_lo, human_dev_hi,
-                    alpha=0.2, color=human_color)
-    ax.plot(human_emp_median, human_dev_median, color=human_color,
-            linewidth=2, label='Human CC')
-
-    ax.fill_between(rat_emp_median, rat_dev_lo, rat_dev_hi,
-                    alpha=0.2, color=rat_color)
-    ax.plot(rat_emp_median, rat_dev_median, color=rat_color,
-            linewidth=2, label='Rat WM')
-
-    ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
-    ax.set_xlabel('Empirical quantile [μm]', fontsize=settings.fonts['label_size'])
-    ax.set_ylabel('GEV − Empirical [μm]', fontsize=settings.fonts['label_size'])
-    ax.legend(loc='best', fontsize=settings.fonts['legend_size'])
-    ax.tick_params(labelsize=settings.fonts['tick_size'])
-
-
-def _plot_dumbbell(
-    ax: plt.Axes,
-    metrics: AggregatedMetrics,
-    title: str,
-    color: str
-) -> None:
-    """Plot dumbbell chart showing r_arith and r_eff bias (%) per distribution."""
-    names = metrics.distribution_names
-    display_names = [get_display_name(n) for n in names]
-
-    y_pos = np.arange(len(names))
-
-    # Get r_arith and r_eff values
-    r_arith = np.array([metrics.r_arith_mean.get(n, np.nan) for n in names])
-    r_eff = np.array([metrics.r_eff_mean.get(n, np.nan) for n in names])
-
-    # Empirical values
-    emp_r_arith = metrics.empirical_r_arith_mean
-    emp_r_eff = metrics.empirical_r_eff_mean
-
-    # Convert to percentage bias: (fitted - empirical) / empirical * 100
-    r_arith_bias = (r_arith - emp_r_arith) / emp_r_arith * 100
-    r_eff_bias = (r_eff - emp_r_eff) / emp_r_eff * 100
-
-    # Clip extreme values for visualization
-    x_max = 100
-    x_min = -100
-    r_eff_bias_clipped = np.clip(r_eff_bias, x_min, x_max)
-
-    # Plot connecting lines (dumbbells)
-    for i in range(len(names)):
-        if not np.isnan(r_arith_bias[i]) and not np.isnan(r_eff_bias[i]):
-            ax.plot([r_arith_bias[i], r_eff_bias_clipped[i]], [y_pos[i], y_pos[i]],
-                    color=color, linewidth=2, alpha=0.6, zorder=1)
-
-    # Plot dots
-    ax.scatter(r_arith_bias, y_pos, color=color, s=60, marker='o',
-               label=r'$\bar{r}$', zorder=3, edgecolor='white', linewidth=0.5)
-    ax.scatter(r_eff_bias_clipped, y_pos, color=color, s=60, marker='s',
-               label=r'$r_{\mathrm{MRI}}$', zorder=3, edgecolor='white', linewidth=0.5)
-
-    # Add arrows for clipped values
-    for i in range(len(names)):
-        if r_eff_bias[i] > x_max:
-            ax.annotate('', xy=(x_max, y_pos[i]), xytext=(x_max - 10, y_pos[i]),
-                        arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
-
-    # Add zero reference line (empirical)
-    ax.axvline(0, color='gray', linestyle='-', linewidth=1.5, alpha=0.7)
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(display_names, fontsize=settings.fonts['tick_size'])
-    ax.set_xlabel('Bias [%]', fontsize=settings.fonts['label_size'])
-    ax.set_xlim(x_min, x_max)
-    ax.invert_yaxis()
-    ax.legend(loc='lower right', fontsize=settings.fonts['legend_size'] - 1)
-    ax.tick_params(labelsize=settings.fonts['tick_size'])
-    ax.text(0.02, 0.98, title, transform=ax.transAxes,
-            fontsize=settings.fonts['label_size'], fontweight='bold',
-            va='top', ha='left')
-
-
 def _plot_radius_bias_both_species(
     ax: plt.Axes,
     human_metrics: AggregatedMetrics,
@@ -1570,7 +1149,7 @@ def _plot_radius_bias_both_species(
                             arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.5))
 
     # Add legend with boxplot-style handles (Rat first)
-    from matplotlib.patches import Patch, FancyBboxPatch
+    from matplotlib.patches import Patch
     from matplotlib.lines import Line2D
     from matplotlib.legend_handler import HandlerBase
 
@@ -1640,126 +1219,6 @@ def _plot_radius_bias_both_species(
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
-def _plot_histogram_with_fits(
-    ax: plt.Axes,
-    hist_data: HistogramData,
-    fit_results: List[FitResult],
-    title: str,
-    subtitle: str,
-    top_n: int = 5
-) -> None:
-    """Plot histogram with fitted PDFs overlaid."""
-    bin_width = np.diff(hist_data.bin_edges).mean()
-    density = hist_data.counts / (hist_data.total_count * bin_width)
-
-    ax.bar(hist_data.bin_centers, density, width=bin_width * 0.9,
-           alpha=settings.histogram['alpha'], color='steelblue',
-           edgecolor=settings.histogram['edgecolor'], linewidth=0.5,
-           label='Data')
-
-    for result in fit_results[:top_n]:
-        color = get_dist_color(result.distribution_name)
-        display_name = get_display_name(result.distribution_name)
-        ax.plot(result.pdf_x_fine, result.pdf_values_fine, '-',
-                color=color, linewidth=2, label=display_name)
-
-    ax.set_xlim(0, PLOT_XLIM_MAX)
-    ax.set_xlabel('Radius (um)', fontsize=settings.fonts['label_size'])
-    ax.set_ylabel('Probability density', fontsize=settings.fonts['label_size'])
-    ax.set_title(title, fontsize=settings.fonts['title_size'], fontweight='bold')
-    ax.legend(fontsize=8, loc='upper right')
-    ax.grid(True, alpha=0.3)
-
-    # Add subtitle with sample info
-    ax.text(0.98, 0.85, subtitle, transform=ax.transAxes,
-            fontsize=9, verticalalignment='top', horizontalalignment='right',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
-
-def _plot_aic_comparison(
-    ax: plt.Axes,
-    metrics: AggregatedMetrics,
-    title: str
-) -> None:
-    """Plot AIC comparison bar chart."""
-    names = metrics.distribution_names
-    display_names = [get_display_name(n) for n in names]
-    aics = metrics.summed_aic
-    delta_aics = aics - aics.min()
-
-    colors = [get_dist_color(name) for name in names]
-    y_pos = np.arange(len(names))
-
-    ax.barh(y_pos, delta_aics, color=colors, alpha=0.8,
-            edgecolor='black', linewidth=0.5)
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(display_names, fontsize=10)
-    ax.set_xlabel('Delta AIC (relative to best)', fontsize=settings.fonts['label_size'])
-    ax.set_title(title, fontsize=settings.fonts['label_size'], fontweight='bold')
-    ax.invert_yaxis()
-    ax.grid(True, alpha=0.3, axis='x')
-
-    # Add best model annotation
-    best_name = display_names[0]
-    ax.text(0.98, 0.02, f'Best: {best_name}', transform=ax.transAxes,
-            fontsize=10, verticalalignment='bottom', horizontalalignment='right',
-            fontweight='bold')
-
-
-def _plot_radius_comparison(
-    ax: plt.Axes,
-    metrics: AggregatedMetrics,
-    radius_type: str,
-    title: str,
-    xlim: float = 100
-) -> None:
-    """Plot radius bias bar chart (r_arith or r_eff) as percent error centered at zero."""
-    names = metrics.distribution_names
-    display_names = [get_display_name(n) for n in names]
-
-    if radius_type == 'r_arith':
-        means = np.array([metrics.r_arith_mean.get(n, np.nan) for n in names])
-        stds = np.array([metrics.r_arith_std.get(n, np.nan) for n in names])
-        empirical_mean = metrics.empirical_r_arith_mean
-        empirical_std = metrics.empirical_r_arith_std
-    else:  # r_eff
-        means = np.array([metrics.r_eff_mean.get(n, np.nan) for n in names])
-        stds = np.array([metrics.r_eff_std.get(n, np.nan) for n in names])
-        empirical_mean = metrics.empirical_r_eff_mean
-        empirical_std = metrics.empirical_r_eff_std
-
-    # Compute percent bias: (fitted - empirical) / empirical * 100
-    bias_pct = (means - empirical_mean) / empirical_mean * 100
-    std_pct = stds / empirical_mean * 100
-    empirical_std_pct = empirical_std / empirical_mean * 100
-
-    colors = [get_dist_color(name) for name in names]
-    y_pos = np.arange(len(names))
-
-    # Plot bars with error bars centered at zero
-    ax.barh(y_pos, bias_pct, xerr=std_pct, color=colors, alpha=0.8,
-            edgecolor='black', linewidth=0.5,
-            capsize=3, error_kw={'elinewidth': 1, 'capthick': 1})
-
-    # Add zero reference line
-    ax.axvline(0, color='black', linestyle='-', linewidth=1.5)
-
-    # Add empirical std as shaded region around zero
-    ax.axvspan(-empirical_std_pct, empirical_std_pct, alpha=0.2, color='gray',
-               label=f'Empirical: {empirical_mean:.3f}±{empirical_std_pct:.0f}%')
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(display_names, fontsize=10)
-    ax.set_xlabel('Bias (%)', fontsize=settings.fonts['label_size'])
-    ax.set_title(title, fontsize=settings.fonts['label_size'], fontweight='bold')
-    ax.invert_yaxis()
-    ax.grid(True, alpha=0.3, axis='x')
-    ax.legend(fontsize=7, loc='lower right')
-
-    # Fixed symmetric range for comparability
-    ax.set_xlim(-xlim, xlim)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Combined distribution fitting for Human CC and Rat data',
@@ -1778,15 +1237,6 @@ def main():
                         help='Maximum radius in um (default: 3.0)')
     parser.add_argument('--top-n', type=int, default=5,
                         help='Number of top distributions to show in histograms (default: 5)')
-    parser.add_argument('--em-correction', type=Path, default=None,
-                        help='Path to EM data directory for human CC correction (e.g., data/raw_EM). '
-                             'Replaces LM counts below threshold with scaled EM counts.')
-    parser.add_argument('--em-correction-threshold', type=float, default=0.4,
-                        help='Radius threshold for EM correction in um (default: 0.4)')
-    parser.add_argument('--em-correction-scale-range', type=float, nargs=2, default=[0.5, 1.0],
-                        metavar=('MIN', 'MAX'),
-                        help='Radius range for computing EM/LM scale factor (default: 0.5 1.0)')
-
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1796,41 +1246,12 @@ def main():
     human_pooled, human_per_sample = load_human_cc_data(
         args.human_data,
         args.bin_width,
-        em_correction_dir=args.em_correction,
-        em_correction_threshold=args.em_correction_threshold,
-        em_correction_scale_range=tuple(args.em_correction_scale_range)
     )
-
-    # Find largest ROI
-    largest_roi_idx = np.argmax(human_per_sample.sample_counts)
-    largest_roi_counts = human_per_sample.counts_matrix[largest_roi_idx]
-    human_largest = HistogramData(
-        bin_edges=human_per_sample.bin_edges,
-        bin_centers=human_per_sample.bin_centers,
-        counts=largest_roi_counts,
-        n_samples=1,
-        total_count=int(largest_roi_counts.sum()),
-        name=f"Human ROI {largest_roi_idx + 1}"
-    )
-    logger.info(f"Largest ROI: #{largest_roi_idx + 1} with {human_largest.total_count:,} axons")
 
     # Load Rat data
     logger.info("=" * 60)
     logger.info("Loading Rat data...")
     rat_pooled, rat_per_sample = load_rat_data(args.rat_data, args.bin_width, args.r_max)
-
-    # Find largest volume
-    largest_vol_idx = np.argmax(rat_per_sample.sample_counts)
-    largest_vol_counts = rat_per_sample.counts_matrix[largest_vol_idx]
-    rat_largest = HistogramData(
-        bin_edges=rat_per_sample.bin_edges,
-        bin_centers=rat_per_sample.bin_centers,
-        counts=largest_vol_counts,
-        n_samples=1,
-        total_count=int(largest_vol_counts.sum()),
-        name=rat_per_sample.sample_names[largest_vol_idx]
-    )
-    logger.info(f"Largest volume: {rat_largest.name} with {rat_largest.total_count:,} radii")
 
     # Fit per-sample and aggregate AIC
     logger.info("=" * 60)
@@ -1857,8 +1278,8 @@ def main():
     logger.info("=" * 60)
     logger.info("Creating summary figure...")
     create_combined_figure(
-        human_pooled, human_largest, human_metrics,
-        rat_pooled, rat_largest, rat_metrics,
+        human_pooled, human_metrics,
+        rat_pooled, rat_metrics,
         human_per_sample, rat_per_sample,
         args.output, args.top_n
     )
@@ -1869,16 +1290,14 @@ def main():
         'human_cc': {
             'n_rois': human_pooled.n_samples,
             'total_count': human_pooled.total_count,
-            'largest_roi_idx': int(largest_roi_idx),
             'distributions': [
                 {'name': name, 'summed_aic': float(human_metrics.summed_aic[i])}
                 for i, name in enumerate(human_metrics.distribution_names)
             ]
         },
         'rat': {
-            'n_volumes': rat_pooled.n_samples,
+            'n_rois': rat_pooled.n_samples,
             'total_count': rat_pooled.total_count,
-            'largest_volume': rat_largest.name,
             'distributions': [
                 {'name': name, 'summed_aic': float(rat_metrics.summed_aic[i])}
                 for i, name in enumerate(rat_metrics.distribution_names)
