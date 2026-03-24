@@ -34,6 +34,7 @@ from matplotlib.ticker import FormatStrFormatter
 from scipy import stats
 
 from axonometry import compute_r_eff, get_plot_settings, style_axis
+from axonometry.io import load_2d_profiles, load_3d_profiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,11 +48,6 @@ MAX_RADIUS_UM = 5.0
 
 
 # ── Data loading ──────────────────────────────────────────────────────────
-
-def load_and_filter_2d(npz_path: Path, radius_type: str = "minor") -> Dict:
-    """Load 2D slice profiles with quality and label exclusion filters."""
-    from axonometry.io import load_2d_profiles
-    return load_2d_profiles(npz_path, radius_type=radius_type)
 
 
 def compute_per_slice_stats(data: Dict) -> Dict:
@@ -84,10 +80,8 @@ def compute_per_slice_stats(data: Dict) -> Dict:
 
 
 def load_3d_radii(npz_path: Path) -> np.ndarray:
-    """Load pooled 3D radii with label exclusion."""
-    from axonometry.io import load_3d_profiles
-    d = load_3d_profiles(npz_path)
-    return d['all_radii_um']
+    """Load pooled 3D radii with endpoint trimming."""
+    return load_3d_profiles(npz_path)['all_radii_um']
 
 
 
@@ -312,11 +306,11 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
 
     # Median + IQR over iterations per ROI
     slice_med = np.median(slice_results, axis=1)
-    slice_q25 = np.percentile(slice_results, 5, axis=1)
-    slice_q75 = np.percentile(slice_results, 95, axis=1)
+    slice_q25 = np.percentile(slice_results, 25, axis=1)
+    slice_q75 = np.percentile(slice_results, 75, axis=1)
     random_med = np.median(random_results, axis=1)
-    random_q25 = np.percentile(random_results, 5, axis=1)
-    random_q75 = np.percentile(random_results, 95, axis=1)
+    random_q25 = np.percentile(random_results, 25, axis=1)
+    random_q75 = np.percentile(random_results, 75, axis=1)
 
     ax.errorbar(x_3d, slice_med,
                 yerr=[slice_med - slice_q25, slice_q75 - slice_med],
@@ -408,7 +402,7 @@ def main():
         logger.info(f"Processing {sn}...")
 
         # 2D data
-        data_2d = load_and_filter_2d(sf, args.radius_type)
+        data_2d = load_2d_profiles(sf, args.radius_type)
         per_slice = compute_per_slice_stats(data_2d)
 
         if per_slice["n_valid"] < 1:

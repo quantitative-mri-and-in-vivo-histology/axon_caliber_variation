@@ -35,7 +35,7 @@ _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
-from axonometry import (add_panel_labels, compute_r_arith, compute_r_eff,
+from axonometry import (compute_r_arith, compute_r_eff,
                         get_plot_settings, rediscretize)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

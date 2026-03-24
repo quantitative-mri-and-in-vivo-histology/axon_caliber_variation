@@ -27,7 +27,8 @@ import numpy as np
 from matplotlib.lines import Line2D
 from scipy import stats
 
-from axonometry import get_plot_settings, style_axis, add_panel_labels, compute_r_eff
+from axonometry import compute_r_eff, get_plot_settings, style_axis
+from axonometry.io import load_2d_profiles, load_3d_profiles
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -41,11 +42,6 @@ MAX_RADIUS_UM = 5.0       # Max radius for histograms
 
 
 # ── Data loading ───────────────────────────────────────────────────────────
-
-def load_and_filter_2d(npz_path: Path, radius_type: str = 'circular') -> Dict:
-    """Load 2D slice profiles with quality and label exclusion filters."""
-    from axonometry.io import load_2d_profiles
-    return load_2d_profiles(npz_path, radius_type=radius_type)
 
 
 def compute_per_slice_stats(data: Dict) -> Dict:
@@ -97,9 +93,7 @@ def compute_per_slice_pdfs(data: Dict) -> np.ndarray:
 
 def load_3d_radii(npz_path: Path) -> np.ndarray:
     """Load pooled 3D radii with endpoint trimming."""
-    from axonometry.io import load_3d_profiles
-    d = load_3d_profiles(npz_path)
-    return d['all_radii_um']
+    return load_3d_profiles(npz_path)['all_radii_um']
 
 
 
@@ -154,7 +148,7 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     bin_centers, bin_edges, bin_width = make_bins()
 
     # 2D: per-slice PDFs → median + IQR envelope
-    data_2d = cache_2d[slice_file] if cache_2d else load_and_filter_2d(slice_file, radius_type)
+    data_2d = cache_2d[slice_file] if cache_2d else load_2d_profiles(slice_file, radius_type)
     pdfs_2d = compute_per_slice_pdfs(data_2d)
     stats_2d = compute_per_slice_stats(data_2d)
 
@@ -263,7 +257,7 @@ def plot_wasserstein_panel(ax, pairs: List[Tuple[Path, Path, str]],
         roi_cdfs_3d.append(cdf_3d)
 
         # Per-slice 2D CDFs → Wasserstein vs 3D
-        data_2d = cache_2d[sf] if cache_2d else load_and_filter_2d(sf, radius_type)
+        data_2d = cache_2d[sf] if cache_2d else load_2d_profiles(sf, radius_type)
         for z in range(data_2d['n_slices']):
             r_z = data_2d['radii'][data_2d['slice_index'] == z]
             if len(r_z) < MIN_AXON_COUNT:
@@ -414,7 +408,7 @@ def run_monte_carlo(pairs: List[Tuple[Path, Path, str]],
     x_3d_reff = []
 
     for sf, af, sn in pairs:
-        data_2d = cache_2d[sf] if cache_2d else load_and_filter_2d(sf, radius_type)
+        data_2d = cache_2d[sf] if cache_2d else load_2d_profiles(sf, radius_type)
         per_slice = compute_per_slice_stats(data_2d)
 
         if per_slice['n_valid'] < 1:
@@ -490,7 +484,7 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=Path('data/processed/rat/lm'),
                         help='Directory containing slice and axon profiles')
     parser.add_argument('--output', type=Path,
-                        default=Path('fig/main/distribution_2d_vs_3d_comparison.svg'),
+                        default=Path('fig/main/2d_vs_3d_distribution_comparison.svg'),
                         help='Output figure path')
     parser.add_argument('--radius-type', type=str, default='minor',
                         choices=['circular', 'minor'], help='Radius type to use')
@@ -518,7 +512,7 @@ def main():
     cache_2d = {}
     cache_3d = {}
     for sf, af, sn in all_pairs:
-        cache_2d[sf] = load_and_filter_2d(sf, args.radius_type)
+        cache_2d[sf] = load_2d_profiles(sf, args.radius_type)
         cache_3d[af] = load_3d_radii(af)
 
     # Pick representative sample for panel (a)
@@ -530,7 +524,7 @@ def main():
             return
         # Ensure representative files are in the cache
         if rep_sf not in cache_2d:
-            cache_2d[rep_sf] = load_and_filter_2d(rep_sf, args.radius_type)
+            cache_2d[rep_sf] = load_2d_profiles(rep_sf, args.radius_type)
         if rep_af not in cache_3d:
             cache_3d[rep_af] = load_3d_radii(rep_af)
     else:
@@ -605,7 +599,6 @@ def main():
     plot_scatter_panel(axes[1, 1], all_metrics, 'r_eff', mc_results)
 
     plt.tight_layout(w_pad=2.5, h_pad=2.5)
-    add_panel_labels(axes)
 
     # Save
     args.output.parent.mkdir(parents=True, exist_ok=True)
