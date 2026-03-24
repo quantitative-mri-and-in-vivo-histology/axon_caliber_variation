@@ -73,8 +73,8 @@ Figures depend on preprocessed data. Run the pipeline stages in order:
    - `extract_rois.py` — crops each population's ROI from the raw `.mat` volumes using pre-computed `*_population_rois.json` bounding boxes, permutes axes so Z = fiber direction, and writes OME-Zarr volumes for both the labeled segmentation and companion grayscale data (if available as `.h5` files alongside the `.mat` sources)
 
 2. **Processing** (`scripts/processing/`)
-   - `compute_2d_slice_profiles.py` — extracts per-instance regionprops (area, eccentricity, radii, ...) for every cross-sectional slice along the fiber axis
-   - `compute_3d_axon_profiles.py` — traces each axon along its 3D skeleton, measuring radius variation along the bundle
+   - `compute_2d_slice_profiles.py` — extracts per-instance regionprops (area, eccentricity, radii, ...) for every cross-sectional slice along the fiber axis (~1 hour for the whole dataset on a dual 36-core Intel Xeon Gold 6254 / 750 GB RAM server)
+   - `compute_3d_axon_profiles.py` — traces each axon along its 3D skeleton, measuring radius variation along the bundle (~24 hours for the whole dataset on the same server)
    - `extract_representative_3d_axons.py` — selects representative axons (low, mid, high CoV) for visualization in Fig 2
 
 3. **Figures** — generate manuscript figures from the processed data (`scripts/figures/`)
