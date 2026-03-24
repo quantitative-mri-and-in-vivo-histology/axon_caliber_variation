@@ -11,7 +11,7 @@ Creates a 2×2 panel figure:
 (d) Effective radius scatter plot (2D vs 3D) for all samples
 
 Usage:
-  python plot_2d_vs_3d_distribution_comparison_v2.py \\
+  python plot_2d_vs_3d_distribution_comparison.py \\
       --data-dir data/processed/rat/LM \\
       --output fig/main/distribution_2d_vs_3d_comparison.svg
 """
@@ -65,9 +65,7 @@ def compute_per_slice_stats(data: Dict) -> Dict:
             continue
         counts_per_slice.append(n)
         r_arith_per_slice.append(np.mean(r_z))
-        r2 = np.mean(r_z ** 2)
-        r6 = np.mean(r_z ** 6)
-        r_eff_per_slice.append((r6 / r2) ** 0.25 if r2 > 0 else np.nan)
+        r_eff_per_slice.append(compute_r_eff(r_z))
 
     return {
         'r_arith': np.array(r_arith_per_slice),
@@ -77,14 +75,12 @@ def compute_per_slice_stats(data: Dict) -> Dict:
     }
 
 
-def compute_per_slice_pdfs(data: Dict, bin_centers: np.ndarray) -> np.ndarray:
+def compute_per_slice_pdfs(data: Dict) -> np.ndarray:
     """Compute per-slice PDFs (n_valid_slices × n_bins)."""
+    bin_centers, bin_edges, bin_width = make_bins()
     radii = data['radii']
     slices = data['slice_index']
     n_slices = data['n_slices']
-    bin_width = bin_centers[1] - bin_centers[0]
-    bin_edges = np.concatenate([[bin_centers[0] - bin_width / 2],
-                                 bin_centers + bin_width / 2])
 
     pdfs = []
     for z in range(n_slices):
@@ -138,9 +134,13 @@ def find_matching_pairs(data_dir: Path) -> List[Tuple[Path, Path, str]]:
 
 # ── Plotting ───────────────────────────────────────────────────────────────
 
-def make_bin_centers() -> np.ndarray:
-    """Standard bin centers for histogram comparison."""
-    return np.arange(BIN_WIDTH_UM / 2, MAX_RADIUS_UM, BIN_WIDTH_UM)
+def make_bins() -> Tuple[np.ndarray, np.ndarray, float]:
+    """Standard bin centers, edges, and width for histogram comparison."""
+    bin_centers = np.arange(BIN_WIDTH_UM / 2, MAX_RADIUS_UM, BIN_WIDTH_UM)
+    bin_width = bin_centers[1] - bin_centers[0]
+    bin_edges = np.concatenate([[bin_centers[0] - bin_width / 2],
+                                 bin_centers + bin_width / 2])
+    return bin_centers, bin_edges, bin_width
 
 
 
@@ -151,14 +151,11 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     """
     Panel (a): 3D and 2D pooled PDFs + r̄/r_MRI vertical markers.
     """
-    bin_centers = make_bin_centers()
-    bin_width = bin_centers[1] - bin_centers[0]
-    bin_edges = np.concatenate([[bin_centers[0] - bin_width / 2],
-                                 bin_centers + bin_width / 2])
+    bin_centers, bin_edges, bin_width = make_bins()
 
     # 2D: per-slice PDFs → median + IQR envelope
     data_2d = cache_2d[slice_file] if cache_2d else load_and_filter_2d(slice_file, radius_type)
-    pdfs_2d = compute_per_slice_pdfs(data_2d, bin_centers)
+    pdfs_2d = compute_per_slice_pdfs(data_2d)
     stats_2d = compute_per_slice_stats(data_2d)
 
     if len(pdfs_2d) == 0:
@@ -251,10 +248,7 @@ def plot_wasserstein_panel(ax, pairs: List[Tuple[Path, Path, str]],
     """
     Panel (b): Within-ROI vs between-ROI Wasserstein distances.
     """
-    bin_centers = make_bin_centers()
-    bin_width = bin_centers[1] - bin_centers[0]
-    bin_edges = np.concatenate([[bin_centers[0] - bin_width / 2],
-                                 bin_centers + bin_width / 2])
+    bin_centers, bin_edges, bin_width = make_bins()
 
     within_distances = []
     roi_cdfs_3d = []
@@ -264,10 +258,8 @@ def plot_wasserstein_panel(ax, pairs: List[Tuple[Path, Path, str]],
         r3d = cache_3d[af] if cache_3d else load_3d_radii(af)
         if len(r3d) == 0:
             continue
-        sorted_r = np.sort(r3d)
-        cdf_3d = np.interp(bin_centers, sorted_r,
-                            np.arange(1, len(sorted_r) + 1) / len(sorted_r),
-                            left=0, right=1)
+        hist_3d, _ = np.histogram(r3d, bins=bin_edges)
+        cdf_3d = np.cumsum(hist_3d) / hist_3d.sum()
         roi_cdfs_3d.append(cdf_3d)
 
         # Per-slice 2D CDFs → Wasserstein vs 3D
@@ -522,6 +514,13 @@ def main():
         logger.error("No matching 2D/3D pairs found!")
         return
 
+    # Pre-load all 2D and 3D data (avoid redundant I/O and filtering)
+    cache_2d = {}
+    cache_3d = {}
+    for sf, af, sn in all_pairs:
+        cache_2d[sf] = load_and_filter_2d(sf, args.radius_type)
+        cache_3d[af] = load_3d_radii(af)
+
     # Pick representative sample for panel (a)
     if args.representative:
         rep_sf = args.data_dir / f"{args.representative}_slice_profiles.npz"
@@ -529,26 +528,25 @@ def main():
         if not rep_sf.exists() or not rep_af.exists():
             logger.error(f"Representative sample files not found: {args.representative}")
             return
+        # Ensure representative files are in the cache
+        if rep_sf not in cache_2d:
+            cache_2d[rep_sf] = load_and_filter_2d(rep_sf, args.radius_type)
+        if rep_af not in cache_3d:
+            cache_3d[rep_af] = load_3d_radii(rep_af)
     else:
-        # Auto: pick sample with highest mean axon count per slice
+        # Auto: pick sample with highest mean axon count per slice (using filtered data)
         best_sf, best_af, best_name = None, None, None
         best_mean_count = 0
         for sf, af, sn in all_pairs:
-            d = np.load(sf)
-            mean_count = np.mean(d['n_instances_per_slice'][d['n_instances_per_slice'] > 0])
+            n_radii = len(cache_2d[sf]['radii'])
+            n_slices = cache_2d[sf]['n_slices']
+            mean_count = n_radii / max(n_slices, 1)
             if mean_count > best_mean_count:
                 best_mean_count = mean_count
                 best_sf, best_af, best_name = sf, af, sn
         rep_sf, rep_af = best_sf, best_af
         logger.info(f"Auto-selected representative: {best_name} "
-                    f"(mean {best_mean_count:.0f} instances/slice)")
-
-    # Pre-load all 2D and 3D data (avoid redundant I/O and filtering)
-    cache_2d = {}
-    cache_3d = {}
-    for sf, af, sn in all_pairs:
-        cache_2d[sf] = load_and_filter_2d(sf, args.radius_type)
-        cache_3d[af] = load_3d_radii(af)
+                    f"(mean {best_mean_count:.0f} filtered instances/slice)")
 
     # Compute 2D/3D metrics for all pairs
     all_metrics = []
@@ -607,7 +605,7 @@ def main():
     plot_scatter_panel(axes[1, 1], all_metrics, 'r_eff', mc_results)
 
     plt.tight_layout(w_pad=2.5, h_pad=2.5)
-    # add_panel_labels(axes)  # Labels added in manuscript layout
+    add_panel_labels(axes)
 
     # Save
     args.output.parent.mkdir(parents=True, exist_ok=True)
