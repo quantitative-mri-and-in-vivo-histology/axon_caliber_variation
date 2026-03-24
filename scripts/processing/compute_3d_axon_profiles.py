@@ -29,20 +29,33 @@ import argparse
 import glob
 import logging
 import os
+import sys
 import traceback
 from pathlib import Path
 
 # Import from axonometry library
-import sys
 _root = Path(__file__).resolve().parent
-while not (_root / "pyproject.toml").exists():
+for _ in range(10):
+    if (_root / "pyproject.toml").exists():
+        break
     _root = _root.parent
+else:
+    raise RuntimeError("Could not find project root (pyproject.toml)")
 sys.path.insert(0, str(_root))
 
 from axonometry.axon_profiles import compute_axon_radius_profiles
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _get_base_stem(path: Path) -> str:
+    """Strip .zarr and .ome.zarr suffixes to get the base name."""
+    name = path.name
+    for suffix in (".ome.zarr", ".zarr"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
 
 
 def batch_compute(matched_files, output_root, args):
@@ -64,9 +77,7 @@ def batch_compute(matched_files, output_root, args):
     failed = []
 
     for i, input_file in enumerate(matched_files, 1):
-        stem = input_file.stem
-        if input_file.suffix == ".zarr" or (input_file.is_dir() and ".zarr" in input_file.name):
-            stem = input_file.with_suffix("").stem if "." in input_file.stem else input_file.stem
+        stem = _get_base_stem(input_file)
         output_file = output_root / f"{stem}{args.output_suffix}.npz"
 
         logger.info(f"\n{'='*80}")
@@ -99,9 +110,9 @@ def batch_compute(matched_files, output_root, args):
     logger.info(f"Successfully processed: {len(successful)}/{len(matched_files)} files")
 
     if len(failed) > 0:
-        logger.info(f"Failed: {len(failed)} files")
+        logger.error(f"Failed: {len(failed)} files")
         for filename, error in failed:
-            logger.info(f"  - {filename}: {error}")
+            logger.error(f"  - {filename}: {error}")
     logger.info(f"{'='*80}\n")
 
 
@@ -134,29 +145,35 @@ if __name__ == '__main__':
     input_pattern = args.input
     output_path = args.output
 
-    matched_files = sorted(glob.glob(input_pattern, recursive=True))
+    matched_files = sorted(
+        f for f in glob.glob(input_pattern, recursive=True)
+        if f.endswith(".zarr")
+    )
 
     if len(matched_files) == 0:
-        parser.error(f"No files matched pattern: {input_pattern}")
+        parser.error(f"No .zarr files matched pattern: {input_pattern}")
     elif len(matched_files) == 1:
         input_path = Path(matched_files[0])
 
         if output_path.suffix != ".npz":
-            stem = input_path.stem
-            if input_path.suffix == ".zarr" or (input_path.is_dir() and ".zarr" in input_path.name):
-                stem = input_path.with_suffix("").stem if "." in input_path.stem else input_path.stem
+            stem = _get_base_stem(input_path)
             output_path = output_path / f"{stem}{args.output_suffix}.npz"
 
-        compute_axon_radius_profiles(
-            input_path,
-            output_path,
-            max_radius_um=args.max_axon_radius,
-            step_size_um=args.step_size,
-            max_axons=args.max_axons,
-            axon_ids=args.axon_ids,
-            backend=args.backend,
-            n_jobs=args.n_jobs,
-        )
+        try:
+            compute_axon_radius_profiles(
+                input_path,
+                output_path,
+                max_radius_um=args.max_axon_radius,
+                step_size_um=args.step_size,
+                max_axons=args.max_axons,
+                axon_ids=args.axon_ids,
+                backend=args.backend,
+                n_jobs=args.n_jobs,
+            )
+        except Exception:
+            logger.error(f"Failed to process {input_path}")
+            traceback.print_exc()
+            sys.exit(1)
     else:
         matched_paths = [Path(f) for f in matched_files]
         if output_path.suffix == ".npz":
