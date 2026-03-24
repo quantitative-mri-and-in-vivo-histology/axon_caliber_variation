@@ -1035,7 +1035,6 @@ def create_combined_figure(
     _plot_radius_bias(ax_eff, all_metrics, modality_names, 'r_eff')
 
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
-    plt.savefig(output_file.with_suffix('.svg'), bbox_inches='tight')
     plt.close()
 
     logger.info(f"Saved figure to {output_file}")
@@ -1054,7 +1053,7 @@ def main():
                         help='Path to LM data directory')
     parser.add_argument('--em-data', type=Path, default=Path('data/raw_philip/CC_anonymized.csv'),
                         help='Path to EM CSV file')
-    parser.add_argument('--output', type=Path, default=Path('fig/lm_vs_em_distribution_fits.png'),
+    parser.add_argument('--output', type=Path, default=Path('fig/lm_vs_em_distribution_fits.svg'),
                         help='Output figure path')
     parser.add_argument('--bin-width', type=float, default=DEFAULT_BIN_WIDTH,
                         help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')

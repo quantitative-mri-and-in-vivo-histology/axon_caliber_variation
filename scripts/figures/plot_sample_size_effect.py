@@ -625,13 +625,8 @@ def create_figure(
     plt.tight_layout()
 
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
-
-    # Also save SVG version
-    svg_file = output_file.with_suffix('.svg')
-    plt.savefig(svg_file, bbox_inches='tight')
-    logger.info(f"Saved figure to {output_file} and {svg_file}")
-
     plt.close()
+    logger.info(f"Saved figure to {output_file}")
 
 
 # =============================================================================

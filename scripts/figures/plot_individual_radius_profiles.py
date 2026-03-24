@@ -258,7 +258,6 @@ def main():
                     arc_interval=10.0)
     vol_path = args.output.with_stem(args.output.stem + "_rendering")
     plt.savefig(vol_path, dpi=800)
-    plt.savefig(vol_path.with_suffix(".png"), dpi=800)
     plt.close()
     logger.info(f"Saved rendering to {vol_path}")
 
@@ -280,7 +279,6 @@ def main():
     plt.tight_layout()
     prof_path = args.output.with_stem(args.output.stem + "_profiles")
     plt.savefig(prof_path, dpi=settings.figure["dpi"], bbox_inches="tight", pad_inches=0.02)
-    plt.savefig(prof_path.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight", pad_inches=0.02)
     plt.close()
     logger.info(f"Saved profiles to {prof_path}")
 

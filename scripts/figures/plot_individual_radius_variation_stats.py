@@ -226,7 +226,6 @@ def main():
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.output, dpi=settings.figure["dpi"], bbox_inches="tight")
-    plt.savefig(args.output.with_suffix(".png"), dpi=settings.figure["dpi"], bbox_inches="tight")
     plt.close()
 
     logger.info(f"Saved to {args.output}")

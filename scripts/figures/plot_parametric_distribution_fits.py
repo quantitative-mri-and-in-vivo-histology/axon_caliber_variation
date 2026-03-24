@@ -804,10 +804,8 @@ def create_combined_figure(
     )
 
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
-    svg_file = output_file.with_suffix('.svg')
-    plt.savefig(svg_file, bbox_inches='tight')
     plt.close()
-    logger.info(f"Saved figure to {output_file} and {svg_file}")
+    logger.info(f"Saved figure to {output_file}")
 
 
 def _plot_win_rate(

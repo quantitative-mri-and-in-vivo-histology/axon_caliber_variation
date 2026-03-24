@@ -145,11 +145,9 @@ def plot_std_vs_radius(
     # Save figure
     output_file.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
-    svg_output = output_file.with_suffix('.svg')
-    plt.savefig(svg_output, bbox_inches='tight')
     plt.close()
 
-    logger.info(f"Saved plot to {output_file} and {svg_output}")
+    logger.info(f"Saved plot to {output_file}")
 
     # Print summary statistics
     logger.info("")

@@ -610,9 +610,6 @@ def main():
     # Save
     args.output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.output, dpi=settings.figure['dpi'], bbox_inches='tight')
-    svg_path = args.output.with_suffix('.svg')
-    if args.output.suffix != '.svg':
-        plt.savefig(svg_path, bbox_inches='tight')
     plt.close()
 
     logger.info(f"\nSaved to {args.output}")
