@@ -36,7 +36,7 @@ _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
-from axonometry import get_plot_settings, rediscretize
+from axonometry import get_plot_settings, rediscretize, compute_r_arith, compute_r_eff
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -442,22 +442,10 @@ def get_display_name(scipy_name: str, multiline: bool = False) -> str:
 
 def compute_empirical_radii(bin_centers: np.ndarray, counts: np.ndarray) -> Tuple[float, float]:
     """Compute empirical r_arith and r_eff from histogram."""
-    total = counts.sum()
-    if total == 0:
-        return np.nan, np.nan
-
-    probs = counts / total
-    r = bin_centers
-
-    # r_arith = E[r]
-    r_arith = np.sum(r * probs)
-
-    # r_eff = (E[r^6] / E[r^2])^(1/4)
-    r2 = np.sum(r**2 * probs)
-    r6 = np.sum(r**6 * probs)
-    r_eff = (r6 / r2) ** 0.25 if r2 > 0 else np.nan
-
-    return r_arith, r_eff
+    return (
+        compute_r_arith(counts=counts, bin_centers=bin_centers),
+        compute_r_eff(counts=counts, bin_centers=bin_centers),
+    )
 
 
 def compute_distribution_radii(
@@ -524,17 +512,15 @@ def fit_distribution_mle(
     probs = counts / total
     probs = probs / probs.sum()
 
-    # Deterministic seed based on distribution name (hash() varies across runs)
-    # Save and restore random state to avoid corrupting caller's random sequence
+    # Deterministic seed per distribution for reproducible fits
     DIST_SEEDS = {name: i * 12345 for i, (name, _) in enumerate(CANDIDATE_DISTRIBUTIONS)}
-    saved_state = np.random.get_state()
+    rng = np.random.default_rng(DIST_SEEDS.get(dist_name, 42))
 
     try:
-        np.random.seed(DIST_SEEDS.get(dist_name, 42))
         bin_width = np.diff(bin_edges).mean()
         jitter = bin_width / 2
-        sampled_bins = np.random.choice(len(bin_centers), size=n_samples, p=probs)
-        samples = bin_centers[sampled_bins] + np.random.uniform(-jitter, jitter, n_samples)
+        sampled_bins = rng.choice(len(bin_centers), size=n_samples, p=probs)
+        samples = bin_centers[sampled_bins] + rng.uniform(-jitter, jitter, n_samples)
         samples = samples[samples > 0]
 
         if len(samples) < 10:
@@ -590,12 +576,10 @@ def fit_distribution_mle(
             pdf_x_fine=x_fine,
             pdf_values_fine=pdf_fine
         )
-        np.random.set_state(saved_state)  # Restore random state
         return result
 
     except (ValueError, RuntimeError) as e:
         logger.debug(f"Failed to fit {dist_name}: {e}")
-        np.random.set_state(saved_state)  # Restore random state
         return None
 
 
@@ -1776,394 +1760,6 @@ def _plot_radius_comparison(
     ax.set_xlim(-xlim, xlim)
 
 
-def subsample_and_fit(
-    per_sample_data: PerSampleHistogramData,
-    n_subsamples: int = 50,
-    subsample_size: int = 1000,
-    seed: int = 42
-) -> Dict:
-    """
-    Subsample from each ROI/volume and compute r_arith/r_eff.
-
-    For each subsample:
-    - Raw: compute r_arith/r_eff directly from subsampled radii
-    - Fitted: fit each distribution and compute r_arith/r_eff from fit
-
-    Returns dict with:
-    - whole_section_r_arith: (n_samples,) whole section values
-    - whole_section_r_eff: (n_samples,) whole section values
-    - subsampled: dict[method_name] -> dict with r_arith and r_eff arrays (n_samples, n_subsamples)
-    """
-    np.random.seed(seed)
-
-    n_samples = per_sample_data.n_samples
-    bin_centers = per_sample_data.bin_centers
-    bin_edges = per_sample_data.bin_edges
-    bin_width = np.diff(bin_edges).mean()
-
-    # Method names: Raw + all distributions
-    method_names = ['Raw'] + [name for name, _ in CANDIDATE_DISTRIBUTIONS]
-
-    # Initialize storage
-    whole_r_arith = np.full(n_samples, np.nan)
-    whole_r_eff = np.full(n_samples, np.nan)
-
-    subsampled = {
-        name: {
-            'r_arith': np.full((n_samples, n_subsamples), np.nan),
-            'r_eff': np.full((n_samples, n_subsamples), np.nan)
-        }
-        for name in method_names
-    }
-
-    logger.info(f"Subsampling {n_subsamples}x{subsample_size} from {n_samples} samples...")
-
-    for sample_idx in range(n_samples):
-        counts = per_sample_data.counts_matrix[sample_idx]
-        total = counts.sum()
-        if total < subsample_size:
-            continue
-
-        # Whole section r_arith and r_eff
-        whole_r_arith[sample_idx], whole_r_eff[sample_idx] = compute_empirical_radii(
-            bin_centers, counts
-        )
-
-        # Generate pseudo-radii from histogram for subsampling
-        probs = counts / total
-
-        for sub_idx in range(n_subsamples):
-            # Subsample bin indices and add jitter
-            sampled_bins = np.random.choice(len(bin_centers), size=subsample_size, p=probs)
-            jitter = np.random.uniform(-bin_width/2, bin_width/2, subsample_size)
-            radii = bin_centers[sampled_bins] + jitter
-            radii = radii[radii > 0]
-
-            if len(radii) < 100:
-                continue
-
-            # Raw: compute directly from subsampled radii
-            raw_r_arith = np.mean(radii)
-            r2 = np.mean(radii**2)
-            r6 = np.mean(radii**6)
-            raw_r_eff = (r6 / r2) ** 0.25 if r2 > 0 else np.nan
-
-            subsampled['Raw']['r_arith'][sample_idx, sub_idx] = raw_r_arith
-            subsampled['Raw']['r_eff'][sample_idx, sub_idx] = raw_r_eff
-
-            # Fitted distributions
-            sub_counts, _ = np.histogram(radii, bins=bin_edges)
-
-            for dist_name, dist in CANDIDATE_DISTRIBUTIONS:
-                result = fit_distribution_mle(
-                    dist_name, dist, bin_centers, bin_edges, sub_counts
-                )
-                if result is not None:
-                    r_arith, r_eff = compute_distribution_radii(dist, result.params)
-                    subsampled[dist_name]['r_arith'][sample_idx, sub_idx] = r_arith
-                    subsampled[dist_name]['r_eff'][sample_idx, sub_idx] = r_eff
-
-    return {
-        'whole_section_r_arith': whole_r_arith,
-        'whole_section_r_eff': whole_r_eff,
-        'subsampled': subsampled,
-        'method_names': method_names
-    }
-
-
-def create_scatter_figure(
-    subsampling_data: Dict,
-    output_file: Path,
-    dataset_name: str = "Human CC"
-) -> None:
-    """Create scatter figure: subsampled vs whole section for one dataset.
-
-    Layout: 2 rows (r_arith, r_eff) x 7 columns (Raw + 6 distributions)
-    """
-    method_names = subsampling_data['method_names']
-    n_methods = len(method_names)
-
-    fig, axes = plt.subplots(2, n_methods, figsize=(2.5 * n_methods, 5))
-
-    for col_idx, method_name in enumerate(method_names):
-        display_name = get_display_name(method_name) if method_name != 'Raw' else 'Raw'
-
-        # Row 0: r_arith
-        _plot_subsample_scatter(
-            axes[0, col_idx],
-            subsampling_data['whole_section_r_arith'],
-            subsampling_data['subsampled'][method_name]['r_arith'],
-            title=display_name,
-            ylabel=r"Subsample $r_{arith}$ ($\mu$m)" if col_idx == 0 else None
-        )
-
-        # Row 1: r_eff
-        _plot_subsample_scatter(
-            axes[1, col_idx],
-            subsampling_data['whole_section_r_eff'],
-            subsampling_data['subsampled'][method_name]['r_eff'],
-            title="",
-            ylabel=r"Subsample $r_{eff}$ ($\mu$m)" if col_idx == 0 else None,
-            xlabel=r"Whole section ($\mu$m)"
-        )
-
-    # Add dataset name as suptitle
-    fig.suptitle(dataset_name, fontsize=14, fontweight='bold', y=1.02)
-
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved scatter figure to {output_file}")
-
-
-def _plot_subsample_scatter(
-    ax: plt.Axes,
-    whole_section: np.ndarray,
-    subsampled: np.ndarray,
-    title: str,
-    ylabel: Optional[str] = None,
-    xlabel: Optional[str] = None
-) -> None:
-    """Plot subsampled values vs whole section values with error bars."""
-    # Get valid samples
-    valid_mask = ~np.isnan(whole_section)
-    if valid_mask.sum() == 0:
-        return
-
-    whole_valid = whole_section[valid_mask]
-    sub_valid = subsampled[valid_mask, :]  # (n_valid_samples, n_subsamples)
-
-    # Compute mean and std across subsamples for each ROI/volume
-    sub_mean = np.nanmean(sub_valid, axis=1)
-    sub_std = np.nanstd(sub_valid, axis=1)
-
-    # Remove any remaining NaN
-    valid = ~np.isnan(sub_mean)
-    x = whole_valid[valid]
-    y_mean = sub_mean[valid]
-    y_std = sub_std[valid]
-
-    if len(x) == 0:
-        return
-
-    # Get range
-    all_vals = np.concatenate([x, y_mean + y_std, y_mean - y_std])
-    r_min = np.nanmin(all_vals) * 0.9
-    r_max = np.nanmax(all_vals) * 1.1
-
-    # Identity line
-    ax.plot([r_min, r_max], [r_min, r_max], 'k--', linewidth=1.5, zorder=1)
-
-    # Error bar plot
-    ax.errorbar(x, y_mean, yerr=y_std, fmt='o', color='steelblue',
-                markersize=5, capsize=3, capthick=1, elinewidth=1,
-                alpha=0.7, zorder=2)
-
-    ax.set_xlim(r_min, r_max)
-    ax.set_ylim(r_min, r_max)
-    ax.set_aspect('equal', adjustable='box')
-
-    if title:
-        ax.set_title(get_display_name(title) if title != 'Raw' else title,
-                     fontsize=10, fontweight='bold')
-    if ylabel:
-        ax.set_ylabel(ylabel, fontsize=settings.fonts['label_size'])
-    if xlabel:
-        ax.set_xlabel(xlabel, fontsize=settings.fonts['label_size'])
-
-    ax.grid(True, alpha=0.3)
-
-
-def _plot_radius_scatter(
-    ax: plt.Axes,
-    metrics: AggregatedMetrics,
-    radius_type: str,
-    title: str
-) -> None:
-    """Plot scatter of fitted vs empirical radius for each ROI/volume."""
-    if radius_type == 'r_arith':
-        all_fitted = metrics.all_r_arith
-        empirical = metrics.empirical_r_arith_per_sample
-    else:  # r_eff
-        all_fitted = metrics.all_r_eff
-        empirical = metrics.empirical_r_eff_per_sample
-
-    # Get range for identity line
-    valid_empirical = empirical[~np.isnan(empirical)]
-    if len(valid_empirical) == 0:
-        return
-
-    r_min = valid_empirical.min() * 0.8
-    r_max = valid_empirical.max() * 1.2
-
-    # Plot identity line
-    ax.plot([r_min, r_max], [r_min, r_max], 'k--', linewidth=1.5, zorder=1)
-
-    # Plot raw/empirical values on the identity line
-    ax.scatter(
-        valid_empirical, valid_empirical,
-        color='black', s=50, alpha=0.8, label='Raw (empirical)',
-        marker='x', linewidth=1.5, zorder=3
-    )
-
-    # Plot each distribution
-    for dist_name, dist_idx in metrics.dist_name_to_idx.items():
-        fitted = all_fitted[dist_idx]
-        valid_mask = ~np.isnan(fitted) & ~np.isnan(empirical)
-
-        if valid_mask.sum() == 0:
-            continue
-
-        color = get_dist_color(dist_name)
-        display_name = get_display_name(dist_name)
-
-        ax.scatter(
-            empirical[valid_mask], fitted[valid_mask],
-            color=color, s=30, alpha=0.6, label=display_name,
-            edgecolor='white', linewidth=0.5, zorder=2
-        )
-
-    ax.set_xlim(r_min, r_max)
-    ax.set_ylim(r_min, r_max)
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_xlabel(r'Empirical radius ($\mu$m)', fontsize=settings.fonts['label_size'])
-    ax.set_ylabel(r'Fitted radius ($\mu$m)', fontsize=settings.fonts['label_size'])
-    ax.set_title(title, fontsize=settings.fonts['label_size'], fontweight='bold')
-    ax.legend(fontsize=8, loc='upper left')
-    ax.grid(True, alpha=0.3)
-
-
-def create_pooled_histogram_figure(
-    human_pooled: HistogramData,
-    human_metrics: AggregatedMetrics,
-    rat_pooled: HistogramData,
-    rat_metrics: AggregatedMetrics,
-    output_file: Path
-) -> None:
-    """Create three-panel figure: (a) human tail, (b) rat tail, (c) full distribution."""
-    from matplotlib.patches import ConnectionPatch
-
-    HUMAN_COLOR = '#1f77b4'  # Blue
-    RAT_COLOR = '#d62728'    # Red
-
-    fig = plt.figure(figsize=(7, 9))
-    gs = fig.add_gridspec(2, 2, height_ratios=[2.5, 1], hspace=0.5, wspace=0.3)
-
-    ax_full = fig.add_subplot(gs[0, :])        # Top (spans both columns)
-    ax_human_tail = fig.add_subplot(gs[1, 0])  # Bottom left
-    ax_rat_tail = fig.add_subplot(gs[1, 1])    # Bottom right
-
-    # Set 1:1 aspect ratio for all panels
-    ax_human_tail.set_box_aspect(1)
-    ax_rat_tail.set_box_aspect(1)
-    ax_full.set_box_aspect(1)
-
-    # Compute densities
-    human_bin_width = np.diff(human_pooled.bin_edges).mean()
-    human_density = human_pooled.counts / (human_pooled.total_count * human_bin_width)
-    rat_bin_width = np.diff(rat_pooled.bin_edges).mean()
-    rat_density = rat_pooled.counts / (rat_pooled.total_count * rat_bin_width)
-
-    # Get best fits
-    best_fit_human = human_metrics.pooled_results[0] if human_metrics.pooled_results else None
-    best_fit_rat = rat_metrics.pooled_results[0] if rat_metrics.pooled_results else None
-
-    tail_xmin, tail_xmax = 1.0, 3.0
-
-    # --- Top left (a): Human tail ---
-    tail_mask_human = (human_pooled.bin_centers >= tail_xmin) & (human_pooled.bin_centers <= tail_xmax)
-    ax_human_tail.bar(human_pooled.bin_centers[tail_mask_human], human_density[tail_mask_human],
-                      width=human_bin_width * 0.9, alpha=0.5, color=HUMAN_COLOR,
-                      edgecolor='white', linewidth=0.5)
-    if best_fit_human:
-        fine_mask = (best_fit_human.pdf_x_fine >= tail_xmin) & (best_fit_human.pdf_x_fine <= tail_xmax)
-        ax_human_tail.plot(best_fit_human.pdf_x_fine[fine_mask],
-                           best_fit_human.pdf_values_fine[fine_mask], '-',
-                           color=HUMAN_COLOR, linewidth=2)
-    ax_human_tail.set_xlim(tail_xmin, tail_xmax)
-    ax_human_tail.set_ylim(0, None)
-    ax_human_tail.set_ylabel('Prob. density', fontsize=settings.fonts['label_size'])
-    ax_human_tail.set_xlabel('Radius [μm]', fontsize=settings.fonts['label_size'])
-    ax_human_tail.tick_params(labelsize=settings.fonts['tick_size'])
-    ax_human_tail.set_title('Human CC', fontsize=settings.fonts['label_size'], color=HUMAN_COLOR)
-
-    # --- Top right (b): Rat tail ---
-    tail_mask_rat = (rat_pooled.bin_centers >= tail_xmin) & (rat_pooled.bin_centers <= tail_xmax)
-    ax_rat_tail.bar(rat_pooled.bin_centers[tail_mask_rat], rat_density[tail_mask_rat],
-                    width=rat_bin_width * 0.9, alpha=0.5, color=RAT_COLOR,
-                    edgecolor='white', linewidth=0.5)
-    if best_fit_rat:
-        fine_mask = (best_fit_rat.pdf_x_fine >= tail_xmin) & (best_fit_rat.pdf_x_fine <= tail_xmax)
-        ax_rat_tail.plot(best_fit_rat.pdf_x_fine[fine_mask],
-                         best_fit_rat.pdf_values_fine[fine_mask], '-',
-                         color=RAT_COLOR, linewidth=2)
-    ax_rat_tail.set_xlim(tail_xmin, tail_xmax)
-    ax_rat_tail.set_ylim(0, None)
-    ax_rat_tail.set_xlabel('Radius [μm]', fontsize=settings.fonts['label_size'])
-    ax_rat_tail.tick_params(labelsize=settings.fonts['tick_size'])
-    ax_rat_tail.set_title('Rat WM', fontsize=settings.fonts['label_size'], color=RAT_COLOR)
-
-    # --- Bottom (c): Full distribution ---
-    ax_full.bar(human_pooled.bin_centers, human_density, width=human_bin_width * 0.9,
-                alpha=0.5, color=HUMAN_COLOR, edgecolor='white', linewidth=0.5,
-                label=f'Human CC (n={human_pooled.total_count:,})')
-    if best_fit_human:
-        ax_full.plot(best_fit_human.pdf_x_fine, best_fit_human.pdf_values_fine, '-',
-                     color=HUMAN_COLOR, linewidth=2.5)
-
-    ax_full.bar(rat_pooled.bin_centers, rat_density, width=rat_bin_width * 0.9,
-                alpha=0.5, color=RAT_COLOR, edgecolor='white', linewidth=0.5,
-                label=f'Rat WM (n={rat_pooled.total_count:,})')
-    if best_fit_rat:
-        ax_full.plot(best_fit_rat.pdf_x_fine, best_fit_rat.pdf_values_fine, '-',
-                     color=RAT_COLOR, linewidth=2.5)
-
-    ax_full.set_xlim(0, PLOT_XLIM_MAX)
-    ax_full.set_xlabel('Axon radius [μm]', fontsize=settings.fonts['label_size'])
-    ax_full.set_ylabel('Probability density', fontsize=settings.fonts['label_size'])
-    ax_full.legend(loc='upper right', fontsize=settings.fonts['legend_size'])
-    ax_full.tick_params(labelsize=settings.fonts['tick_size'])
-
-    # Connection lines from full plot (top) down to tail panels (bottom)
-    # Human: from full plot bottom to human tail top
-    con_human_left = ConnectionPatch(
-        xyA=(tail_xmin, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmin, ax_human_tail.get_ylim()[1]), coordsB=ax_human_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_human_left)
-
-    con_human_right = ConnectionPatch(
-        xyA=(tail_xmax, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmax, ax_human_tail.get_ylim()[1]), coordsB=ax_human_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_human_right)
-
-    # Rat: from full plot bottom to rat tail top
-    con_rat_left = ConnectionPatch(
-        xyA=(tail_xmin, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmin, ax_rat_tail.get_ylim()[1]), coordsB=ax_rat_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_rat_left)
-
-    con_rat_right = ConnectionPatch(
-        xyA=(tail_xmax, 0), coordsA=ax_full.transData,
-        xyB=(tail_xmax, ax_rat_tail.get_ylim()[1]), coordsB=ax_rat_tail.transData,
-        color='0.5', linestyle='--', linewidth=0.8
-    )
-    fig.add_artist(con_rat_right)
-
-    plt.savefig(output_file, dpi=settings.figure['dpi'], bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved pooled histogram figure to {output_file}")
-
-
-# =============================================================================
-# Main
-# =============================================================================
-
 def main():
     parser = argparse.ArgumentParser(
         description='Combined distribution fitting for Human CC and Rat data',
@@ -2266,30 +1862,6 @@ def main():
         human_per_sample, rat_per_sample,
         args.output, args.top_n
     )
-
-    # Create pooled histogram figure
-    pooled_hist_output = args.output.with_stem(args.output.stem + '_histograms')
-    logger.info("Creating pooled histogram figure...")
-    create_pooled_histogram_figure(
-        human_pooled, human_metrics,
-        rat_pooled, rat_metrics,
-        pooled_hist_output
-    )
-
-    # Subsampling analysis
-    logger.info("=" * 60)
-    logger.info("Running subsampling analysis...")
-    human_subsampling = subsample_and_fit(human_per_sample, n_subsamples=50, subsample_size=1000)
-    rat_subsampling = subsample_and_fit(rat_per_sample, n_subsamples=50, subsample_size=1000)
-
-    # Create scatter figures (one per dataset)
-    human_scatter_output = args.output.with_stem(args.output.stem + '_scatter_human')
-    logger.info("Creating Human CC scatter figure...")
-    create_scatter_figure(human_subsampling, human_scatter_output, "Human CC")
-
-    rat_scatter_output = args.output.with_stem(args.output.stem + '_scatter_rat')
-    logger.info("Creating Rat WM scatter figure...")
-    create_scatter_figure(rat_subsampling, rat_scatter_output, "Rat WM")
 
     # Save JSON
     json_file = args.output.with_suffix('.json')
