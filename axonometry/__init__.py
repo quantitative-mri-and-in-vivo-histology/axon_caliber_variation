@@ -22,17 +22,16 @@ from .io import (
     downsample_mean,
 )
 
-from .populations import (
-    compute_all_orientations,
-    classify_by_dominant_axis,
-    filter_sparse_axons,
-    create_populations,
-)
-
 from .histogram import (
     rediscretize,
     compute_r_arith,
     compute_r_eff,
+)
+
+from .distribution_fitting import (
+    FitResult,
+    fit_distribution_mle,
+    compute_distribution_radii,
 )
 
 from .plotting import (
@@ -56,17 +55,16 @@ __all__ = [
     "write_ome_zarr_pyramid",
     "downsample_nearest",
     "downsample_mean",
-    # Populations
     "load_volume_downsampled",
     "precompute_axon_voxels",
-    "compute_all_orientations",
-    "classify_by_dominant_axis",
-    "filter_sparse_axons",
-    "create_populations",
     # Histogram
     "rediscretize",
     "compute_r_arith",
     "compute_r_eff",
+    # Distribution fitting
+    "FitResult",
+    "fit_distribution_mle",
+    "compute_distribution_radii",
     # Plotting
     "load_plot_settings",
     "PlotSettings",
