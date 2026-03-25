@@ -63,6 +63,8 @@ Requires Python >= 3.10.
 pip install -e ".[full]"
 ```
 
+A `.devcontainer` configuration is provided for VS Code / GitHub Codespaces with all dependencies pre-installed.
+
 ## Reproducing figures
 
 ### Processing pipeline
