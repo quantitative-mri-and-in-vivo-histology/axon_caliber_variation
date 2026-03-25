@@ -102,4 +102,4 @@ Use `--help` for available options.
 
 ## License
 
-MIT
+This project is licensed under the MIT License (see LICENSE file).
