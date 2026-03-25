@@ -251,6 +251,7 @@ CANDIDATE_DISTRIBUTIONS = [
     ('invgauss', stats.invgauss),        # Inverse gaussian
     ('fatiguelife', stats.fatiguelife),  # Birnbaum-Saunders
     ('lognorm', stats.lognorm),          # Log normal
+    ('fisk', stats.fisk),                # Log-logistic
     ('gamma', stats.gamma),              # Gamma
 ]
 
@@ -260,6 +261,7 @@ DIST_DISPLAY_NAMES = {
     'lognorm': 'Log Normal',
     'invgauss': 'Inverse Gaussian',
     'fatiguelife': 'Birnbaum-Saunders',
+    'fisk': 'Log-Logistic',
     'gamma': 'Gamma',
 }
 
@@ -269,6 +271,7 @@ DIST_DISPLAY_NAMES_MULTILINE = {
     'lognorm': 'Log\nNormal',
     'invgauss': 'Inverse\nGaussian',
     'fatiguelife': 'Birnbaum-\nSaunders',
+    'fisk': 'Log-\nLogistic',
     'gamma': 'Gamma',
 }
 
@@ -425,6 +428,7 @@ DIST_COLORS = {
     'lognorm': '#ff7f0e',         # Orange
     'invgauss': '#9467bd',        # Purple
     'fatiguelife': '#8c564b',     # Brown
+    'fisk': '#e377c2',            # Pink
     'gamma': '#008080',           # Teal
 }
 
@@ -909,7 +913,7 @@ def _plot_radius_bias_both_species(
         human_emp_per_sample = human_metrics.empirical_r_arith_per_sample
         rat_emp_per_sample = rat_metrics.empirical_r_arith_per_sample
         xlabel = r'$\bar{r}$ error [%]'
-        x_lim = 2.5  # ±2.5%
+        x_lim = 5  # ±5%
     else:  # r_eff
         human_all = human_metrics.all_r_eff
         rat_all = rat_metrics.all_r_eff
@@ -1063,7 +1067,7 @@ def _plot_radius_bias_both_species(
     ax.set_xlim(-x_lim, x_lim)
     # Add intermediate ticks
     if radius_type == 'r_arith':
-        ax.set_xticks([-2, -1, 0, 1, 2])
+        ax.set_xticks([-4, -2, 0, 2, 4])
     else:  # r_eff
         ax.set_xticks([-100, -50, 0, 50, 100])
     ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
@@ -1080,8 +1084,8 @@ def main():
                         help='Directory containing human CC TSV files (default: data/raw/human/lm)')
     parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
                         help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
-    parser.add_argument('--output', type=Path, default=Path('fig/main/combined_distribution_fits.svg'),
-                        help='Output file path (default: fig/main/combined_distribution_fits.svg)')
+    parser.add_argument('--output', type=Path, default=Path('fig/main/parametric_distribution_fits.svg'),
+                        help='Output file path (default: fig/main/parametric_distribution_fits.svg)')
     parser.add_argument('--bin-width', type=float, default=DEFAULT_BIN_WIDTH,
                         help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')
     parser.add_argument('--r-max', type=float, default=3.0,
@@ -1133,25 +1137,57 @@ def main():
         args.output
     )
 
-    # Save JSON
+    # Save JSON with full metrics
     json_file = args.output.with_suffix('.json')
-    output_data = {
-        'human_cc': {
-            'n_rois': human_pooled.n_samples,
-            'total_count': human_pooled.total_count,
-            'distributions': [
-                {'name': name, 'summed_aic': float(human_metrics.summed_aic[i])}
-                for i, name in enumerate(human_metrics.distribution_names)
-            ]
-        },
-        'rat': {
-            'n_rois': rat_pooled.n_samples,
-            'total_count': rat_pooled.total_count,
-            'distributions': [
-                {'name': name, 'summed_aic': float(rat_metrics.summed_aic[i])}
-                for i, name in enumerate(rat_metrics.distribution_names)
-            ]
+
+    def _metrics_to_dict(metrics, pooled_data):
+        """Convert AggregatedMetrics to a JSON-serializable dict."""
+        dists = []
+        for i, name in enumerate(metrics.distribution_names):
+            idx = metrics.dist_name_to_idx[name]
+            r_arith_bias = metrics.all_r_arith[idx] - metrics.empirical_r_arith_per_sample
+            r_eff_bias = metrics.all_r_eff[idx] - metrics.empirical_r_eff_per_sample
+            # Relative bias (%)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                r_arith_rel = r_arith_bias / metrics.empirical_r_arith_per_sample * 100
+                r_eff_rel = r_eff_bias / metrics.empirical_r_eff_per_sample * 100
+            r_arith_valid = r_arith_rel[np.isfinite(r_arith_rel)]
+            r_eff_valid = r_eff_rel[np.isfinite(r_eff_rel)]
+            # Pooled fit params
+            pooled_result = next(
+                (r for r in metrics.pooled_results if r.distribution_name == name), None
+            )
+            dists.append({
+                'name': name,
+                'summed_aic': float(metrics.summed_aic[i]),
+                'delta_aic': float(metrics.summed_aic[i] - metrics.summed_aic[0]),
+                'win_rate': float(metrics.win_rate.get(name, 0)),
+                'pooled_params': [float(p) for p in pooled_result.params] if pooled_result else None,
+                'pooled_nll': float(pooled_result.nll) if pooled_result else None,
+                'r_arith_bias_pct': {
+                    'mean': float(np.mean(r_arith_valid)) if len(r_arith_valid) else None,
+                    'median': float(np.median(r_arith_valid)) if len(r_arith_valid) else None,
+                    'std': float(np.std(r_arith_valid)) if len(r_arith_valid) else None,
+                },
+                'r_eff_bias_pct': {
+                    'mean': float(np.mean(r_eff_valid)) if len(r_eff_valid) else None,
+                    'median': float(np.median(r_eff_valid)) if len(r_eff_valid) else None,
+                    'std': float(np.std(r_eff_valid)) if len(r_eff_valid) else None,
+                },
+                'wasserstein': {
+                    'mean': float(np.nanmean(metrics.all_wasserstein[idx])),
+                    'median': float(np.nanmedian(metrics.all_wasserstein[idx])),
+                },
+            })
+        return {
+            'n_rois': pooled_data.n_samples,
+            'total_count': pooled_data.total_count,
+            'distributions': dists,
         }
+
+    output_data = {
+        'human_cc': _metrics_to_dict(human_metrics, human_pooled),
+        'rat': _metrics_to_dict(rat_metrics, rat_pooled),
     }
     with open(json_file, 'w') as f:
         json.dump(output_data, f, indent=2)

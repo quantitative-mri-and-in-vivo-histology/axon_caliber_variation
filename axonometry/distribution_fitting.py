@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 MIN_BIN_PROB = 1e-15  # floor for bin probabilities to avoid log(0)
-N_RESTARTS = 3  # perturbed restarts around MoM estimate
+N_RESTARTS = 10  # perturbed restarts around MoM estimate
 
 # Minimum fraction of PDF mass that must fall within [0, r_max] for the
 # truncated moment integration to be considered valid.
@@ -76,8 +76,8 @@ def compute_distribution_radii(
     """
     shape_params, loc, scale = _unpack_params(params)
     try:
-        r = np.linspace(0, r_max, n_points)
-        dr = r[1] - r[0]
+        dr = r_max / n_points
+        r = np.linspace(dr / 2, r_max - dr / 2, n_points)  # midpoint rule; avoids 0*inf at r=0
         pdf = dist.pdf(r, *shape_params, loc=loc, scale=scale)
         pdf = np.maximum(pdf, 0)
 
@@ -193,11 +193,26 @@ def _mom_fatiguelife(mu, var):
     """
     if var > 0 and mu > 0:
         ratio = var / mu ** 2
-        c = np.sqrt(max(2 * ratio / (1 + 5 * ratio / 4), 0.01))
+        c = np.sqrt(max(ratio / (1 + 5 * ratio / 4), 0.01))
         scale = max(mu / (1 + c**2 / 2), 1e-6)
     else:
         c = 0.5
         scale = max(mu, 1e-6)
+    return (c, 0.0, scale)
+
+
+def _mom_fisk(mu, var):
+    """MoM for Log-logistic / fisk(c, loc=0, scale).
+
+    scipy fisk(c, loc=0, scale): mean = scale * pi/c / sin(pi/c) for c > 1.
+    Start with c=3 (moderate shape) and solve for scale from the mean.
+    """
+    c = 3.0
+    if mu > 0:
+        # mean = scale * pi/c / sin(pi/c)
+        scale = max(mu * c * np.sin(np.pi / c) / np.pi, 1e-6)
+    else:
+        scale = 1e-6
     return (c, 0.0, scale)
 
 
@@ -218,6 +233,7 @@ _MOM_INITIALIZERS = {
     'lognorm': _mom_lognorm,
     'invgauss': _mom_invgauss,
     'fatiguelife': _mom_fatiguelife,
+    'fisk': _mom_fisk,
     'genextreme': _mom_genextreme,
 }
 
