@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-This repository contains Python-based analysis and figure generation code for the manuscript on axon caliber variability and the effective axon radius, based on publicly available high-resolution axon segmentation data.
+This repository contains Python-based analysis and figure generation code for the manuscript on axon caliber variation and its impact on histological sampling of axon radius distributions, conduction velocity, and scalar statistics as mean radius and MRI-visible radius, based on publicly available high-resolution axon segmentation data.
 
 ### Datasets
 
-**1. Rat Brain 3D Segmentation Data** (Abdollazadeh et al., Nat. Commun., 2025)
+**1. Rat Brain 3D Segmentation Data** (Sierra, Abdollahzadeh et al., 2021)
 - 10 labeled 3D volumes of myelinated axons from 5 rats
 - 2 rats with TBI (traumatic brain injury), 3 rats with sham operation
 - Each rat has both ipsilateral and contralateral hemisphere volumes
@@ -16,7 +16,7 @@ This repository contains Python-based analysis and figure generation code for th
   - **HM (High Magnification)**: Small test set for algorithm validation only; data too limited to report
 - Used for: along-bundle stability analysis, effective radius profiles
 
-**2. Human Corpus Callosum 2D Light Microscopy Data** (`data/raw_LM/`)
+**2. Human Corpus Callosum 2D Light Microscopy Data** (Mordhorst et al., 2025; `data/raw/human/lm/`)
 - Large-scale 2D axon radius distributions from human corpus callosum
 - Pre-processed histogram data (bin edges, bin centers, counts)
 - Multiple radius measures: circular equivalent, major axis, minor axis
@@ -40,50 +40,48 @@ config/
 ├── plot_settings.yaml      # Global plot styling settings (colors, fonts, etc.)
 │
 data/
-├── raw/                    # Raw .mat files organized by condition and hemisphere (rat 3D data)
-│   ├── Sham_25_ipsi/
-│   │   └── HM_25_ipsi_myelinated_axons.mat
-│   ├── Sham_25_contra/
-│   │   └── HM_25_contra_myelinated_axons.mat
-│   ├── TBI_2_ipsi/
-│   │   └── HM_2_ipsi_myelinated_axons.mat
+├── source/rat/             # Original .mat files organized by condition and hemisphere
+│   ├── Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat
+│   ├── Sham_25_contra/LM_25_contra_myelinated_axons.mat
 │   └── ...
 │
-├── raw_LM/                 # Human corpus callosum 2D light microscopy data
-│   ├── desc-binCenters_radii.tsv      # Histogram bin centers
-│   ├── desc-binEdges_radii.tsv        # Histogram bin edges
-│   ├── desc-countsCircularEq_radii.tsv    # Counts (circular equivalent radius)
-│   ├── desc-countsMajorAxis_radii.tsv     # Counts (major axis radius)
-│   ├── desc-countsMinorAxis_radii.tsv     # Counts (minor axis radius)
-│   ├── roiinfo.tsv                    # ROI metadata
-│   ├── desc-polygons_roicoords.tsv    # ROI polygon coordinates
-│   ├── sub-ev01/                      # Subject 1 data
-│   └── sub-ev02/                      # Subject 2 data
+├── raw/
+│   ├── human/
+│   │   ├── lm/             # Human corpus callosum 2D light microscopy data
+│   │   │   ├── desc-binCenters_radii.tsv
+│   │   │   ├── desc-binEdges_radii.tsv
+│   │   │   ├── desc-countsCircularEq_radii.tsv
+│   │   │   ├── desc-countsMajorAxis_radii.tsv
+│   │   │   ├── desc-countsMinorAxis_radii.tsv
+│   │   │   ├── roiinfo.tsv
+│   │   │   ├── sub-ev01/
+│   │   │   └── sub-ev02/
+│   │   ├── em/             # Internal EM data
+│   │   └── em_ruthig/      # Ruthig et al. EM data (Zenodo)
+│   └── rat/
+│       ├── lm/             # Prepared OME-Zarr volumes (LM)
+│       └── hm/             # Prepared OME-Zarr volumes (HM)
 │
-├── processed/              # Processed NPZ files organized by microscopy type
-│   ├── HM/                 # High magnification data
-│   │   ├── sham_25_ipsi_axon_profiles.npz
-│   │   ├── sham_25_ipsi_slice_profiles.npz
-│   │   ├── sham_25_contra_axon_profiles.npz
-│   │   ├── tbi_2_ipsi_axon_profiles.npz
+├── processed/rat/
+│   ├── lm/                 # Low magnification processed profiles
+│   │   ├── sham_25_contra_cc_myelin_axon_profiles.npz
+│   │   ├── sham_25_contra_cc_myelin_slice_profiles.npz
 │   │   └── ...
-│   └── LM/                 # Low magnification data
-│       ├── sham_25_ipsi_axon_profiles.npz
-│       └── ...
+│   └── hm/                 # High magnification processed profiles
 │
 fig/                        # Generated figures and plots
 │
-scripts/                    # Analysis, figure generation, and exploratory scripts
+scripts/
 │   ├── preparation/        # Data preparation (ROI identification, volume extraction)
 │   ├── processing/         # Data processing (slice profiles, axon profiles)
 │   ├── figures/            # Manuscript figure generation
 │   ├── visualization/      # Neuroglancer and interactive visualization
-│   ├── exploratory/        # Exploratory analyses (spatial_correlations/, 2d_vs_3d/, distribution_fitting/)
+│   ├── exploratory/        # Exploratory analyses
 │   └── benchmarks/         # Performance benchmarks
 ```
 
 **Naming Convention**: When using `--organize-by-microscopy` flag:
-- Output files are organized into `HM/` and `LM/` subdirectories based on microscopy type
+- Output files are organized into `hm/` and `lm/` subdirectories based on microscopy type
 - Microscopy prefix (HM_/LM_) is removed from filenames (encoded in directory structure)
 - "_myelinated_axons" suffix is removed from filenames (redundant)
 - Condition prefix (Sham/TBI) is extracted from parent directory and converted to lowercase
@@ -91,10 +89,11 @@ scripts/                    # Analysis, figure generation, and exploratory scrip
   - `suffix` is either `axon_profiles` (3D skeleton-based analysis) or `slice_profiles` (2D slice-based analysis)
 
 **Example transformation**:
-- Input: `data/raw/Sham_25_ipsi/HM_25_ipsi_myelinated_axons.mat`
-- Output: `data/processed/HM/sham_25_ipsi_axon_profiles.npz`
+- Input: `data/source/rat/Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat`
+- Prepared: `data/raw/rat/lm/sham_25_ipsi_cc_myelin.zarr`
+- Output: `data/processed/rat/lm/sham_25_ipsi_cc_myelin_axon_profiles.npz`
 
-**Rationale**: This structure enables easy comparison between different imaging modalities (HM/LM) for the same biological sample, while preserving critical experimental metadata (condition, subject ID, hemisphere) in filenames for analysis and filtering.
+**Rationale**: This structure preserves critical experimental metadata (condition, subject ID, hemisphere, tract) in filenames for analysis and filtering.
 
 ## Main Components
 
@@ -129,62 +128,41 @@ dominant/separation axis 2 → (2,0,1)  — move X to Z
 
 **Parametric Distribution Fitting** (human corpus callosum data)
 
-Fit parametric distributions to axon radius histograms following the methodology of Sepehrband et al. (2016, NeuroImage). This analysis applies to the 2D light microscopy data in `data/raw_LM/`.
+Fit parametric distributions to axon radius histograms following the methodology of Sepehrband et al. (2016, NeuroImage). This analysis applies to the 2D light microscopy data in `data/raw/human/lm/`.
 
-*Candidate distributions* (in order of expected performance):
+*Candidate distributions* (Sepehrband et al., 2016):
 - **Generalized Extreme Value (GEV)** - best performer in Sepehrband et al.
-- Gamma - commonly used baseline
-- Log-normal
 - Inverse Gaussian
-- Log-logistic
 - Birnbaum-Saunders
+- Log-normal
+- Log-logistic
+- Gamma
 
-*Light microscopy resolution limit*:
-- Small axons with radius r < 0.3 μm cannot be reliably resolved
-- Fits must account for this **left-truncation** (or left-censoring)
-- Options:
-  1. Fit truncated distributions with lower bound at r_min = 0.3 μm
-  2. Fit to histogram data starting from first reliable bin
-  3. Model the truncation explicitly in the likelihood function
-- Report both raw fitted parameters and truncation-corrected estimates
-
-*Fitting approach*:
+*Fitting approach* (implemented in `axonometry/distribution_fitting.py`):
 - Input: histogram counts from TSV files (bin edges + counts)
-- Method: maximum likelihood estimation (MLE) on binned data
-- Goodness-of-fit: AIC, BIC, Kolmogorov-Smirnov test
-- Output: fitted parameters, confidence intervals, diagnostic plots
+- Method: binned MLE (multinomial likelihood over CDF-derived bin probabilities)
+- Initialization: method-of-moments with perturbed restarts
+- Goodness-of-fit: AIC, Wasserstein distance
+- Radius estimation: numerical integration of fitted distribution for r_arith and r_eff
 
 *Reference*: Sepehrband F, et al. (2016). "Towards higher sensitivity and stability of axon diameter estimation with diffusion-weighted MRI." NMR Biomed. 29(3):293-308. PMID: 27303273
 
-**Combined Distribution Fitting** ([fit_combined_distributions.py](scripts/figures/fit_combined_distributions.py))
+**Combined Distribution Fitting** ([plot_parametric_distribution_fits.py](scripts/figures/plot_parametric_distribution_fits.py))
 
 Compares distribution fits and radius estimation bias across Human CC and Rat WM datasets:
 
-*Outputs*:
-1. **Summary figure** (2×4 layout): histogram + AIC + r_arith bias + r_eff bias for each dataset
-2. **Scatter figures** (2×7 layout): subsampled vs whole-section values for Raw + 6 distributions
-
-*Key features*:
-- 6 Sepehrband distributions: GEV, Inverse Gaussian, Birnbaum-Saunders, Log Normal, Log Logistic, Gamma
-- Fixed colors per distribution (consistent across all panels)
-- Per-ROI/volume fitting with summed AIC aggregation
-- Subsampling analysis: 50 subsamples × 1000 axons each, showing mean ± std error bars
-- Optional EM correction for human data (`--em-correction` flag)
-
 *Usage*:
 ```bash
-python scripts/figures/fit_combined_distributions.py \
-    --human-data data/raw_LM \
-    --rat-data data/processed/LM \
-    --output fig/combined_distribution_fits.png
-
-# With EM correction for human data:
-python scripts/figures/fit_combined_distributions.py \
-    --human-data data/raw_LM \
-    --rat-data data/processed/LM \
-    --output fig/combined_distribution_fits_em.png \
-    --em-correction data/raw_EM
+python scripts/figures/plot_parametric_distribution_fits.py \
+    --human-data data/raw/human/lm \
+    --rat-data data/processed/rat/lm \
+    --output fig/main/combined_distribution_fits.svg
 ```
+
+*Key features*:
+- 6 Sepehrband distributions with fixed colors per distribution
+- Per-ROI/volume fitting with summed AIC aggregation
+- Win rate, Wasserstein distance, r_arith and r_eff bias comparison
 
 *Key finding*: Best AIC (GEV) ≠ best r_eff predictor. Log Normal has near-zero r_eff bias for Human CC despite worse AIC.
 
@@ -196,17 +174,17 @@ python scripts/figures/fit_combined_distributions.py \
 Download the raw axon segmentation data from:
 [FAIR Data Dataset - f8ccc23a-1f1a-4c98-86b7-b63652a809c3](https://etsin.fairdata.fi/dataset/f8ccc23a-1f1a-4c98-86b7-b63652a809c3)
 
-Place the 10 .mat files in `data/raw/LM/`:
-- LM_2_ipsi_myelinated_axons.mat (Sham)
-- LM_2_contra_myelinated_axons.mat (Sham)
-- LM_24_ipsi_myelinated_axons.mat (Sham)
-- LM_24_contra_myelinated_axons.mat (Sham)
-- LM_25_ipsi_myelinated_axons.mat (TBI)
-- LM_25_contra_myelinated_axons.mat (TBI)
-- LM_28_ipsi_myelinated_axons.mat (Sham)
-- LM_28_contra_myelinated_axons.mat (Sham)
-- LM_49_ipsi_myelinated_axons.mat (TBI)
-- LM_49_contra_myelinated_axons.mat (TBI)
+Place the 10 .mat files in `data/source/rat/`, organized by condition and hemisphere:
+- Sham_2_ipsi/LM_2_ipsi_myelinated_axons.mat
+- Sham_2_contra/LM_2_contra_myelinated_axons.mat
+- Sham_24_ipsi/LM_24_ipsi_myelinated_axons.mat
+- Sham_24_contra/LM_24_contra_myelinated_axons.mat
+- Sham_28_ipsi/LM_28_ipsi_myelinated_axons.mat
+- Sham_28_contra/LM_28_contra_myelinated_axons.mat
+- TBI_25_ipsi/LM_25_ipsi_myelinated_axons.mat
+- TBI_25_contra/LM_25_contra_myelinated_axons.mat
+- TBI_49_ipsi/LM_49_ipsi_myelinated_axons.mat
+- TBI_49_contra/LM_49_contra_myelinated_axons.mat
 
 
 ## Technical Details
@@ -224,7 +202,7 @@ Place the 10 .mat files in `data/raw/LM/`:
   - ZSTD compression (level 3)
   - uint16 labels (supports up to 65,535 axons)
   - Segment IDs stored in `labels/segment_ids`
-- **Output**: PNG figures (200 DPI)
+- **Output**: SVG figures (200 DPI raster fallback)
 
 ### Memory Efficiency
 - Zarr streaming: slice-by-slice processing avoids loading full volumes
