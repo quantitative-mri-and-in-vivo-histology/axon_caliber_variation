@@ -1,14 +1,9 @@
 """
 Combined distribution fitting for Human CC and Rat white matter data.
 
-Creates a 2x2 figure showing:
-- (a) Human CC: pooled histogram with fitted PDFs
-- (b) Rat: pooled histogram with fitted PDFs
-- (c) Human CC: AIC comparison (summed across all ROIs)
-- (d) Rat: AIC comparison (summed across all ROIs)
-
-This script focuses purely on AIC-based model comparison. Separate scripts
-handle r_eff and r_arith evaluation.
+Creates a 6-panel figure with 2 rows:
+- Row 1: Pooled histograms with fitted PDFs (Human CC, Rat)
+- Row 2: AIC comparison, Wasserstein distance, radius bias (r_arith, r_eff)
 
 Usage:
     python scripts/figures/plot_parametric_distribution_fits.py \\
@@ -21,22 +16,27 @@ import argparse
 import json
 import logging
 import sys
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.legend_handler import HandlerBase
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Rectangle
 from scipy import stats
-from scipy.optimize import OptimizeWarning
 
 # Find repo root (contains pyproject.toml)
 _root = Path(__file__).resolve().parent
 while not (_root / "pyproject.toml").exists():
     _root = _root.parent
 sys.path.insert(0, str(_root))
-from axonometry import get_plot_settings, rediscretize, compute_r_arith, compute_r_eff
+from axonometry import (compute_r_arith, compute_r_eff, get_plot_settings,
+                        rediscretize)
+from axonometry.distribution_fitting import (FitResult,
+                                             compute_distribution_radii,
+                                             fit_distribution_mle)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 # Constants
-MIN_BIN_PROB = 1e-300
+Y_SPACING = 1.3  # Vertical spacing between distributions in horizontal boxplots
 PLOT_XLIM_MAX = 3.0
 DEFAULT_BIN_WIDTH = 0.05  # um
 
@@ -73,20 +73,6 @@ class PerSampleHistogramData:
     n_samples: int
     sample_counts: np.ndarray  # total count per sample
     sample_names: List[str]
-
-
-@dataclass
-class FitResult:
-    """Container for distribution fit results."""
-    distribution_name: str
-    n_params: int
-    params: Tuple
-    nll: float
-    aic: float
-    wasserstein: float = 0.0  # Wasserstein distance between empirical and fitted CDF
-    pdf_values: np.ndarray = field(default_factory=lambda: np.array([]))
-    pdf_x_fine: np.ndarray = field(default_factory=lambda: np.array([]))
-    pdf_values_fine: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
 @dataclass
@@ -294,250 +280,14 @@ def get_display_name(scipy_name: str, multiline: bool = False) -> str:
     return DIST_DISPLAY_NAMES.get(scipy_name, scipy_name)
 
 
-# =============================================================================
-# Radius Calculations
-# =============================================================================
-
-def compute_empirical_radii(bin_centers: np.ndarray, counts: np.ndarray) -> Tuple[float, float]:
+def compute_empirical_radii(
+    bin_centers: np.ndarray, counts: np.ndarray
+) -> Tuple[float, float]:
     """Compute empirical r_arith and r_eff from histogram."""
     return (
         compute_r_arith(counts=counts, bin_centers=bin_centers),
         compute_r_eff(counts=counts, bin_centers=bin_centers),
     )
-
-
-def compute_distribution_radii(
-    dist: stats.rv_continuous,
-    params: Tuple,
-    r_max: float = 10.0,
-    n_points: int = 1000
-) -> Tuple[float, float]:
-    """Compute r_arith and r_eff from fitted distribution."""
-    shape_params, loc, scale = _unpack_params(params)
-
-    # Use numerical integration over fine grid
-    r = np.linspace(0.001, r_max, n_points)
-    dr = r[1] - r[0]
-
-    try:
-        pdf = dist.pdf(r, *shape_params, loc=loc, scale=scale)
-        pdf = np.maximum(pdf, 0)  # Ensure non-negative
-
-        # Normalize (in case of truncation effects)
-        norm = np.sum(pdf) * dr
-        if norm < 0.01:  # Distribution mostly outside range
-            return np.nan, np.nan
-        pdf = pdf / norm
-
-        # r_arith = E[r]
-        r_arith = np.sum(r * pdf) * dr
-
-        # r_eff = (E[r^6] / E[r^2])^(1/4)
-        r2 = np.sum(r**2 * pdf) * dr
-        r6 = np.sum(r**6 * pdf) * dr
-        r_eff = (r6 / r2) ** 0.25 if r2 > 0 else np.nan
-
-        return r_arith, r_eff
-    except Exception:
-        return np.nan, np.nan
-
-
-def _unpack_params(params: Tuple) -> Tuple[Tuple, float, float]:
-    """Unpack distribution parameters into (shape_params, loc, scale)."""
-    if len(params) == 2:
-        return (), params[0], params[1]
-    return params[:-2], params[-2], params[-1]
-
-
-# =============================================================================
-# Distribution Fitting
-# =============================================================================
-
-
-def _binned_nll(theta, dist, bin_edges, counts, fix_loc):
-    """Negative log-likelihood for binned data.
-
-    Args:
-        theta: Parameter vector (shape params + loc? + scale).
-        dist: scipy.stats distribution object.
-        bin_edges: Array of bin edges.
-        counts: Observed counts per bin.
-        fix_loc: If True, loc is fixed at 0 and not in theta.
-    """
-    # Reconstruct full parameter tuple
-    if fix_loc:
-        # theta = (*shape, scale)
-        shape_params = theta[:-1]
-        loc = 0.0
-        scale = theta[-1]
-    else:
-        # theta = (*shape, loc, scale)
-        shape_params = theta[:-2]
-        loc = theta[-2]
-        scale = theta[-1]
-
-    if scale <= 0:
-        return 1e20
-
-    try:
-        edge_cdfs = dist.cdf(bin_edges, *shape_params, loc=loc, scale=scale)
-        if np.any(np.isnan(edge_cdfs)):
-            return 1e20
-        bin_probs = np.diff(edge_cdfs)
-        bin_probs = np.maximum(bin_probs, MIN_BIN_PROB)
-        nll = -np.dot(counts, np.log(bin_probs))
-        return nll if np.isfinite(nll) else 1e20
-    except Exception:
-        return 1e20
-
-
-N_RESTARTS = 20  # Number of random restarts for binned MLE
-
-
-def _get_initial_params_multi(dist_name, dist, bin_centers, counts):
-    """Get multiple initial parameter estimates from different random seeds."""
-    total = counts.sum()
-    probs = counts / total
-    bin_width = bin_centers[1] - bin_centers[0]
-    n_init = min(int(total), 10_000)
-
-    all_params = []
-    for seed in range(N_RESTARTS):
-        rng = np.random.default_rng(seed)
-        sampled_bins = rng.choice(len(bin_centers), size=n_init, p=probs)
-        samples = bin_centers[sampled_bins] + rng.uniform(-bin_width / 2, bin_width / 2, n_init)
-        samples = samples[samples > 0]
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', category=RuntimeWarning)
-            warnings.filterwarnings('ignore', category=OptimizeWarning)
-            try:
-                if dist_name == 'genextreme':
-                    params = dist.fit(samples)
-                else:
-                    params = dist.fit(samples, floc=0)
-                all_params.append(params)
-            except Exception:
-                continue
-
-    return all_params
-
-
-def fit_distribution_mle(
-    dist_name: str,
-    dist: stats.rv_continuous,
-    bin_centers: np.ndarray,
-    bin_edges: np.ndarray,
-    counts: np.ndarray
-) -> Optional[FitResult]:
-    """Fit distribution to histogram data using proper binned MLE.
-
-    Maximizes the multinomial log-likelihood over bin probabilities
-    derived from the parametric CDF. Uses multiple random restarts
-    to avoid local optima.
-    """
-    from scipy.optimize import minimize
-
-    total = counts.sum()
-    if total == 0:
-        return None
-
-    try:
-        # Get multiple initial parameter estimates
-        all_init_params = _get_initial_params_multi(dist_name, dist, bin_centers, counts)
-        if not all_init_params:
-            return None
-
-        fix_loc = (dist_name != 'genextreme')
-
-        # Bounds (same for all restarts)
-        shape_params_0, _, _ = _unpack_params(all_init_params[0])
-        n_shape = len(shape_params_0)
-        n_theta = n_shape + (1 if fix_loc else 2)
-        bounds = [(None, None)] * n_theta
-        if fix_loc:
-            bounds[-1] = (1e-8, None)  # scale > 0
-        else:
-            bounds[-2] = (None, None)  # loc
-            bounds[-1] = (1e-8, None)  # scale > 0
-
-        nll_args = (dist, bin_edges, counts, fix_loc)
-        best_result = None
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-            for init_params in all_init_params:
-                shape_params_init, loc_init, scale_init = _unpack_params(init_params)
-                if fix_loc:
-                    theta0 = np.array([*shape_params_init, scale_init])
-                else:
-                    theta0 = np.array([*shape_params_init, loc_init, scale_init])
-
-                # Try L-BFGS-B first (fast, uses gradient)
-                result = minimize(
-                    _binned_nll, theta0, args=nll_args,
-                    method='L-BFGS-B', bounds=bounds,
-                    options={'maxiter': 1000, 'ftol': 1e-12}
-                )
-
-                # Fall back to Nelder-Mead if L-BFGS-B fails
-                if not np.isfinite(result.fun) or result.fun >= 1e19:
-                    result = minimize(
-                        _binned_nll, theta0, args=nll_args,
-                        method='Nelder-Mead',
-                        options={'maxiter': 5000, 'xatol': 1e-10, 'fatol': 1e-10}
-                    )
-
-                if np.isfinite(result.fun) and (best_result is None or result.fun < best_result.fun):
-                    best_result = result
-
-        if best_result is None or not np.isfinite(best_result.fun) or best_result.fun >= 1e19:
-            logger.debug(f"Optimization failed for {dist_name}")
-            return None
-
-        result = best_result
-
-        # Reconstruct full params tuple
-        if fix_loc:
-            shape_params = tuple(result.x[:-1])
-            loc = 0.0
-            scale = result.x[-1]
-        else:
-            shape_params = tuple(result.x[:-2])
-            loc = result.x[-2]
-            scale = result.x[-1]
-
-        params = (*shape_params, loc, scale)
-        nll = result.fun
-        k = len(result.x)  # only count free parameters (loc excluded when fixed)
-        aic = 2 * k + 2 * nll
-
-        bin_width = np.diff(bin_edges).mean()
-        pdf_values = dist.pdf(bin_centers, *shape_params, loc=loc, scale=scale)
-
-        empirical_cdf = np.cumsum(counts) / total
-        fitted_cdf = dist.cdf(bin_edges[1:], *shape_params, loc=loc, scale=scale)
-        wasserstein = np.sum(np.abs(empirical_cdf - fitted_cdf)) * bin_width
-
-        x_fine = np.linspace(bin_centers[0], bin_centers[-1], 500)
-        pdf_fine = dist.pdf(x_fine, *shape_params, loc=loc, scale=scale)
-
-        return FitResult(
-            distribution_name=dist_name,
-            n_params=k,
-            params=params,
-            nll=nll,
-            aic=aic,
-            wasserstein=wasserstein,
-            pdf_values=pdf_values,
-            pdf_x_fine=x_fine,
-            pdf_values_fine=pdf_fine
-        )
-
-    except (ValueError, RuntimeError) as e:
-        logger.debug(f"Failed to fit {dist_name}: {e}")
-        return None
 
 
 def fit_all_distributions(hist_data: HistogramData) -> List[FitResult]:
@@ -563,6 +313,9 @@ def fit_all_distributions(hist_data: HistogramData) -> List[FitResult]:
 # Per-Sample Fitting and Aggregation
 # =============================================================================
 
+MOMENT_EVAL_PERCENTILE = 0.99999  # p99.999 for truncated moment evaluation
+
+
 def fit_all_samples(
     per_sample_data: PerSampleHistogramData,
     pooled_data: HistogramData
@@ -581,6 +334,13 @@ def fit_all_samples(
     # Empirical values per sample
     empirical_r_arith = np.full(n_samples, np.nan)
     empirical_r_eff = np.full(n_samples, np.nan)
+
+    # Data-backed upper bound for moment evaluation (p99.999 of pooled data)
+    cdf = np.cumsum(pooled_data.counts) / pooled_data.counts.sum()
+    idx = min(np.searchsorted(cdf, MOMENT_EVAL_PERCENTILE), len(pooled_data.bin_centers) - 1)
+    r_max_eval = pooled_data.bin_centers[idx]
+    logger.info(f"Moment evaluation r_max = {r_max_eval:.2f} μm "
+                f"(p{MOMENT_EVAL_PERCENTILE * 100:.3f} of pooled data)")
 
     logger.info(f"Fitting {n_methods} distributions to {n_samples} samples...")
 
@@ -607,7 +367,9 @@ def fit_all_samples(
                 all_aics[dist_idx, sample_idx] = result.aic
                 all_wasserstein[dist_idx, sample_idx] = result.wasserstein
                 # Compute r_arith and r_eff from fitted distribution
-                r_arith, r_eff = compute_distribution_radii(dist, result.params)
+                r_arith, r_eff = compute_distribution_radii(
+                    dist, result.params, r_max=r_max_eval
+                )
                 all_r_arith[dist_idx, sample_idx] = r_arith
                 all_r_eff[dist_idx, sample_idx] = r_eff
 
@@ -701,17 +463,18 @@ def compute_inter_roi_wasserstein(per_sample: PerSampleHistogramData) -> float:
     return np.median(pairwise_distances) if pairwise_distances else 0.0
 
 
+INSET_PERCENTILE_LO = 0.90   # inset shows from p90 to p99.9
+INSET_PERCENTILE_HI = 0.999
+
+
 def _plot_pooled_pdf_with_fits(
     ax: plt.Axes,
     hist_data: HistogramData,
     fit_results: List[FitResult],
     species_color: str,
-    inset_xlim: Tuple[float, float] = (1.0, 3.0),
     distribution_order: List[str] = None
 ) -> None:
     """Plot pooled histogram with all fitted PDFs in distribution colors."""
-    from matplotlib.patches import Rectangle
-
     bin_width = np.diff(hist_data.bin_edges).mean()
     density = hist_data.counts / (hist_data.total_count * bin_width)
 
@@ -743,26 +506,30 @@ def _plot_pooled_pdf_with_fits(
     # Title will be added externally
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
-    # Add tail inset - larger, using most of plot area with narrow margin
-    # Find appropriate y-limit for inset (max density in tail region)
-    tail_mask = hist_data.bin_centers >= inset_xlim[0]
-    tail_density = density[tail_mask]
-    tail_y_max = tail_density.max() * 1.2 if tail_density.max() > 0 else 0.1
+    # Add tail inset — percentile-based range (consistent across species)
+    cdf = np.cumsum(hist_data.counts) / hist_data.total_count
+    lo_idx = min(np.searchsorted(cdf, INSET_PERCENTILE_LO), len(hist_data.bin_centers) - 1)
+    hi_idx = min(np.searchsorted(cdf, INSET_PERCENTILE_HI), len(hist_data.bin_centers) - 1)
+    inset_lo = hist_data.bin_centers[lo_idx] - bin_width / 2
+    inset_hi = hist_data.bin_centers[hi_idx]
 
-    ax_inset = ax.inset_axes([0.32, 0.32, 0.66, 0.66])  # [x, y, width, height]
+    tail_mask = (hist_data.bin_centers >= inset_lo) & (hist_data.bin_centers <= inset_hi)
+    tail_density = density[tail_mask]
+    tail_y_max = tail_density.max() * 1.2 if len(tail_density) > 0 and tail_density.max() > 0 else 0.1
+
+    ax_inset = ax.inset_axes([0.32, 0.32, 0.66, 0.66])
     ax_inset.bar(hist_data.bin_centers, density, width=bin_width * 0.9,
                  alpha=0.4, color=species_color, edgecolor='white', linewidth=0.3)
     for result in ordered_results:
         color = get_dist_color(result.distribution_name)
         ax_inset.plot(result.pdf_x_fine, result.pdf_values_fine, '-',
                       color=color, linewidth=1.5)
-    ax_inset.set_xlim(*inset_xlim)
+    ax_inset.set_xlim(inset_lo, inset_hi)
     ax_inset.set_ylim(0, tail_y_max)
     ax_inset.tick_params(labelsize=settings.fonts['tick_size'] - 2)
     ax_inset.set_xlabel('')
     ax_inset.set_ylabel('')
 
-    # Add indicator rectangle with connector lines to inset
     ax.indicate_inset_zoom(ax_inset, edgecolor='gray', linewidth=1.5,
                            linestyle='--', alpha=0.8)
 
@@ -775,7 +542,6 @@ def create_combined_figure(
     human_per_sample: PerSampleHistogramData,
     rat_per_sample: PerSampleHistogramData,
     output_file: Path,
-    top_n: int = 5
 ) -> None:
     """Create 6-panel figure with 2 rows.
 
@@ -824,7 +590,6 @@ def create_combined_figure(
     _plot_pooled_pdf_with_fits(
         ax_a, rat_pooled, rat_metrics.pooled_results,
         species_color=RAT_COLOR,
-        inset_xlim=(0.5, 1.2),  # Rat tail starts earlier
         distribution_order=dist_order
     )
 
@@ -832,7 +597,6 @@ def create_combined_figure(
     _plot_pooled_pdf_with_fits(
         ax_b, human_pooled, human_metrics.pooled_results,
         species_color=HUMAN_COLOR,
-        inset_xlim=(1.0, 3.0),  # Human tail
         distribution_order=dist_order
     )
 
@@ -841,14 +605,11 @@ def create_combined_figure(
     handles, labels = ax_a.get_legend_handles_labels()
 
     # Create custom half-blue/half-red patch for empirical data
-    from matplotlib.legend_handler import HandlerBase
-
     class SplitColorHandler(HandlerBase):
         """Custom handler for split-color rectangle."""
         def create_artists(self, legend, orig_handle, xdescent, ydescent,
                            width, height, fontsize, trans):
             # Create two rectangles side by side (Rat first, then Human)
-            from matplotlib.patches import Rectangle
             half_width = width / 2
             left_rect = Rectangle(
                 (xdescent, ydescent), half_width, height,
@@ -863,7 +624,6 @@ def create_combined_figure(
             return [left_rect, right_rect]
 
     # Create dummy handle for empirical data
-    from matplotlib.patches import Patch
     empirical_patch = Patch(facecolor='gray')  # placeholder, handler will override
 
     # Prepend empirical data to handles/labels
@@ -932,7 +692,7 @@ def _plot_win_rate(
     human_win = np.array([human_metrics.win_rate.get(n, 0) for n in names]) * 100
     rat_win = np.array([rat_metrics.win_rate.get(n, 0) for n in names]) * 100
 
-    y_spacing = 1.3  # Spacing between distributions
+    y_spacing = Y_SPACING
     y_pos = np.arange(len(names)) * y_spacing
 
     # Plot dots (rat first so human is on top)
@@ -976,7 +736,7 @@ def _plot_wasserstein_both_species(
     names = human_metrics.distribution_names
     display_names = [get_display_name(n, multiline=True) for n in names]
 
-    y_spacing = 1.3  # Spacing between distributions
+    y_spacing = Y_SPACING
     y_pos = np.arange(len(names)) * y_spacing
     box_width = 0.4
 
@@ -1036,10 +796,6 @@ def _plot_wasserstein_both_species(
                    alpha=0.8, zorder=1)
 
     # Add legend manually (Rat, Human on first row; Anat. Var. on second row)
-    from matplotlib.patches import Patch, Rectangle
-    from matplotlib.lines import Line2D
-    from matplotlib.legend_handler import HandlerBase
-
     # Custom handler for solid colored rectangle
     class SolidPatchHandler(HandlerBase):
         def __init__(self, color):
@@ -1143,7 +899,7 @@ def _plot_radius_bias_both_species(
     names = human_metrics.distribution_names
     display_names = [get_display_name(n, multiline=True) for n in names]
 
-    y_spacing = 1.3  # Spacing between distributions
+    y_spacing = Y_SPACING
     y_pos = np.arange(len(names)) * y_spacing
 
     # Get per-sample values for each species
@@ -1153,14 +909,14 @@ def _plot_radius_bias_both_species(
         human_emp_per_sample = human_metrics.empirical_r_arith_per_sample
         rat_emp_per_sample = rat_metrics.empirical_r_arith_per_sample
         xlabel = r'$\bar{r}$ error [%]'
-        x_lim = 5  # ±5%
+        x_lim = 2.5  # ±2.5%
     else:  # r_eff
         human_all = human_metrics.all_r_eff
         rat_all = rat_metrics.all_r_eff
         human_emp_per_sample = human_metrics.empirical_r_eff_per_sample
         rat_emp_per_sample = rat_metrics.empirical_r_eff_per_sample
         xlabel = r'$r_{\mathrm{MRI}}$ error [%]'
-        x_lim = 60  # ±60%
+        x_lim = 100  # ±100%
 
     # Compute per-sample bias for each distribution
     box_width = 0.4
@@ -1250,10 +1006,6 @@ def _plot_radius_bias_both_species(
                             arrowprops=dict(arrowstyle='->', color=rat_color, lw=1.5))
 
     # Add legend with boxplot-style handles (Rat first)
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
-    from matplotlib.legend_handler import HandlerBase
-
     class BoxplotHandler(HandlerBase):
         """Custom handler that draws a mini boxplot with whisker caps."""
         def __init__(self, facecolor, edgecolor):
@@ -1263,8 +1015,6 @@ def _plot_radius_bias_both_species(
 
         def create_artists(self, legend, orig_handle, xdescent, ydescent,
                            width, height, fontsize, trans):
-            from matplotlib.patches import Rectangle
-            from matplotlib.lines import Line2D
             # Box (IQR) - centered, takes middle 50% of width
             box_left = xdescent + width * 0.25
             box_width = width * 0.5
@@ -1313,9 +1063,9 @@ def _plot_radius_bias_both_species(
     ax.set_xlim(-x_lim, x_lim)
     # Add intermediate ticks
     if radius_type == 'r_arith':
-        ax.set_xticks([-5, -2.5, 0, 2.5, 5])
+        ax.set_xticks([-2, -1, 0, 1, 2])
     else:  # r_eff
-        ax.set_xticks([-60, -30, 0, 30, 60])
+        ax.set_xticks([-100, -50, 0, 50, 100])
     ax.set_ylim(y_pos[-1] + 0.5, -1.5)  # Inverted, with extra padding at top
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
@@ -1336,8 +1086,6 @@ def main():
                         help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')
     parser.add_argument('--r-max', type=float, default=3.0,
                         help='Maximum radius in um (default: 3.0)')
-    parser.add_argument('--top-n', type=int, default=5,
-                        help='Number of top distributions to show in histograms (default: 5)')
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1382,7 +1130,7 @@ def main():
         human_pooled, human_metrics,
         rat_pooled, rat_metrics,
         human_per_sample, rat_per_sample,
-        args.output, args.top_n
+        args.output
     )
 
     # Save JSON

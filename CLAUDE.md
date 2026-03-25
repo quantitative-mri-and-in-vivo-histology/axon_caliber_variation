@@ -136,7 +136,6 @@ Fit parametric distributions to axon radius histograms following the methodology
 - Gamma - commonly used baseline
 - Log-normal
 - Inverse Gaussian
-- Log-logistic
 - Birnbaum-Saunders
 
 *Light microscopy resolution limit*:

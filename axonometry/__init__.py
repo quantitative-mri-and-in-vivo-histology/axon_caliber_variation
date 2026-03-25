@@ -35,6 +35,12 @@ from .histogram import (
     compute_r_eff,
 )
 
+from .distribution_fitting import (
+    FitResult,
+    fit_distribution_mle,
+    compute_distribution_radii,
+)
+
 from .plotting import (
     load_plot_settings,
     PlotSettings,
@@ -67,6 +73,10 @@ __all__ = [
     "rediscretize",
     "compute_r_arith",
     "compute_r_eff",
+    # Distribution fitting
+    "FitResult",
+    "fit_distribution_mle",
+    "compute_distribution_radii",
     # Plotting
     "load_plot_settings",
     "PlotSettings",
