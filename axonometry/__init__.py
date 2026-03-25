@@ -22,13 +22,6 @@ from .io import (
     downsample_mean,
 )
 
-from .populations import (
-    compute_all_orientations,
-    classify_by_dominant_axis,
-    filter_sparse_axons,
-    create_populations,
-)
-
 from .histogram import (
     rediscretize,
     compute_r_arith,
@@ -62,13 +55,8 @@ __all__ = [
     "write_ome_zarr_pyramid",
     "downsample_nearest",
     "downsample_mean",
-    # Populations
     "load_volume_downsampled",
     "precompute_axon_voxels",
-    "compute_all_orientations",
-    "classify_by_dominant_axis",
-    "filter_sparse_axons",
-    "create_populations",
     # Histogram
     "rediscretize",
     "compute_r_arith",
