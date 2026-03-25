@@ -28,7 +28,6 @@ import numpy as np
 from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from scipy.ndimage import gaussian_filter1d
 
 # Find repo root (contains pyproject.toml)
 _root = Path(__file__).resolve().parent
@@ -286,37 +285,37 @@ def plot_pdf_combined(
         pdf_ref_interp = np.interp(x_eval, bin_centers, pdf_ref, left=0, right=0)
 
         # Plot subsamples first (so full sample is on top)
-        # Sort sample sizes so smaller ones are plotted first (behind)
         sorted_sizes = sorted([s for s in sample_sizes if s <= total_count])
 
         for idx, sample_size in enumerate(sorted_sizes):
-            pdf_subsamples = []
-            for _ in range(n_subsamples):
-                sampled_bins = np.random.choice(len(bin_centers), size=sample_size, p=probs)
-                sub_counts = np.bincount(sampled_bins, minlength=len(bin_centers)).astype(float)
-                pdf_sub = sub_counts / (sub_counts.sum() * bin_width)
-                pdf_sub_interp = np.interp(x_eval, bin_centers, pdf_sub, left=0, right=0)
-                pdf_subsamples.append(pdf_sub_interp)
+            # Build subsample PDFs at bin centers, then take median/IQR
+            pdf_subsamples = np.empty((n_subsamples, len(bin_centers)))
+            for j in range(n_subsamples):
+                sampled_bins = np.random.choice(
+                    len(bin_centers), size=sample_size, p=probs
+                )
+                sub_counts = np.bincount(
+                    sampled_bins, minlength=len(bin_centers)
+                ).astype(float)
+                pdf_subsamples[j] = sub_counts / (sub_counts.sum() * bin_width)
 
-            pdf_subsamples = np.array(pdf_subsamples)
             pdf_lo = np.percentile(pdf_subsamples, 25.0, axis=0)
             pdf_hi = np.percentile(pdf_subsamples, 75.0, axis=0)
 
-            # Smooth the CI bands
-            sigma = 1
-            pdf_lo = gaussian_filter1d(pdf_lo, sigma=sigma)
-            pdf_hi = gaussian_filter1d(pdf_hi, sigma=sigma)
+            # Interpolate from bin centers onto common x-axis
+            lo_interp = np.interp(x_eval, bin_centers, pdf_lo, left=0, right=0)
+            hi_interp = np.interp(x_eval, bin_centers, pdf_hi, left=0, right=0)
 
             # Shaded area
-            ax.fill_between(x_eval, pdf_lo, pdf_hi, alpha=fill_alphas[idx], color=color,
-                           zorder=1 + idx)
+            ax.fill_between(x_eval, lo_interp, hi_interp,
+                           alpha=fill_alphas[idx], color=color, zorder=1 + idx)
 
             # Boundary lines with different styles
             linestyle = line_styles[idx] if idx < len(line_styles) else '-'
-            ax.plot(x_eval, pdf_lo, color=color, linestyle=linestyle, linewidth=0.8,
-                   alpha=0.7, zorder=2 + idx)
-            ax.plot(x_eval, pdf_hi, color=color, linestyle=linestyle, linewidth=0.8,
-                   alpha=0.7, zorder=2 + idx)
+            ax.plot(x_eval, lo_interp, color=color, linestyle=linestyle,
+                   linewidth=0.8, alpha=0.7, zorder=2 + idx)
+            ax.plot(x_eval, hi_interp, color=color, linestyle=linestyle,
+                   linewidth=0.8, alpha=0.7, zorder=2 + idx)
 
         # Plot full distribution on top (solid line)
         ax.plot(x_eval, pdf_ref_interp, color=color, linewidth=1.5,
