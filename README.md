@@ -2,7 +2,7 @@
 
 Laurin Mordhorst, Nikolaus Weiskopf, Markus Morawski, Siawoosh Mohammadi
 
-**Paper:** [DOI forthcoming]
+**Preprint:** [https://doi.org/10.64898/2026.03.25.714137](https://doi.org/10.64898/2026.03.25.714137)
 
 This repository contains the analysis code and figure generation scripts for the above manuscript. It is intended for reproducing the published results.
 
