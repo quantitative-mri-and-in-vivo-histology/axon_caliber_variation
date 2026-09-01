@@ -288,7 +288,7 @@ def plot_pdf_combined(
         sorted_sizes = sorted([s for s in sample_sizes if s <= total_count])
 
         for idx, sample_size in enumerate(sorted_sizes):
-            # Build subsample PDFs at bin centers, then take 5-95% band
+            # Build subsample PDFs at bin centers, then take central 95% band
             pdf_subsamples = np.empty((n_subsamples, len(bin_centers)))
             for j in range(n_subsamples):
                 sampled_bins = np.random.choice(
@@ -299,8 +299,8 @@ def plot_pdf_combined(
                 ).astype(float)
                 pdf_subsamples[j] = sub_counts / (sub_counts.sum() * bin_width)
 
-            pdf_lo = np.percentile(pdf_subsamples, 5.0, axis=0)
-            pdf_hi = np.percentile(pdf_subsamples, 95.0, axis=0)
+            pdf_lo = np.percentile(pdf_subsamples, 2.5, axis=0)
+            pdf_hi = np.percentile(pdf_subsamples, 97.5, axis=0)
 
             # Interpolate from bin centers onto common x-axis
             lo_interp = np.interp(x_eval, bin_centers, pdf_lo, left=0, right=0)

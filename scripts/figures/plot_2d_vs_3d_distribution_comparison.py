@@ -181,8 +181,8 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
         return
 
     pdf_2d_median = np.median(pdfs_2d, axis=0)
-    pdf_2d_lo = np.percentile(pdfs_2d, 5, axis=0)
-    pdf_2d_hi = np.percentile(pdfs_2d, 95, axis=0)
+    pdf_2d_lo = np.percentile(pdfs_2d, 2.5, axis=0)
+    pdf_2d_hi = np.percentile(pdfs_2d, 97.5, axis=0)
 
     # 3D: pooled PDF
     radii_3d = cache_3d[axon_file] if cache_3d else load_3d_radii(axon_file)
@@ -201,7 +201,7 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     # 3D: solid PDF line
     ax.plot(x, pdf_3d[mask], color=color_3d, linewidth=settings.line['linewidth'],
             linestyle='-')
-    # 2D: median line + 5-95% shaded envelope across slices
+    # 2D: median line + central 95% shaded envelope across slices
     ax.fill_between(x, pdf_2d_lo[mask], pdf_2d_hi[mask], alpha=0.3, color=color_2d)
     ax.plot(x, pdf_2d_median[mask], color=color_2d, linewidth=settings.line['linewidth'],
             linestyle='-')
@@ -242,7 +242,7 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     # 2D entries
     handles.append((Patch(facecolor=color_2d, alpha=0.3),
                     Line2D([0], [0], color=color_2d, linewidth=1.5, linestyle='-')))
-    labels.append('2D median PDF\n(+ 5–95% range)')
+    labels.append('2D median PDF\n(+ central 95%)')
     handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle=':'))
     labels.append(r'2D $\bar{r}$ median')
     handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle='--'))
