@@ -288,7 +288,7 @@ def plot_pdf_combined(
         sorted_sizes = sorted([s for s in sample_sizes if s <= total_count])
 
         for idx, sample_size in enumerate(sorted_sizes):
-            # Build subsample PDFs at bin centers, then take median/IQR
+            # Build subsample PDFs at bin centers, then take 5-95% band
             pdf_subsamples = np.empty((n_subsamples, len(bin_centers)))
             for j in range(n_subsamples):
                 sampled_bins = np.random.choice(
@@ -299,8 +299,8 @@ def plot_pdf_combined(
                 ).astype(float)
                 pdf_subsamples[j] = sub_counts / (sub_counts.sum() * bin_width)
 
-            pdf_lo = np.percentile(pdf_subsamples, 25.0, axis=0)
-            pdf_hi = np.percentile(pdf_subsamples, 75.0, axis=0)
+            pdf_lo = np.percentile(pdf_subsamples, 5.0, axis=0)
+            pdf_hi = np.percentile(pdf_subsamples, 95.0, axis=0)
 
             # Interpolate from bin centers onto common x-axis
             lo_interp = np.interp(x_eval, bin_centers, pdf_lo, left=0, right=0)
@@ -318,7 +318,8 @@ def plot_pdf_combined(
                    linewidth=0.8, alpha=0.7, zorder=2 + idx)
 
         # Plot full distribution on top (solid line)
-        ax.plot(x_eval, pdf_ref_interp, color=color, linewidth=1.5,
+        ax.plot(x_eval, pdf_ref_interp, color=color,
+                linewidth=settings.line['linewidth'],
                 linestyle='-', zorder=10)
 
     # Build legend
@@ -336,7 +337,8 @@ def plot_pdf_combined(
             full_label = rf'{species_label} ($n \approx 10^{exp}$)'
         else:
             full_label = rf'{species_label} ($n \approx {mantissa_rounded}\times 10^{exp}$)'
-        legend_handles.append(Line2D([0], [0], color=color, linewidth=1.5, label=full_label))
+        legend_handles.append(Line2D([0], [0], color=color,
+                                      linewidth=settings.line['linewidth'], label=full_label))
 
         # Subsample patches
         sorted_sizes = sorted([s for s in sample_sizes if s <= total_count])
@@ -478,16 +480,16 @@ def plot_within_vs_between_wasserstein(
 
     # Draw horizontal dashed lines for inter-ROI medians
     ax.axhline(between_median_per_species['Human'], color=human_color,
-               linestyle='--', linewidth=2, label='Human inter-ROI', zorder=1)
+               linestyle='--', linewidth=settings.line['linewidth'], label='Human inter-ROI', zorder=1)
     ax.axhline(between_median_per_species['Rat'], color=rat_color,
-               linestyle='--', linewidth=2, label='Rat inter-ROI', zorder=1)
+               linestyle='--', linewidth=settings.line['linewidth'], label='Rat inter-ROI', zorder=1)
 
     # Add legend
     handles = [
         Patch(facecolor=rat_color, alpha=0.7, label='Rat (sampling)'),
         Patch(facecolor=human_color, alpha=0.7, label='Human (sampling)'),
-        Line2D([0], [0], color=rat_color, linestyle='--', linewidth=2, label='Rat (anat. var.)'),
-        Line2D([0], [0], color=human_color, linestyle='--', linewidth=2, label='Human (anat. var.)'),
+        Line2D([0], [0], color=rat_color, linestyle='--', linewidth=settings.line['linewidth'], label='Rat (anat. var.)'),
+        Line2D([0], [0], color=human_color, linestyle='--', linewidth=settings.line['linewidth'], label='Human (anat. var.)'),
     ]
     ax.legend(handles=handles, loc='upper right', fontsize=legend_size)
 
@@ -563,9 +565,10 @@ def plot_combined_rel_error(
 
         # Plot line with markers at all sample sizes
         ax.plot(sample_sizes_present, rel_error_median, color=color, marker=marker,
-                markersize=6, linewidth=2, label=label)
+                markersize=6, linewidth=settings.line['linewidth'], label=label)
 
-    ax.axhline(0, color='black', linestyle='-', linewidth=1)
+    ax.axhline(0, color='black', linestyle='--', alpha=0.5,
+               linewidth=settings.line['linewidth'], zorder=0)
     ax.set_xscale('log')
     ax.set_xlabel('Sample size', fontsize=label_size)
     ax.set_ylabel(ylabel, fontsize=label_size)

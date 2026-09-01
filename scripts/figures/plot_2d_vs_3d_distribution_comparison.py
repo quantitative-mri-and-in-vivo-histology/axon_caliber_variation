@@ -25,7 +25,9 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import to_rgba
+from matplotlib.legend_handler import HandlerBase
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Rectangle
 from scipy import stats
 
 from axonometry import compute_r_eff, get_plot_settings, style_axis
@@ -139,6 +141,26 @@ def make_bins() -> Tuple[np.ndarray, np.ndarray, float]:
 
 
 
+class HandlerLineInPatch(HandlerBase):
+    """Legend handler drawing a median line centered inside a shaded band.
+
+    Expects orig_handle to be a (patch, line) tuple; renders a full-height
+    rectangle from the patch and a horizontal line (from the line) through it.
+    """
+
+    def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                       width, height, fontsize, trans):
+        patch, line = orig_handle
+        rect = Rectangle((xdescent, ydescent), width, height,
+                         facecolor=patch.get_facecolor(), edgecolor='none',
+                         transform=trans)
+        ln = Line2D([xdescent, xdescent + width],
+                    [ydescent + height / 2.0, ydescent + height / 2.0],
+                    color=line.get_color(), linewidth=line.get_linewidth(),
+                    linestyle=line.get_linestyle(), transform=trans)
+        return [rect, ln]
+
+
 def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
                    radius_type: str, x_max: float,
                    cache_2d: Optional[Dict] = None,
@@ -159,8 +181,8 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
         return
 
     pdf_2d_median = np.median(pdfs_2d, axis=0)
-    pdf_2d_lo = np.percentile(pdfs_2d, 25, axis=0)
-    pdf_2d_hi = np.percentile(pdfs_2d, 75, axis=0)
+    pdf_2d_lo = np.percentile(pdfs_2d, 5, axis=0)
+    pdf_2d_hi = np.percentile(pdfs_2d, 95, axis=0)
 
     # 3D: pooled PDF
     radii_3d = cache_3d[axon_file] if cache_3d else load_3d_radii(axon_file)
@@ -174,15 +196,15 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     # Colors: one per dimensionality (matching binary_a/b from variability stats)
     color_2d = settings.colors['binary_a']   # Sand/tan
     color_3d = settings.colors['binary_b']   # Dusty teal
-    vline_lw = 2.0
+    vline_lw = settings.line['linewidth']
 
     # 3D: solid PDF line
     ax.plot(x, pdf_3d[mask], color=color_3d, linewidth=settings.line['linewidth'],
             linestyle='-')
-    # 2D: median line + IQR shaded envelope
+    # 2D: median line + 5-95% shaded envelope across slices
+    ax.fill_between(x, pdf_2d_lo[mask], pdf_2d_hi[mask], alpha=0.3, color=color_2d)
     ax.plot(x, pdf_2d_median[mask], color=color_2d, linewidth=settings.line['linewidth'],
             linestyle='-')
-    ax.fill_between(x, pdf_2d_lo[mask], pdf_2d_hi[mask], alpha=0.3, color=color_2d)
 
     # 3D summary statistics (pooled)
     r_arith_3d = np.mean(radii_3d)
@@ -197,16 +219,14 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     r_eff_2d_lo = np.percentile(valid_reff, 25) if len(valid_reff) else np.nan
     r_eff_2d_hi = np.percentile(valid_reff, 75) if len(valid_reff) else np.nan
 
-    # r̄ markers (dotted): 3D line + 2D median line with IQR shaded
+    # r̄ markers (dotted): 3D line + 2D median line
     ax.axvline(r_arith_3d, color=color_3d, linewidth=vline_lw, linestyle=':', alpha=0.9)
     ax.axvline(r_arith_2d_med, color=color_2d, linewidth=vline_lw, linestyle=':', alpha=0.9)
-    ax.axvspan(r_arith_2d_lo, r_arith_2d_hi, alpha=0.15, color=color_2d, zorder=0)
 
-    # r_MRI markers (dashed): 3D line + 2D median line with IQR shaded
+    # r_MRI markers (dashed): 3D line + 2D median line
     ax.axvline(r_eff_3d, color=color_3d, linewidth=vline_lw, linestyle='--', alpha=0.9)
     if not np.isnan(r_eff_2d_med):
         ax.axvline(r_eff_2d_med, color=color_2d, linewidth=vline_lw, linestyle='--', alpha=0.9)
-        ax.axvspan(r_eff_2d_lo, r_eff_2d_hi, alpha=0.15, color=color_2d, zorder=0)
 
     # Legend
     handles, labels = [], []
@@ -220,17 +240,19 @@ def plot_pdf_panel(ax, slice_file: Path, axon_file: Path,
     labels.append(r'3D $r_{\mathrm{MRI}}$')
 
     # 2D entries
-    handles.append(Line2D([0], [0], color=color_2d, linewidth=1.5, linestyle='-'))
-    labels.append('2D median PDF (+ IQR)')
+    handles.append((Patch(facecolor=color_2d, alpha=0.3),
+                    Line2D([0], [0], color=color_2d, linewidth=1.5, linestyle='-')))
+    labels.append('2D median PDF\n(+ 5–95% range)')
     handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle=':'))
-    labels.append(r'2D $\bar{r}$ median (+ IQR)')
+    labels.append(r'2D $\bar{r}$ median')
     handles.append(Line2D([0], [0], color=color_2d, linewidth=vline_lw, linestyle='--'))
-    labels.append(r'2D $r_{\mathrm{MRI}}$ median (+ IQR)')
+    labels.append(r'2D $r_{\mathrm{MRI}}$ median')
 
     style_axis(ax, xlabel='Axon radius [μm]', ylabel='Probability density [μm⁻¹]')
     ax.legend(handles, labels, loc='upper right',
               fontsize=settings.fonts['legend_size'] - 1,
-              framealpha=0.9)
+              framealpha=0.9,
+              handler_map={tuple: HandlerLineInPatch()})
     ax.set_xlim(0, x_max)
     ax.set_ylim(bottom=0)
     ax.set_box_aspect(1)
@@ -348,7 +370,8 @@ def plot_scatter_panel(ax, all_metrics: List[Tuple[Dict, Dict, str]],
     all_vals = x_vals + y_vals
     lo = min(all_vals) * 0.95
     hi = max(all_vals) * 1.05
-    ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.5, linewidth=1.5, zorder=0)
+    ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.5,
+            linewidth=settings.line['linewidth'], zorder=0)
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
     ax.set_box_aspect(1)
@@ -494,7 +517,7 @@ def main():
                         help='Output figure path')
     parser.add_argument('--radius-type', type=str, default='minor',
                         choices=['circular', 'minor'], help='Radius type to use')
-    parser.add_argument('--x-max', type=float, default=1.5,
+    parser.add_argument('--x-max', type=float, default=1.0,
                         help='Max x-axis for PDF panel')
     parser.add_argument('--n-iterations', type=int, default=10000,
                         help='Monte Carlo iterations')

@@ -332,7 +332,8 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
     all_vals = np.concatenate([x_3d, slice_med, random_med])
     lo = np.nanmin(all_vals) * 0.95
     hi = np.nanmax(all_vals) * 1.05
-    ax.plot([lo, hi], [lo, hi], "k--", alpha=0.5, linewidth=1.5, zorder=0)
+    ax.plot([lo, hi], [lo, hi], "k--", alpha=0.5,
+            linewidth=settings.line["linewidth"], zorder=0)
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
 
