@@ -137,9 +137,9 @@ def main():
     main_color = settings.colors["category_a"]
     ax_hist.hist(all_cv, bins=hist_s["bins"], color=main_color,
                  edgecolor=hist_s["edgecolor"], alpha=hist_s["alpha"])
-    ax_hist.axvline(np.mean(all_cv), color=settings.colors["mean_line"], linestyle="--",
+    ax_hist.axvline(np.mean(all_cv), color=settings.colors["mean_line"], linestyle="-",
                     linewidth=line_s["linewidth"], label=f"Mean = {np.mean(all_cv):.3f}")
-    ax_hist.axvline(np.median(all_cv), color=settings.colors["median_line"], linestyle=":",
+    ax_hist.axvline(np.median(all_cv), color=settings.colors["median_line"], linestyle="-",
                     linewidth=line_s["linewidth"], label=f"Median = {np.median(all_cv):.3f}")
     style_axis(ax_hist, xlabel="CoV", ylabel="Count")
     ax_hist.set_xlim(0, 0.8)

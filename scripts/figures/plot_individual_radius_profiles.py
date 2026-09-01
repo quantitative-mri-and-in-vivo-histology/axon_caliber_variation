@@ -195,7 +195,7 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                 tick_centers.append(x_center)
                 z_tick = z_positions[j]
                 ax.plot([x_center - tick_half, x_center + tick_half], [y_c, y_c],
-                        [z_tick, z_tick], color="black", linewidth=0.5,
+                        [z_tick, z_tick], color="black", linewidth=1.5,
                         alpha=0.5, zorder=10)
 
             # Draw connections between axons
@@ -206,7 +206,7 @@ def render_axons_3d(volumes, colors, voxel_size, ax, rep_axons,
                     ax.plot([tick_centers[j] + tick_half, tick_centers[j + 1] - tick_half],
                             [y_c, y_c_next],
                             [z_positions[j], z_positions[j + 1]], color="black",
-                            linewidth=0.3, alpha=0.2, zorder=5)
+                            linewidth=1.0, alpha=0.2, zorder=5)
 
             # Tick label left of first axon
             if z_positions[0] is not None:

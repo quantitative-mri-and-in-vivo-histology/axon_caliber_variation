@@ -88,11 +88,11 @@ Figures depend on preprocessed data. Run the pipeline stages in order:
 | Fig 2a–b | `scripts/figures/plot_individual_radius_profiles.py`            | 3D rendering and radius profiles for representative axons         |
 | Fig 2c–e | `scripts/figures/plot_individual_radius_variation_stats.py`     | CoV histogram, CoV vs mean radius, slowdown reduction             |
 | Fig 3    | `scripts/figures/plot_2d_vs_3d_distribution_comparison.py`     | 2D/3D PDF stability, Wasserstein distance, mean and r_eff scatter |
-| Fig 4    | `scripts/figures/plot_parametric_distribution_fits.py`          | Parametric distribution fits and AIC for Human CC and Rat WM      |
+| Fig 4    | `scripts/figures/plot_2d_slice_vs_random_distribution_comparison.py` | Monte Carlo 2D-slice vs random sampling: Wasserstein, mean and r_eff scatter |
 | Fig 5    | `scripts/figures/plot_sample_size_effect.py`                   | Sample size effect on radius estimation error                     |
+| Fig 6    | `scripts/figures/plot_parametric_distribution_fits.py`          | Parametric distribution fits and AIC for Human CC and Rat WM      |
 | Fig S1   | `scripts/figures/plot_individual_radius_std_vs_mean.py`        | Radius standard deviation vs mean radius                          |
 | Fig S2   | `scripts/figures/plot_2d_vs_3d_distribution_comparison.py`     | 2D vs 3D comparison (circular radius approximation)               |
-| Fig S3   | `scripts/figures/plot_2d_slice_vs_random_distribution_comparison.py` | Monte Carlo 2D vs 3D correlation                             |
 
 Each script can be run standalone, e.g.:
 

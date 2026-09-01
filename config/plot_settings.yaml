@@ -40,9 +40,11 @@ colors:
   single_line: "#505050"       # Dark gray for single median/mean lines
 
   # Colored binary comparisons (when grayscale insufficient)
-  # Use for scatter plots, error bars, or when colors aid interpretation
-  binary_a: "#C4A77D"          # Sand/tan - warm neutral
-  binary_b: "#7BA3A8"          # Dusty teal - cool neutral
+  # Use for scatter plots, error bars, or when colors aid interpretation.
+  # Same red/blue as the species colors above; safe only because no single figure
+  # contains both a species and a binary methodological comparison.
+  binary_a: "#D94A4A"          # Red
+  binary_b: "#4A90D9"          # Blue
 
 # Marker styles for populations (tract, rat data only)
 markers:
@@ -53,7 +55,9 @@ markers:
 # =============================================================================
 # Encoding Priority
 # =============================================================================
-# 1. Color for strongest distinction (species, condition)
+# Red/blue is the primary contrast pair: species where species are compared, binary
+# methodological comparison otherwise. No single figure may contain both.
+# 1. Color for the strongest distinction in the figure (species, condition, or binary comparison)
 # 2. Shape for secondary categorical (tract)
 # 3. Line style (solid/dashed) as tertiary option
 
@@ -79,10 +83,10 @@ panel_labels:
 
 # Font settings
 fonts:
-  label_size: 14       # xlabel, ylabel
-  tick_size: 12        # tick labels
+  label_size: 16       # xlabel, ylabel
+  tick_size: 14        # tick labels
   title_size: 16       # panel titles (if used)
-  legend_size: 11      # legend text
+  legend_size: 13      # legend text
   weight: "normal"
 
 # Grid and frame settings
@@ -92,14 +96,14 @@ grid:
 
 frame:
   box: true            # Show all four spines (box around plot)
-  linewidth: 1.0       # Spine linewidth
+  linewidth: 1.2       # Spine linewidth
 
 # Error bar settings
 error_bars:
-  capsize: 4
-  capthick: 1.2
-  linewidth: 1.2
-  alpha: 0.7
+  capsize: 5
+  capthick: 1.5
+  linewidth: 1.5
+  alpha: 0.85
 
 # Histogram settings
 histogram:
@@ -109,6 +113,6 @@ histogram:
 
 # Line plot settings
 line:
-  linewidth: 2
-  marker_size: 5
-  fill_alpha: 0.2
+  linewidth: 2.5
+  marker_size: 7
+  fill_alpha: 0.35   # shaded IQR bands; 0.2 was too faint

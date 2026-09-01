@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from scipy import stats
 
@@ -332,11 +333,12 @@ def plot_scatter_panel(ax, all_metrics: List[Tuple[Dict, Dict, str]],
     err = settings.error_bars
 
     ax.errorbar(x_vals, y_vals, yerr=[yerr_lo, yerr_hi],
-                fmt='o', color=color, markersize=7,
+                fmt='o', color=color, ecolor=to_rgba(color, 0.7),
+                markersize=8,
                 capsize=err['capsize'], capthick=err['capthick'],
                 elinewidth=err['linewidth'],
-                markeredgecolor='black', markeredgewidth=0.5,
-                alpha=err['alpha'])
+                markerfacecolor=to_rgba(color, 0.3), markeredgecolor=color,
+                markeredgewidth=1.5)
 
     if len(x_vals) < 2:
         ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center',
@@ -363,6 +365,10 @@ def plot_scatter_panel(ax, all_metrics: List[Tuple[Dict, Dict, str]],
     else:
         xlabel = r'$r_{\mathrm{MRI}}$ (3D) [μm]'
         ylabel = r'$r_{\mathrm{MRI}}$ (2D) [μm]'
+        # Match x tick locations to y (limits are equal)
+        ax.set_xticks(ax.get_yticks())
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
 
     style_axis(ax, xlabel=xlabel, ylabel=ylabel)
 

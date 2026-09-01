@@ -257,8 +257,8 @@ For violin/box plots (high contrast):
 - **Category B**: Dark gray (`#505050`)
 
 For colored binary comparisons (scatter plots, error bars):
-- **Binary A**: Sand/tan (`#C4A77D`) - warm neutral
-- **Binary B**: Dusty teal (`#7BA3A8`) - cool neutral
+- **Binary A**: Red (`#D94A4A`)
+- **Binary B**: Blue (`#4A90D9`)
 
 *Single lines/curves (no comparison):*
 - Use dark gray (`#505050`) for single median/mean lines with shaded IQR
@@ -266,13 +266,15 @@ For colored binary comparisons (scatter plots, error bars):
 Examples: Ideal vs With slowdown, Intra-ROI vs Inter-ROI, CV vs radius (single line).
 
 *Encoding Priority:*
-1. Color for biological distinctions (species, condition)
+Red (`#D94A4A`) and blue (`#4A90D9`) are the primary contrast pair: species where species are
+compared, binary methodological comparison otherwise. **No single figure may contain both.**
+1. Color for the strongest distinction in the figure (species, condition, or binary comparison)
 2. Shape for anatomical categories (tract)
-3. Grayscale for methodological comparisons
+3. Grayscale for methodological comparisons where a binary color pair is not needed
 
 **Figure conventions:**
 - **No suptitles**: Do not add figure-level titles (`fig.suptitle()`)
-- **No subplot titles**: Do not add individual panel titles (`ax.set_title()`)
+- **No subplot titles**: Do not add individual panel titles (`ax.set_title()`) — these are added manually during figure assembly
 - **No panel labels**: Do not add subplot panel labels (a, b, c, ...) — these are added manually during figure assembly
 - **Units in square brackets**: Use square brackets for units in axis labels (e.g., `Radius [μm]`, not `Radius (μm)`)
 - **Radius notation**: Use `$\bar{r}$` for arithmetic mean radius, `$r_{\mathrm{MRI}}$` for effective MRI-visible radius
@@ -298,8 +300,8 @@ step_edge = settings.colors['category_b_edge']   # '#303030' (dark edge, linewid
 violin_light = settings.colors['category_a_violin']  # '#D0D0D0'
 violin_dark = settings.colors['category_b_violin']   # '#505050'
 # For colored binary comparisons (scatter plots, error bars):
-binary_a = settings.colors['binary_a']           # '#C4A77D' (sand/tan)
-binary_b = settings.colors['binary_b']           # '#7BA3A8' (dusty teal)
+binary_a = settings.colors['binary_a']           # '#D94A4A' (red)
+binary_b = settings.colors['binary_b']           # '#4A90D9' (blue)
 
 # Representative example colors
 colors = [settings.colors['example_1'],  # Green

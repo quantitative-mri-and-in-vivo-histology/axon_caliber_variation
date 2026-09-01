@@ -18,7 +18,7 @@ Median and IQR are computed over Monte Carlo iterations.
 Usage:
     python scripts/figures/plot_2d_slice_vs_random_distribution_comparison.py \
         --data-dir data/processed/rat/lm \
-        --output fig/montecarlo_2d_vs_3d_correlation.png \
+        --output fig/main/2d_slice_vs_random_distribution_comparison.svg \
         --n-iterations 100
 """
 
@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import to_rgba
 from matplotlib.ticker import FormatStrFormatter
 from scipy import stats
 
@@ -314,17 +315,19 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
 
     ax.errorbar(x_3d, slice_med,
                 yerr=[slice_med - slice_q25, slice_q75 - slice_med],
-                fmt="o", color=color_slice,
-                markersize=6, capsize=err_s["capsize"], capthick=err_s["capthick"],
-                elinewidth=err_s["linewidth"], markeredgecolor="black",
-                markeredgewidth=0.5, alpha=0.8, label="2D slice-wise sampling", zorder=10)
+                fmt="o", color=color_slice, ecolor=to_rgba(color_slice, 0.7),
+                markersize=8, capsize=err_s["capsize"], capthick=err_s["capthick"],
+                elinewidth=err_s["linewidth"],
+                markerfacecolor=to_rgba(color_slice, 0.3), markeredgecolor=color_slice,
+                markeredgewidth=1.5, label="2D slice-wise sampling", zorder=10)
 
     ax.errorbar(x_3d, random_med,
                 yerr=[random_med - random_q25, random_q75 - random_med],
-                fmt="x", color=color_random,
-                markersize=5, capsize=err_s["capsize"], capthick=err_s["capthick"],
-                elinewidth=err_s["linewidth"], markeredgecolor=color_random,
-                markeredgewidth=1.5, alpha=0.8, label="2D random sampling", zorder=10)
+                fmt="o", color=color_random, ecolor=to_rgba(color_random, 0.7),
+                markersize=4, capsize=err_s["capsize"], capthick=err_s["capthick"],
+                elinewidth=err_s["linewidth"],
+                markerfacecolor=color_random, markeredgecolor=color_random,
+                markeredgewidth=1.5, label="2D random sampling", zorder=11)
 
     all_vals = np.concatenate([x_3d, slice_med, random_med])
     lo = np.nanmin(all_vals) * 0.95
@@ -335,6 +338,13 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
 
     ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+
+    # Use identical tick locations on x and y (limits are equal)
+    ticks = ax.get_yticks()
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
 
     if metric == "mean_radius":
         xlabel = r"$\bar{r}$ (3D) [μm]"
@@ -349,17 +359,25 @@ def plot_scatter_comparison(ax, x_3d: np.ndarray,
     def _fmt_p(p):
         return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
 
-    text_slice = f"R = {r_slice_mean:.2f}±{r_slice_std:.2f}"
+    # Normalized mean bias per method: mean((2D - 3D) / 3D) * 100% (as in Fig 3)
+    bias_slice = np.mean((slice_med - x_3d) / x_3d) * 100
+    bias_random = np.mean((random_med - x_3d) / x_3d) * 100
+
+    # Slice block: 3 lines (bias / R / p), kept roughly at the current upper-left spot
+    text_slice = (f"Bias = {bias_slice:+.1f}%\n"
+                  f"$R$ = {r_slice_mean:.2f} ± {r_slice_std:.2f}")
     if p_slice is not None:
-        text_slice += f", {_fmt_p(p_slice)}"
-    ax.text(0.04, 0.78, text_slice, transform=ax.transAxes,
+        text_slice += f"\n{_fmt_p(p_slice)}"
+    ax.text(0.04, 0.74, text_slice, transform=ax.transAxes,
             fontsize=font_s["legend_size"], ha="left", va="top", color=color_slice)
 
-    text_random = f"R = {r_random_mean:.2f}±{r_random_std:.2f}"
+    # Random block: 3 lines (bias / R / p), moved to bottom-right (as in Fig 3)
+    text_random = (f"Bias = {bias_random:+.1f}%\n"
+                   f"$R$ = {r_random_mean:.2f} ± {r_random_std:.2f}")
     if p_random is not None:
-        text_random += f", {_fmt_p(p_random)}"
-    ax.text(0.04, 0.72, text_random, transform=ax.transAxes,
-            fontsize=font_s["legend_size"], ha="left", va="top", color=color_random)
+        text_random += f"\n{_fmt_p(p_random)}"
+    ax.text(0.96, 0.04, text_random, transform=ax.transAxes,
+            fontsize=font_s["legend_size"], ha="right", va="bottom", color=color_random)
 
     ax.set_box_aspect(1)
 
@@ -374,7 +392,7 @@ def main():
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/supplementary/2d_slice_vs_random_distribution_comparison.svg"))
+                        default=Path("fig/main/2d_slice_vs_random_distribution_comparison.svg"))
     parser.add_argument("--n-iterations", type=int, default=10000)
     parser.add_argument("--radius-type", type=str, default="minor",
                         choices=["minor", "circular"])
@@ -469,7 +487,7 @@ def main():
     logger.info(f"  Effective radius p-values: slice={p_reff_slice:.4f}, random={p_reff_random:.4f}")
 
     # ── Figure ────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(14.4, 4.8))
 
     logger.info("\nPlotting panel (a): Wasserstein distance...")
     plot_wasserstein_violin(axes[0], slice_results["wasserstein"],
