@@ -8,7 +8,7 @@ This repository contains Python-based analysis and figure generation code for th
 
 **1. Rat Brain 3D Segmentation Data** (Sierra, Abdollahzadeh et al., 2021)
 - 10 labeled 3D volumes of myelinated axons from 5 rats
-- 2 rats with TBI (traumatic brain injury), 3 rats with sham operation
+- 3 rats with TBI (traumatic brain injury), 2 rats with sham operation
 - Each rat has both ipsilateral and contralateral hemisphere volumes
 - Multiple white matter tract populations identified by orientation-based clustering
 - Available in two magnifications:
@@ -175,16 +175,16 @@ Download the raw axon segmentation data from:
 [FAIR Data Dataset - f8ccc23a-1f1a-4c98-86b7-b63652a809c3](https://etsin.fairdata.fi/dataset/f8ccc23a-1f1a-4c98-86b7-b63652a809c3)
 
 Place the 10 .mat files in `data/source/rat/`, organized by condition and hemisphere:
-- Sham_2_ipsi/LM_2_ipsi_myelinated_axons.mat
-- Sham_2_contra/LM_2_contra_myelinated_axons.mat
-- Sham_24_ipsi/LM_24_ipsi_myelinated_axons.mat
-- Sham_24_contra/LM_24_contra_myelinated_axons.mat
-- Sham_28_ipsi/LM_28_ipsi_myelinated_axons.mat
-- Sham_28_contra/LM_28_contra_myelinated_axons.mat
-- TBI_25_ipsi/LM_25_ipsi_myelinated_axons.mat
-- TBI_25_contra/LM_25_contra_myelinated_axons.mat
-- TBI_49_ipsi/LM_49_ipsi_myelinated_axons.mat
-- TBI_49_contra/LM_49_contra_myelinated_axons.mat
+- TBI_2_ipsi/LM_2_ipsi_myelinated_axons.mat
+- TBI_2_contra/LM_2_contra_myelinated_axons.mat
+- TBI_24_ipsi/LM_24_ipsi_myelinated_axons.mat
+- TBI_24_contra/LM_24_contra_myelinated_axons.mat
+- TBI_28_ipsi/LM_28_ipsi_myelinated_axons.mat
+- TBI_28_contra/LM_28_contra_myelinated_axons.mat
+- Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat
+- Sham_25_contra/LM_25_contra_myelinated_axons.mat
+- Sham_49_ipsi/LM_49_ipsi_myelinated_axons.mat
+- Sham_49_contra/LM_49_contra_myelinated_axons.mat
 
 
 ## Technical Details

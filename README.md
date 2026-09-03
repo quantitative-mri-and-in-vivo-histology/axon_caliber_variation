@@ -1,4 +1,4 @@
-# 3D Histology Validates 2D Histology for Axon Radius Distributions and Conduction Velocities
+# White matter fiber bundles enable robust conduction and time-critical signaling despite axon caliber variation
 
 Laurin Mordhorst, Nikolaus Weiskopf, Markus Morawski, Siawoosh Mohammadi
 
@@ -18,16 +18,16 @@ Place the `.mat` files in `data/source/rat/`, organized by condition and hemisph
 
 ```
 data/source/rat/
-├── Sham_2_ipsi/LM_2_ipsi_myelinated_axons.mat
-├── Sham_2_contra/LM_2_contra_myelinated_axons.mat
-├── Sham_24_ipsi/LM_24_ipsi_myelinated_axons.mat
-├── Sham_24_contra/LM_24_contra_myelinated_axons.mat
-├── Sham_28_ipsi/LM_28_ipsi_myelinated_axons.mat
-├── Sham_28_contra/LM_28_contra_myelinated_axons.mat
-├── TBI_25_ipsi/LM_25_ipsi_myelinated_axons.mat
-├── TBI_25_contra/LM_25_contra_myelinated_axons.mat
-├── TBI_49_ipsi/LM_49_ipsi_myelinated_axons.mat
-└── TBI_49_contra/LM_49_contra_myelinated_axons.mat
+├── TBI_2_ipsi/LM_2_ipsi_myelinated_axons.mat
+├── TBI_2_contra/LM_2_contra_myelinated_axons.mat
+├── TBI_24_ipsi/LM_24_ipsi_myelinated_axons.mat
+├── TBI_24_contra/LM_24_contra_myelinated_axons.mat
+├── TBI_28_ipsi/LM_28_ipsi_myelinated_axons.mat
+├── TBI_28_contra/LM_28_contra_myelinated_axons.mat
+├── Sham_25_ipsi/LM_25_ipsi_myelinated_axons.mat
+├── Sham_25_contra/LM_25_contra_myelinated_axons.mat
+├── Sham_49_ipsi/LM_49_ipsi_myelinated_axons.mat
+└── Sham_49_contra/LM_49_contra_myelinated_axons.mat
 ```
 
 ### Human corpus callosum 2D light microscopy data
