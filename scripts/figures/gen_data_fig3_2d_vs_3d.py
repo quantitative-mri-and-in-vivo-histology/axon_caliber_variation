@@ -24,6 +24,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+from matplotlib import cbook
 from scipy import stats
 
 from axonometry import compute_r_eff
@@ -201,13 +202,32 @@ def main():
                 continue
             cdf_2d = np.cumsum(hz) / hz.sum()
             within.append(np.sum(np.abs(cdf_2d - cdf_3d)) * bin_width)
-    between = [np.sum(np.abs(roi_cdfs_3d[i] - roi_cdfs_3d[j])) * bin_width
-               for i in range(len(roi_cdfs_3d)) for j in range(i + 1, len(roi_cdfs_3d))]
+    within = np.asarray(within)
+    between = np.asarray([np.sum(np.abs(roi_cdfs_3d[i] - roi_cdfs_3d[j])) * bin_width
+                          for i in range(len(roi_cdfs_3d)) for j in range(i + 1, len(roi_cdfs_3d))])
     logger.info(f"  Within: {len(within)} slices, Between: {len(between)} ROI pairs")
-    pd.DataFrame({'wasserstein_um': within}).to_csv(
-        args.out_dir / f"{args.prefix}_b_wasserstein_within.csv", index=False)
-    pd.DataFrame({'wasserstein_um': between}).to_csv(
-        args.out_dir / f"{args.prefix}_b_wasserstein_between.csv", index=False)
+    # Compact violin outline (matplotlib violin_stats) instead of raw arrays
+    vpstats = cbook.violin_stats([within, between], points=100)
+    viol_rows, stat_rows = [], []
+    for pos, (g, vs) in enumerate(zip(['within', 'between'], vpstats), start=1):
+        for c, v in zip(vs['coords'], vs['vals']):
+            viol_rows.append({'group': g, 'coord': c, 'density': v})
+        stat_rows.append({'group': g, 'position': pos, 'mean': vs['mean'],
+                          'median': vs['median'], 'vmin': vs['min'], 'vmax': vs['max']})
+    pd.DataFrame(viol_rows).to_csv(args.out_dir / f"{args.prefix}_b_wasserstein_violin.csv", index=False)
+    pd.DataFrame(stat_rows).to_csv(args.out_dir / f"{args.prefix}_b_wasserstein_stats.csv", index=False)
+    # Jittered overlay points (replicate the original rng sequence, seed 42)
+    rng = np.random.default_rng(42)
+    n_show = min(500, len(within))
+    idx = (rng.choice(len(within), n_show, replace=False)
+           if len(within) > n_show else np.arange(len(within)))
+    jw = rng.uniform(-0.15, 0.15, len(idx))
+    jb = rng.uniform(-0.15, 0.15, len(between))
+    pd.DataFrame({
+        'group': ['within'] * len(idx) + ['between'] * len(between),
+        'x': np.concatenate([1 + jw, 2 + jb]),
+        'y': np.concatenate([within[idx], between]),
+    }).to_csv(args.out_dir / f"{args.prefix}_b_wasserstein_points.csv", index=False)
 
     # ── Panels (c)/(d): per-ROI 2D-vs-3D scatter + MC stats ───────────────
     rows, roi_data, x3a, x3e = [], [], [], []

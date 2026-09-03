@@ -84,9 +84,14 @@ def plot_pdf_panel(ax, pdf, markers, x_max):
     ax.set_box_aspect(1)
 
 
-def plot_wasserstein_panel(ax, within, between):
-    parts = ax.violinplot([within, between], positions=[1, 2],
-                          showmeans=False, showmedians=True, widths=0.7)
+def plot_wasserstein_panel(ax, viol, viol_stats, points):
+    vpstats = []
+    for g in ('within', 'between'):
+        gv = viol[viol['group'] == g]
+        s = viol_stats[viol_stats['group'] == g].iloc[0]
+        vpstats.append({'coords': gv['coord'].to_numpy(), 'vals': gv['density'].to_numpy(),
+                        'mean': s['mean'], 'median': s['median'], 'min': s['vmin'], 'max': s['vmax']})
+    parts = ax.violin(vpstats, positions=[1, 2], showmeans=False, showmedians=True, widths=0.7)
     colors = [settings.colors['category_a_violin'], settings.colors['category_b_violin']]
     for i, pc in enumerate(parts['bodies']):
         pc.set_facecolor(colors[i])
@@ -96,13 +101,10 @@ def plot_wasserstein_panel(ax, within, between):
     for key in ('cbars', 'cmins', 'cmaxes'):
         parts[key].set_color('gray')
 
-    rng = np.random.default_rng(42)
-    n_show = min(500, len(within))
-    idx = rng.choice(len(within), n_show, replace=False) if len(within) > n_show else np.arange(len(within))
-    jitter = rng.uniform(-0.15, 0.15, len(idx))
-    ax.scatter(1 + jitter, within[idx], alpha=0.4, s=5, color='#808080', zorder=0)
-    jitter = rng.uniform(-0.15, 0.15, len(between))
-    ax.scatter(2 + jitter, between, alpha=0.5, s=10, color='#404040', zorder=0)
+    wp = points[points['group'] == 'within']
+    bp = points[points['group'] == 'between']
+    ax.scatter(wp['x'], wp['y'], alpha=0.4, s=5, color='#808080', zorder=0)
+    ax.scatter(bp['x'], bp['y'], alpha=0.5, s=10, color='#404040', zorder=0)
 
     ax.set_xticks([1, 2])
     ax.set_xticklabels(['Sampling error\n(intra-ROI 2D ↔ 3D)', 'Anat. variability\n(inter-ROI 3D)'],
@@ -165,14 +167,15 @@ def main():
     dd, pf = args.data_dir, args.prefix
     pdf = pd.read_csv(dd / f"{pf}_a_pdf.csv")
     markers = pd.read_csv(dd / f"{pf}_a_markers.csv")
-    within = pd.read_csv(dd / f"{pf}_b_wasserstein_within.csv")['wasserstein_um'].to_numpy()
-    between = pd.read_csv(dd / f"{pf}_b_wasserstein_between.csv")['wasserstein_um'].to_numpy()
+    b_viol = pd.read_csv(dd / f"{pf}_b_wasserstein_violin.csv")
+    b_stats = pd.read_csv(dd / f"{pf}_b_wasserstein_stats.csv")
+    b_points = pd.read_csv(dd / f"{pf}_b_wasserstein_points.csv")
     scatter = pd.read_csv(dd / f"{pf}_cd_scatter.csv")
     cd_stats = pd.read_csv(dd / f"{pf}_cd_stats.csv").set_index('metric')
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 9))
     plot_pdf_panel(axes[0, 0], pdf, markers, args.x_max)
-    plot_wasserstein_panel(axes[0, 1], within, between)
+    plot_wasserstein_panel(axes[0, 1], b_viol, b_stats, b_points)
     plot_scatter_panel(axes[1, 0], scatter, cd_stats.loc['r_arith'], 'r_arith')
     plot_scatter_panel(axes[1, 1], scatter, cd_stats.loc['r_eff'], 'r_eff')
 
