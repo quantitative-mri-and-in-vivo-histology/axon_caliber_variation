@@ -59,7 +59,7 @@ def plot_wasserstein_violin(ax, viol, viol_stats, points):
         ax.scatter(gp["x"], gp["y"], alpha=0.3, s=3, color=color, zorder=0)
 
     ax.set_xticks([1, 2])
-    ax.set_xticklabels(["2D slice-wise\nsampling", "2D random\nsampling"],
+    ax.set_xticklabels(["Per-cross-section\nsampling", "Random\nsampling"],
                        fontsize=settings.fonts["tick_size"] - 1)
     style_axis(ax, ylabel="Wasserstein distance [μm]")
     ax.set_ylim(bottom=0)
@@ -84,12 +84,12 @@ def plot_scatter(ax, scatter, stats_row, metric):
                 ecolor=to_rgba(color_slice, 0.7), markersize=8,
                 capsize=err_s["capsize"], capthick=err_s["capthick"], elinewidth=err_s["linewidth"],
                 markerfacecolor=to_rgba(color_slice, 0.3), markeredgecolor=color_slice,
-                markeredgewidth=1.5, label="2D slice-wise sampling", zorder=10)
+                markeredgewidth=1.5, label="Per-cross-section sampling", zorder=10)
     ax.errorbar(x, r_med, yerr=[r_lo, r_hi], fmt="o", color=color_random,
                 ecolor=to_rgba(color_random, 0.7), markersize=4,
                 capsize=err_s["capsize"], capthick=err_s["capthick"], elinewidth=err_s["linewidth"],
                 markerfacecolor=color_random, markeredgecolor=color_random,
-                markeredgewidth=1.5, label="2D random sampling", zorder=11)
+                markeredgewidth=1.5, label="Random sampling", zorder=11)
 
     all_vals = np.concatenate([x, s_med, r_med])
     lo, hi = np.nanmin(all_vals) * 0.95, np.nanmax(all_vals) * 1.05
