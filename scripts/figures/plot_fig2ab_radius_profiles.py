@@ -14,6 +14,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from matplotlib.colors import to_rgb
 from scipy import ndimage
 
@@ -241,6 +242,8 @@ def main():
                         default=Path("data/processed/rat/lm/representative_axons.npz"))
     parser.add_argument("--output", type=Path,
                         default=Path("fig/main/fig_2.svg"))
+    parser.add_argument("--data-dir", type=Path, default=Path("data/figures"),
+                        help="Directory with fig_2b_radius_profiles.csv (panel b)")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -267,15 +270,17 @@ def main():
     plt.close()
     logger.info(f"Saved rendering to {vol_path}")
 
-    # Figure 2: Radius profiles
+    # Figure 2: Radius profiles (panel b) — read from source-data CSV
+    prof_df = pd.read_csv(args.data_dir / "fig_2b_radius_profiles.csv")
     fig_prof, ax_prof = plt.subplots(figsize=(5, 4.5))
-    for i, axon in enumerate(rep_axons):
-        ax_prof.plot(axon["arc_lengths"], axon["radii"], color=colors[i],
-                     linewidth=settings.line["linewidth"], label=f'CoV = {axon["cv"]:.2f}')
+    for i, (_, g) in enumerate(prof_df.groupby("axon_index")):
+        ax_prof.plot(g["arc_length_um"], g["radius_um"], color=colors[i],
+                     linewidth=settings.line["linewidth"],
+                     label=f'CoV = {g["cov"].iloc[0]:.2f}')
 
     style_axis(ax_prof, xlabel=r"Arc length [$\mu$m]", ylabel=r"Axon radius [$\mu$m]")
     ax_prof.legend(loc="upper right", fontsize=settings.fonts["legend_size"], handlelength=1.5)
-    max_arc = max(a["arc_lengths"].max() for a in rep_axons)
+    max_arc = prof_df["arc_length_um"].max()
     x_max = int(np.ceil(max_arc / 10) * 10)
     ax_prof.set_xticks(range(0, x_max + 1, 10))
     ax_prof.set_xlim(0, x_max)

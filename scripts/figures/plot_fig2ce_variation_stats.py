@@ -1,12 +1,15 @@
 """
-Plot radius variability statistics: CV histogram, CV vs radius, slowdown reduction.
+Plot Figure 2c-e (radius variability statistics) from precomputed source data.
 
-Loads axon profile NPZ files from a data directory and creates a 1×3
-panel figure using pooled statistics across all axons.
+Reads the CSVs written by gen_data_fig2ce_variation_stats.py and renders the
+1x3 panel figure:
+  (c) CoV histogram with mean/median lines
+  (d) CoV vs along-axon mean radius (binned median + IQR)
+  (e) conduction-velocity & diffusion reduction vs radius
 
 Usage:
     python scripts/figures/plot_fig2ce_variation_stats.py
-    python scripts/figures/plot_fig2ce_variation_stats.py --data-dir data/processed/rat/lm
+    python scripts/figures/plot_fig2ce_variation_stats.py --data-dir data/figures
 """
 
 import argparse
@@ -14,7 +17,7 @@ import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
+import pandas as pd
 
 from axonometry import get_plot_settings, style_axis
 
@@ -24,107 +27,20 @@ logger = logging.getLogger(__name__)
 settings = get_plot_settings()
 
 
-def load_axon_stats(data_dir: Path, min_length_um: float = 20.0) -> dict:
-    """Load per-axon statistics from all axon profile NPZ files in data_dir.
-
-    Radius samples from all segments of each axon are pooled.
-    Only axons with total length >= min_length_um are included.
-    """
-    from axonometry.io import load_3d_profiles
-
-    all_mean_radii = []
-    all_cv = []
-    all_cond_reduction = []
-    all_diff_reduction = []
-    total_axons = 0
-
-    for npz_path in sorted(data_dir.glob("*_axon_profiles.npz")):
-        filtered = load_3d_profiles(npz_path)
-        total_axons += len(filtered['labels'])
-
-        for i in range(len(filtered['labels'])):
-            seg_radii = filtered['segment_radii_um'][i]
-            seg_lengths = filtered['segment_lengths_um'][i]
-            if not seg_radii:
-                continue
-
-            total_len = sum(float(sl) for sl in seg_lengths)
-            if total_len < min_length_um:
-                continue
-
-            # Pool all radius samples across segments
-            all_r = np.concatenate([np.asarray(r, dtype=np.float64) for r in seg_radii])
-            all_r = all_r[all_r > 0]
-            if len(all_r) < 3:
-                continue
-
-            mean_r = np.mean(all_r)
-            if mean_r <= 0:
-                continue
-
-            cv = np.std(all_r) / mean_r
-
-            # Conduction velocity: v(r) ∝ r * sqrt(-ln(g(r)))
-            # (Rushton, J. Physiol. 1951, doi:10.1113/jphysiol.1951.sp004655)
-            # g-ratio model: g(r) = r/(r+dm), dm = r̄*(1-ḡ)/ḡ
-            # ḡ = 0.6 optimal for rat CNS
-            # (Chomiak & Hu, PLoS ONE 2009, doi:10.1371/journal.pone.0007754)
-            g_bar = 0.6
-            dm = mean_r * (1 - g_bar) / g_bar  # = 2*mean_r/3
-            g_r = all_r / (all_r + dm)
-            v_r = all_r * np.sqrt(-np.log(g_r))
-            v_ideal = mean_r * np.sqrt(-np.log(g_bar))
-            # v_eff = 1 / <1/v(r)>
-            slowness = 1.0 / v_r
-            v_eff = 1.0 / np.mean(slowness)
-            cond_reduction_pct = (1 - v_eff / v_ideal) * 100  # % reduction
-
-            # Along-axon diffusion reduction: 4*CV² / (1 + 4*CV²)
-            # (Lee et al., Commun. Biol. 2020, doi:10.1038/s42003-020-1050-x)
-            diff_reduction_pct = 4.0 * cv**2 / (1.0 + 4.0 * cv**2) * 100
-
-            all_mean_radii.append(mean_r)
-            all_cv.append(cv)
-            all_cond_reduction.append(cond_reduction_pct)
-            all_diff_reduction.append(diff_reduction_pct)
-
-        logger.info(f"  {npz_path.name}: {len(filtered['labels'])} axons")
-
-    logger.info(f"Total axons: {total_axons}, axons used: {len(all_mean_radii)} "
-                f"(length >= {min_length_um} μm)")
-    return {
-        "all_mean_radii": np.array(all_mean_radii),
-        "all_cv": np.array(all_cv),
-        "all_cond_reduction": np.array(all_cond_reduction),
-        "all_diff_reduction": np.array(all_diff_reduction),
-        "total_axons": total_axons,
-        "n_axons_used": len(all_mean_radii),
-    }
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Plot radius variability statistics")
-    parser.add_argument("--data-dir", type=Path,
-                        default=Path("data/processed/rat/lm"))
+    parser = argparse.ArgumentParser(description="Plot Fig 2c-e from source data")
+    parser.add_argument("--data-dir", type=Path, default=Path("data/figures"),
+                        help="Directory containing the fig_2* source-data CSVs")
     parser.add_argument("--output", type=Path,
                         default=Path("fig/main/fig_2ce.svg"))
-    parser.add_argument("--min-length", type=float, default=20.0,
-                        help="Minimum total axon length in μm")
     args = parser.parse_args()
 
-    if not args.data_dir.exists():
-        logger.error(f"Data directory not found: {args.data_dir}")
-        return
-
-    d = load_axon_stats(args.data_dir, min_length_um=args.min_length)
-    all_r = d["all_mean_radii"]
-    all_cv = d["all_cv"]
-    all_cond = d["all_cond_reduction"]
-    all_diff = d["all_diff_reduction"]
-
-    if len(all_r) == 0:
-        logger.error("No axons loaded")
-        return
+    dd = args.data_dir
+    hist = pd.read_csv(dd / "fig_2c_cov_histogram.csv")
+    hist_lines = pd.read_csv(dd / "fig_2c_summary.csv").set_index("statistic")["cov"]
+    cvr = pd.read_csv(dd / "fig_2d_cov_vs_radius.csv")
+    red = pd.read_csv(dd / "fig_2e_reduction_vs_radius.csv")
+    red_med = pd.read_csv(dd / "fig_2e_summary.csv").set_index("statistic")["value"]
 
     hist_s = settings.histogram
     font_s = settings.fonts
@@ -133,89 +49,51 @@ def main():
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
     ax_hist, ax_cv, ax_vel = axes
 
-    # --- (a) CV histogram ---
-    main_color = settings.colors["category_a"]
-    ax_hist.hist(all_cv, bins=hist_s["bins"], color=main_color,
-                 edgecolor=hist_s["edgecolor"], alpha=hist_s["alpha"])
-    ax_hist.axvline(np.mean(all_cv), color=settings.colors["mean_line"], linestyle="-",
-                    linewidth=line_s["linewidth"], label=f"Mean = {np.mean(all_cv):.3f}")
-    ax_hist.axvline(np.median(all_cv), color=settings.colors["median_line"], linestyle="-",
-                    linewidth=line_s["linewidth"], label=f"Median = {np.median(all_cv):.3f}")
+    # --- (c) CoV histogram ---
+    centers = hist["cov_bin_center"].to_numpy()
+    counts = hist["count"].to_numpy()
+    bin_w = centers[1] - centers[0] if len(centers) > 1 else 0.02
+    ax_hist.bar(centers, counts, width=bin_w, align="center",
+                color=settings.colors["category_a"], edgecolor=hist_s["edgecolor"],
+                alpha=hist_s["alpha"])
+    mean_cv, median_cv = float(hist_lines["mean"]), float(hist_lines["median"])
+    ax_hist.axvline(mean_cv, color=settings.colors["mean_line"], linestyle="-",
+                    linewidth=line_s["linewidth"], label=f"Mean = {mean_cv:.3f}")
+    ax_hist.axvline(median_cv, color=settings.colors["median_line"], linestyle="-",
+                    linewidth=line_s["linewidth"], label=f"Median = {median_cv:.3f}")
     style_axis(ax_hist, xlabel="CoV", ylabel="Count")
     ax_hist.set_xlim(0, 0.8)
     ax_hist.legend(loc="upper right", fontsize=font_s["legend_size"])
     ax_hist.ticklabel_format(axis="y", style="sci", scilimits=(4, 4), useMathText=True)
     ax_hist.yaxis.get_offset_text().set_fontsize(font_s["tick_size"])
 
-    # --- (b) CV vs radius (binned median + IQR) ---
-    x_max = np.percentile(all_r, 99.5)
-    n_bins = 30
-    bin_edges = np.linspace(0, x_max, n_bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    bin_med = np.full(n_bins, np.nan)
-    bin_q25 = np.full(n_bins, np.nan)
-    bin_q75 = np.full(n_bins, np.nan)
-
-    for i in range(n_bins):
-        mask = (all_r >= bin_edges[i]) & (all_r < bin_edges[i + 1])
-        if np.sum(mask) >= 50:
-            bin_med[i] = np.median(all_cv[mask])
-            bin_q25[i] = np.percentile(all_cv[mask], 25)
-            bin_q75[i] = np.percentile(all_cv[mask], 75)
-
-    valid = ~np.isnan(bin_med)
+    # --- (d) CoV vs radius (binned median + IQR) ---
     single_color = settings.colors["single_line"]
-    ax_cv.plot(bin_centers[valid], bin_med[valid], color=single_color, linestyle="-",
+    ax_cv.plot(cvr["mean_radius_um"], cvr["cov_median"], color=single_color, linestyle="-",
                linewidth=line_s["linewidth"], marker="o", markersize=line_s["marker_size"],
                label="Median")
-    ax_cv.fill_between(bin_centers[valid], bin_q25[valid], bin_q75[valid],
+    ax_cv.fill_between(cvr["mean_radius_um"], cvr["cov_q25"], cvr["cov_q75"],
                        color=single_color, alpha=line_s["fill_alpha"], label="IQR (25-75%)")
     style_axis(ax_cv, xlabel=r"Along-axon mean radius [μm]", ylabel="CoV")
     ax_cv.set_xlim(0.1, 0.6)
     ax_cv.set_ylim(0, 0.385)
 
-    # --- (c) Reduction vs radius (already in %) ---
-    size_bins = 30
-    sb_edges = np.linspace(0, x_max, size_bins + 1)
-    sb_centers = (sb_edges[:-1] + sb_edges[1:]) / 2
-
-    cond_med = np.full(size_bins, np.nan)
-    cond_q25 = np.full(size_bins, np.nan)
-    cond_q75 = np.full(size_bins, np.nan)
-    diff_med = np.full(size_bins, np.nan)
-    diff_q25 = np.full(size_bins, np.nan)
-    diff_q75 = np.full(size_bins, np.nan)
-
-    for i in range(size_bins):
-        mask = (all_r >= sb_edges[i]) & (all_r < sb_edges[i + 1])
-        if np.sum(mask) >= 50:
-            cond_med[i] = np.median(all_cond[mask])
-            cond_q25[i] = np.percentile(all_cond[mask], 25)
-            cond_q75[i] = np.percentile(all_cond[mask], 75)
-            diff_med[i] = np.median(all_diff[mask])
-            diff_q25[i] = np.percentile(all_diff[mask], 25)
-            diff_q75[i] = np.percentile(all_diff[mask], 75)
-
-    vb = ~np.isnan(cond_med)
-
+    # --- (e) Reduction vs radius ---
     cond_color = settings.colors["binary_a"]
     diff_color = settings.colors["binary_b"]
+    med_cond = float(red_med["cond_median_pct"])
+    med_diff = float(red_med["diff_median_pct"])
 
-    med_cond = np.median(all_cond)
-    med_diff = np.median(all_diff)
-
-    ax_vel.plot(sb_centers[vb], cond_med[vb], color=cond_color, linestyle="-",
+    ax_vel.plot(red["mean_radius_um"], red["cond_median_pct"], color=cond_color, linestyle="-",
                 linewidth=line_s["linewidth"], marker="o", markersize=line_s["marker_size"],
                 label=f"Conduction velocity\n(median: {med_cond:.1f}%)")
-    ax_vel.fill_between(sb_centers[vb], cond_q25[vb], cond_q75[vb],
+    ax_vel.fill_between(red["mean_radius_um"], red["cond_q25_pct"], red["cond_q75_pct"],
                         color=cond_color, alpha=line_s["fill_alpha"])
-
-    ax_vel.plot(sb_centers[vb], diff_med[vb], color=diff_color, linestyle="-",
+    ax_vel.plot(red["mean_radius_um"], red["diff_median_pct"], color=diff_color, linestyle="-",
                 linewidth=line_s["linewidth"], marker="s", markersize=line_s["marker_size"],
                 label=f"Diffusion along-axon\n(median: {med_diff:.1f}%)")
-    ax_vel.fill_between(sb_centers[vb], diff_q25[vb], diff_q75[vb],
+    ax_vel.fill_between(red["mean_radius_um"], red["diff_q25_pct"], red["diff_q75_pct"],
                         color=diff_color, alpha=line_s["fill_alpha"])
-
     ax_vel.legend(loc="upper right", fontsize=font_s["legend_size"])
     style_axis(ax_vel, xlabel=r"Along-axon mean radius [μm]", ylabel="Reduction [%]")
     ax_vel.set_xlim(0.1, 0.6)
@@ -225,14 +103,10 @@ def main():
         ax.set_box_aspect(1)
 
     plt.tight_layout()
-
     args.output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.output, dpi=settings.figure["dpi"], bbox_inches="tight")
     plt.close()
-
     logger.info(f"Saved to {args.output}")
-    logger.info(f"  N={len(all_cv)} axons, mean CoV={np.mean(all_cv):.3f}, "
-                f"median cond. reduction={np.median(all_cond):.1f}%")
 
 
 if __name__ == "__main__":
