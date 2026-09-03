@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+from types import SimpleNamespace
 from matplotlib.legend_handler import HandlerBase
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
@@ -543,8 +545,8 @@ def create_combined_figure(
     human_metrics: AggregatedMetrics,
     rat_pooled: HistogramData,
     rat_metrics: AggregatedMetrics,
-    human_per_sample: PerSampleHistogramData,
-    rat_per_sample: PerSampleHistogramData,
+    human_inter_roi_w: float,
+    rat_inter_roi_w: float,
     output_file: Path,
 ) -> None:
     """Create 6-panel figure with 2 rows.
@@ -582,10 +584,6 @@ def create_combined_figure(
     # Set aspect ratio for bottom row panels
     for ax in [ax_c, ax_d, ax_e, ax_f]:
         ax.set_box_aspect(1 / 0.75)
-
-    # Compute inter-ROI Wasserstein for reference lines
-    human_inter_roi_w = compute_inter_roi_wasserstein(human_per_sample)
-    rat_inter_roi_w = compute_inter_roi_wasserstein(rat_per_sample)
 
     # Use human distribution order (by AIC) for consistency with bottom row
     dist_order = human_metrics.distribution_names
@@ -1074,58 +1072,71 @@ def _plot_radius_bias_both_species(
     ax.tick_params(labelsize=settings.fonts['tick_size'])
 
 
+def _reconstruct(species, hist_df, fit_df, dist_df, ps_df, emp_df):
+    """Rebuild (HistogramData, AggregatedMetrics) for one species from CSVs."""
+    h = hist_df[hist_df['species'] == species]
+    centers = h['bin_center'].to_numpy()
+    counts = h['count'].to_numpy()
+    bw = float(np.diff(centers).mean())
+    edges = np.concatenate([[centers[0] - bw / 2], centers + bw / 2])
+    emp = emp_df[emp_df['species'] == species].sort_values('sample_idx')
+    n_samples = len(emp)
+    pooled = HistogramData(
+        bin_edges=edges, bin_centers=centers, counts=counts,
+        n_samples=n_samples, total_count=int(counts.sum()),
+        name={'human': 'Human CC', 'rat': 'Rat WM'}[species])
+
+    fc = fit_df[fit_df['species'] == species]
+    pooled_results = [
+        SimpleNamespace(distribution_name=dname,
+                        pdf_x_fine=g['pdf_x'].to_numpy(),
+                        pdf_values_fine=g['pdf_val'].to_numpy())
+        for dname, g in fc.groupby('distribution')]
+
+    ds = dist_df[dist_df['species'] == species]
+    ds_sorted = ds.sort_values('summed_aic')
+    cand = [n for n, _ in CANDIDATE_DISTRIBUTIONS]
+    dist_name_to_idx = {n: i for i, n in enumerate(cand)}
+    all_r_arith = np.full((len(cand), n_samples), np.nan)
+    all_r_eff = np.full((len(cand), n_samples), np.nan)
+    all_wass = np.full((len(cand), n_samples), np.nan)
+    for _, row in ps_df[ps_df['species'] == species].iterrows():
+        di = dist_name_to_idx[row['distribution']]
+        s = int(row['sample_idx'])
+        all_r_arith[di, s] = row['r_arith']
+        all_r_eff[di, s] = row['r_eff']
+        all_wass[di, s] = row['wasserstein']
+
+    metrics = AggregatedMetrics(
+        distribution_names=ds_sorted['distribution'].tolist(),
+        summed_aic=ds_sorted['summed_aic'].to_numpy(),
+        pooled_results=pooled_results,
+        all_r_arith=all_r_arith, all_r_eff=all_r_eff, all_wasserstein=all_wass,
+        empirical_r_arith_per_sample=emp['empirical_r_arith'].to_numpy(),
+        empirical_r_eff_per_sample=emp['empirical_r_eff'].to_numpy(),
+        dist_name_to_idx=dist_name_to_idx,
+        win_rate=dict(zip(ds['distribution'], ds['win_rate'])))
+    return pooled, metrics
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Combined distribution fitting for Human CC and Rat data',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-
-    parser.add_argument('--human-data', type=Path, default=Path('data/raw/human/lm'),
-                        help='Directory containing human CC TSV files (default: data/raw/human/lm)')
-    parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
-                        help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
-    parser.add_argument('--output', type=Path, default=Path('fig/main/fig_6.svg'),
-                        help='Output file path (default: fig/main/fig_6.svg)')
-    parser.add_argument('--bin-width', type=float, default=DEFAULT_BIN_WIDTH,
-                        help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')
-    parser.add_argument('--r-max', type=float, default=3.0,
-                        help='Maximum radius in um (default: 3.0)')
+        description='Plot Fig 6 (parametric distribution fits) from source data')
+    parser.add_argument('--data-dir', type=Path, default=Path('data/figures'))
+    parser.add_argument('--output', type=Path, default=Path('fig/main/fig_6.svg'))
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load Human CC data
-    logger.info("=" * 60)
-    logger.info("Loading Human CC data...")
-    human_pooled, human_per_sample = load_human_cc_data(
-        args.human_data,
-        args.bin_width,
-    )
+    dd = args.data_dir
+    hist_df = pd.read_csv(dd / 'fig_6_pooled_hist.csv')
+    fit_df = pd.read_csv(dd / 'fig_6_fit_curves.csv')
+    dist_df = pd.read_csv(dd / 'fig_6_dist_stats.csv')
+    ps_df = pd.read_csv(dd / 'fig_6_per_sample.csv')
+    emp_df = pd.read_csv(dd / 'fig_6_empirical.csv')
+    iroi = pd.read_csv(dd / 'fig_6_inter_roi.csv').set_index('species')['inter_roi_wasserstein']
 
-    # Load Rat data
-    logger.info("=" * 60)
-    logger.info("Loading Rat data...")
-    rat_pooled, rat_per_sample = load_rat_data(args.rat_data, args.bin_width, args.r_max)
-
-    # Fit per-sample and aggregate AIC
-    logger.info("=" * 60)
-    logger.info("Fitting Human CC distributions...")
-    human_metrics = fit_all_samples(human_per_sample, human_pooled)
-
-    logger.info("=" * 60)
-    logger.info("Fitting Rat distributions...")
-    rat_metrics = fit_all_samples(rat_per_sample, rat_pooled)
-
-    # Report results
-    logger.info("=" * 60)
-    logger.info("Human CC - Top 5 by summed AIC:")
-    for i, name in enumerate(human_metrics.distribution_names[:5], 1):
-        delta = human_metrics.summed_aic[i-1] - human_metrics.summed_aic[0]
-        logger.info(f"  {i}. {name}: Delta AIC = {delta:.0f}")
-
-    logger.info("Rat WM - Top 5 by summed AIC:")
-    for i, name in enumerate(rat_metrics.distribution_names[:5], 1):
-        delta = rat_metrics.summed_aic[i-1] - rat_metrics.summed_aic[0]
-        logger.info(f"  {i}. {name}: Delta AIC = {delta:.0f}")
+    human_pooled, human_metrics = _reconstruct('human', hist_df, fit_df, dist_df, ps_df, emp_df)
+    rat_pooled, rat_metrics = _reconstruct('rat', hist_df, fit_df, dist_df, ps_df, emp_df)
 
     # Create main figure (4-panel)
     logger.info("=" * 60)
@@ -1143,67 +1154,11 @@ def main():
         create_combined_figure(
             human_pooled, human_metrics,
             rat_pooled, rat_metrics,
-            human_per_sample, rat_per_sample,
+            float(iroi['human']), float(iroi['rat']),
             args.output
         )
     finally:
         settings._settings['fonts'] = _orig_fonts
-
-    # Save JSON with full metrics
-    json_file = args.output.with_suffix('.json')
-
-    def _metrics_to_dict(metrics, pooled_data):
-        """Convert AggregatedMetrics to a JSON-serializable dict."""
-        dists = []
-        for i, name in enumerate(metrics.distribution_names):
-            idx = metrics.dist_name_to_idx[name]
-            r_arith_bias = metrics.all_r_arith[idx] - metrics.empirical_r_arith_per_sample
-            r_eff_bias = metrics.all_r_eff[idx] - metrics.empirical_r_eff_per_sample
-            # Relative bias (%)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                r_arith_rel = r_arith_bias / metrics.empirical_r_arith_per_sample * 100
-                r_eff_rel = r_eff_bias / metrics.empirical_r_eff_per_sample * 100
-            r_arith_valid = r_arith_rel[np.isfinite(r_arith_rel)]
-            r_eff_valid = r_eff_rel[np.isfinite(r_eff_rel)]
-            # Pooled fit params
-            pooled_result = next(
-                (r for r in metrics.pooled_results if r.distribution_name == name), None
-            )
-            dists.append({
-                'name': name,
-                'summed_aic': float(metrics.summed_aic[i]),
-                'delta_aic': float(metrics.summed_aic[i] - metrics.summed_aic[0]),
-                'win_rate': float(metrics.win_rate.get(name, 0)),
-                'pooled_params': [float(p) for p in pooled_result.params] if pooled_result else None,
-                'pooled_nll': float(pooled_result.nll) if pooled_result else None,
-                'r_arith_bias_pct': {
-                    'mean': float(np.mean(r_arith_valid)) if len(r_arith_valid) else None,
-                    'median': float(np.median(r_arith_valid)) if len(r_arith_valid) else None,
-                    'std': float(np.std(r_arith_valid)) if len(r_arith_valid) else None,
-                },
-                'r_eff_bias_pct': {
-                    'mean': float(np.mean(r_eff_valid)) if len(r_eff_valid) else None,
-                    'median': float(np.median(r_eff_valid)) if len(r_eff_valid) else None,
-                    'std': float(np.std(r_eff_valid)) if len(r_eff_valid) else None,
-                },
-                'wasserstein': {
-                    'mean': float(np.nanmean(metrics.all_wasserstein[idx])),
-                    'median': float(np.nanmedian(metrics.all_wasserstein[idx])),
-                },
-            })
-        return {
-            'n_rois': pooled_data.n_samples,
-            'total_count': pooled_data.total_count,
-            'distributions': dists,
-        }
-
-    output_data = {
-        'human_cc': _metrics_to_dict(human_metrics, human_pooled),
-        'rat': _metrics_to_dict(rat_metrics, rat_pooled),
-    }
-    with open(json_file, 'w') as f:
-        json.dump(output_data, f, indent=2)
-    logger.info(f"Saved results to {json_file}")
 
 
 if __name__ == '__main__':
