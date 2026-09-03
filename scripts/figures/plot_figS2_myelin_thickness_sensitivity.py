@@ -16,8 +16,8 @@ The reference (straight) cylinder uses the SAME myelin relation as the profile i
 each model, so the comparison isolates the effect of radius variation only.
 
 Usage:
-    python scripts/figures/plot_gratio_model_sensitivity.py
-    python scripts/figures/plot_gratio_model_sensitivity.py --data-dir data/processed/rat/lm
+    python scripts/figures/plot_figS2_myelin_thickness_sensitivity.py
+    python scripts/figures/plot_figS2_myelin_thickness_sensitivity.py --data-dir data/processed/rat/lm
 """
 
 import argparse

@@ -147,13 +147,13 @@ Fit parametric distributions to axon radius histograms following the methodology
 
 *Reference*: Sepehrband F, et al. (2016). "Towards higher sensitivity and stability of axon diameter estimation with diffusion-weighted MRI." NMR Biomed. 29(3):293-308. PMID: 27303273
 
-**Combined Distribution Fitting** ([plot_parametric_distribution_fits.py](scripts/figures/plot_parametric_distribution_fits.py))
+**Combined Distribution Fitting** ([plot_fig6_parametric_fits.py](scripts/figures/plot_fig6_parametric_fits.py))
 
 Compares distribution fits and radius estimation bias across Human CC and Rat WM datasets:
 
 *Usage*:
 ```bash
-python scripts/figures/plot_parametric_distribution_fits.py \
+python scripts/figures/plot_fig6_parametric_fits.py \
     --human-data data/raw/human/lm \
     --rat-data data/processed/rat/lm \
     --output fig/main/combined_distribution_fits.svg

@@ -5,7 +5,7 @@ Loads pre-computed NPZ from create_representative_axons.py and creates a
 two-panel figure: 3D volume rendering (left) + radius profiles (right).
 
 Usage:
-    python scripts/figures/plot_individual_radius_profiles.py
+    python scripts/figures/plot_fig2ab_radius_profiles.py
 """
 
 import argparse

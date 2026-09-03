@@ -11,7 +11,7 @@ Creates a 2×2 panel figure:
 (d) Effective radius scatter plot (2D vs 3D) for all samples
 
 Usage:
-  python plot_2d_vs_3d_distribution_comparison.py \\
+  python plot_fig3_2d_vs_3d.py \\
       --data-dir data/processed/rat/LM \\
       --output fig/main/distribution_2d_vs_3d_comparison.svg
 """

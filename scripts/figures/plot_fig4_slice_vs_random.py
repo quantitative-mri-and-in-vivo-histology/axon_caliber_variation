@@ -16,7 +16,7 @@ Creates a 1x3 figure showing:
 Median and IQR are computed over Monte Carlo iterations.
 
 Usage:
-    python scripts/figures/plot_2d_slice_vs_random_distribution_comparison.py \
+    python scripts/figures/plot_fig4_slice_vs_random.py \
         --data-dir data/processed/rat/lm \
         --output fig/main/2d_slice_vs_random_distribution_comparison.svg \
         --n-iterations 100

@@ -8,7 +8,7 @@ Creates a 2×2 figure:
   (d) Effective MRI radius error vs sample size (both datasets)
 
 Usage:
-    python scripts/figures/plot_sample_size_effect.py \
+    python scripts/figures/plot_fig5_sample_size.py \
         --human-data data/raw/human/lm \
         --rat-data data/processed/rat/lm \
         --output fig/main/sample_size_effect.svg

@@ -5,8 +5,8 @@ Loads axon profile NPZ files from a data directory and creates a 1×3
 panel figure using pooled statistics across all axons.
 
 Usage:
-    python scripts/figures/plot_individual_radius_variation_stats.py
-    python scripts/figures/plot_individual_radius_variation_stats.py --data-dir data/processed/rat/lm
+    python scripts/figures/plot_fig2ce_variation_stats.py
+    python scripts/figures/plot_fig2ce_variation_stats.py --data-dir data/processed/rat/lm
 """
 
 import argparse
