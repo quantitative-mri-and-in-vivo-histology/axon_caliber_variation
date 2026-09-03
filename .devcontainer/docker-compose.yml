@@ -19,7 +19,8 @@ services:
       - ..:/workspace:delegated
       - claude-code-bashhistory:/commandhistory
       - claude-code-config:/home/node/.claude
-      - ${HOME}/.ssh:/home/node/.ssh-host:cached
+      # Host SSH keys are mounted via docker-compose.override.yml (git-ignored):
+      #   - "${HOME}/.ssh:/home/node/.ssh-host:cached"
     environment:
       NODE_OPTIONS: "--max-old-space-size=4096"
       CLAUDE_CONFIG_DIR: "/home/node/.claude"
