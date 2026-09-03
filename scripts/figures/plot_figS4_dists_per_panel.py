@@ -10,7 +10,7 @@ Usage:
     python scripts/figures/plot_figS4_dists_per_panel.py \\
         --human-data data/raw/human/lm \\
         --rat-data data/processed/rat/lm \\
-        --output fig/supplementary/parametric_fits_per_distribution.svg
+        --output fig/supplementary/fig_s4.svg
 """
 
 import argparse
@@ -146,9 +146,9 @@ def main():
     parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
                         help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
     parser.add_argument('--output', type=Path,
-                        default=Path('fig/supplementary/parametric_fits_per_distribution.svg'),
+                        default=Path('fig/supplementary/fig_s4.svg'),
                         help='Output file path (default: '
-                             'fig/supplementary/parametric_fits_per_distribution.svg)')
+                             'fig/supplementary/fig_s4.svg)')
     parser.add_argument('--bin-width', type=float, default=DEFAULT_BIN_WIDTH,
                         help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')
     parser.add_argument('--r-max', type=float, default=3.0,

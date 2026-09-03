@@ -156,7 +156,7 @@ Compares distribution fits and radius estimation bias across Human CC and Rat WM
 python scripts/figures/plot_fig6_parametric_fits.py \
     --human-data data/raw/human/lm \
     --rat-data data/processed/rat/lm \
-    --output fig/main/combined_distribution_fits.svg
+    --output fig/main/fig_6.svg
 ```
 
 *Key features*:

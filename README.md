@@ -92,7 +92,7 @@ Supplementary figures:
 
 - **S1** — `plot_figS1_radius_std_vs_mean.py` (radius standard deviation vs mean radius)
 - **S2** — `plot_figS2_myelin_thickness_sensitivity.py` (g-ratio / myelin-thickness model sensitivity of the conduction-velocity reduction)
-- **S3** — `plot_fig3_2d_vs_3d.py --radius-type circular` (circular- vs minor-axis radius)
+- **S3** — `plot_fig3_2d_vs_3d.py --radius-type circular --output fig/supplementary/fig_s3.svg` (circular- vs minor-axis radius)
 - **S4** — `plot_figS4_dists_per_panel.py` (per-panel distribution fits)
 
 Each script runs standalone; use `--help` for options:

@@ -240,7 +240,7 @@ def main():
     parser.add_argument("--input", type=Path,
                         default=Path("data/processed/rat/lm/representative_axons.npz"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/main/individual_radius_profiles.svg"))
+                        default=Path("fig/main/fig_2.svg"))
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -262,7 +262,7 @@ def main():
     ax_vol = fig_vol.add_axes([0, 0, 1, 1], projection="3d")
     render_axons_3d(volumes, colors, voxel_size, ax_vol, rep_axons,
                     arc_interval=10.0)
-    vol_path = args.output.with_stem(args.output.stem + "_rendering")
+    vol_path = args.output.with_stem(args.output.stem + "a")
     plt.savefig(vol_path, dpi=800)
     plt.close()
     logger.info(f"Saved rendering to {vol_path}")
@@ -283,7 +283,7 @@ def main():
     ax_prof.set_ylim(ymin, ymax * 1.15)
     ax_prof.set_box_aspect(1)
     plt.tight_layout()
-    prof_path = args.output.with_stem(args.output.stem + "_profiles")
+    prof_path = args.output.with_stem(args.output.stem + "b")
     plt.savefig(prof_path, dpi=settings.figure["dpi"], bbox_inches="tight", pad_inches=0.02)
     plt.close()
     logger.info(f"Saved profiles to {prof_path}")

@@ -13,7 +13,7 @@ Creates a 2×2 panel figure:
 Usage:
   python plot_fig3_2d_vs_3d.py \\
       --data-dir data/processed/rat/LM \\
-      --output fig/main/distribution_2d_vs_3d_comparison.svg
+      --output fig/main/fig_3.svg
 """
 
 import argparse
@@ -513,7 +513,7 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=Path('data/processed/rat/lm'),
                         help='Directory containing slice and axon profiles')
     parser.add_argument('--output', type=Path,
-                        default=Path('fig/main/2d_vs_3d_distribution_comparison.svg'),
+                        default=Path('fig/main/fig_3.svg'),
                         help='Output figure path')
     parser.add_argument('--radius-type', type=str, default='minor',
                         choices=['circular', 'minor'], help='Radius type to use')

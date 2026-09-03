@@ -18,7 +18,7 @@ Median and IQR are computed over Monte Carlo iterations.
 Usage:
     python scripts/figures/plot_fig4_slice_vs_random.py \
         --data-dir data/processed/rat/lm \
-        --output fig/main/2d_slice_vs_random_distribution_comparison.svg \
+        --output fig/main/fig_4.svg \
         --n-iterations 100
 """
 
@@ -393,7 +393,7 @@ def main():
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/main/2d_slice_vs_random_distribution_comparison.svg"))
+                        default=Path("fig/main/fig_4.svg"))
     parser.add_argument("--n-iterations", type=int, default=10000)
     parser.add_argument("--radius-type", type=str, default="minor",
                         choices=["minor", "circular"])

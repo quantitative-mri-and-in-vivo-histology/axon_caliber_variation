@@ -178,8 +178,8 @@ def main():
         'output_file',
         type=Path,
         nargs='?',
-        default=Path('fig/supplementary/radius_std_vs_mean.svg'),
-        help='Output file path (default: fig/supplementary/radius_std_vs_mean.svg)'
+        default=Path('fig/supplementary/fig_s1.svg'),
+        help='Output file path (default: fig/supplementary/fig_s1.svg)'
     )
     parser.add_argument(
         '--min-length',

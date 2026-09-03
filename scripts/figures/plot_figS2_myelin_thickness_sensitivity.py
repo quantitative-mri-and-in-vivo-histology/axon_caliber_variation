@@ -156,7 +156,7 @@ def main():
         description="g-ratio model sensitivity of the conduction velocity reduction")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/supplementary/gratio_model_sensitivity.svg"))
+                        default=Path("fig/supplementary/fig_s2.svg"))
     parser.add_argument("--min-length", type=float, default=20.0,
                         help="Minimum total axon length in um")
     args = parser.parse_args()

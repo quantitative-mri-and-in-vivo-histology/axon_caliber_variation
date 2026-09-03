@@ -11,7 +11,7 @@ Usage:
     python scripts/figures/plot_fig5_sample_size.py \
         --human-data data/raw/human/lm \
         --rat-data data/processed/rat/lm \
-        --output fig/main/sample_size_effect.svg
+        --output fig/main/fig_5.svg
 """
 
 import argparse
@@ -645,8 +645,8 @@ def main():
                         help='Directory containing human CC TSV files (default: data/raw/human/lm)')
     parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
                         help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
-    parser.add_argument('--output', type=Path, default=Path('fig/main/sample_size_effect.svg'),
-                        help='Output file path (default: fig/main/sample_size_effect.svg)')
+    parser.add_argument('--output', type=Path, default=Path('fig/main/fig_5.svg'),
+                        help='Output file path (default: fig/main/fig_5.svg)')
     parser.add_argument('--n-subsamples', type=int, default=N_SUBSAMPLES,
                         help=f'Number of subsamples per ROI (default: {N_SUBSAMPLES})')
     parser.add_argument('--seed', type=int, default=42,

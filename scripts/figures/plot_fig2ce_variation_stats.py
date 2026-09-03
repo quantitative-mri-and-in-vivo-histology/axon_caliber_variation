@@ -107,7 +107,7 @@ def main():
     parser.add_argument("--data-dir", type=Path,
                         default=Path("data/processed/rat/lm"))
     parser.add_argument("--output", type=Path,
-                        default=Path("fig/main/radius_variability_stats.svg"))
+                        default=Path("fig/main/fig_2ce.svg"))
     parser.add_argument("--min-length", type=float, default=20.0,
                         help="Minimum total axon length in μm")
     args = parser.parse_args()

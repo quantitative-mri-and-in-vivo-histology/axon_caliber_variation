@@ -9,7 +9,7 @@ Usage:
     python scripts/figures/plot_fig6_parametric_fits.py \\
         --human-data data/raw/human/lm \\
         --rat-data data/processed/rat/lm \\
-        --output fig/main/combined_distribution_fits.svg
+        --output fig/main/fig_6.svg
 """
 
 import argparse
@@ -1084,8 +1084,8 @@ def main():
                         help='Directory containing human CC TSV files (default: data/raw/human/lm)')
     parser.add_argument('--rat-data', type=Path, default=Path('data/processed/rat/lm'),
                         help='Directory containing rat NPZ files (default: data/processed/rat/lm)')
-    parser.add_argument('--output', type=Path, default=Path('fig/main/parametric_distribution_fits.svg'),
-                        help='Output file path (default: fig/main/parametric_distribution_fits.svg)')
+    parser.add_argument('--output', type=Path, default=Path('fig/main/fig_6.svg'),
+                        help='Output file path (default: fig/main/fig_6.svg)')
     parser.add_argument('--bin-width', type=float, default=DEFAULT_BIN_WIDTH,
                         help=f'Bin width in um (default: {DEFAULT_BIN_WIDTH})')
     parser.add_argument('--r-max', type=float, default=3.0,
